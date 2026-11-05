@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from saturnus import Messages
 
+from .usage import UsageTotals
+
 
 @dataclass
 class Session:
@@ -14,6 +16,7 @@ class Session:
     model_id: str
     id: str = field(default_factory=lambda: uuid4().hex)
     messages: Messages = field(default_factory=Messages)
+    usage: UsageTotals = field(default_factory=UsageTotals)
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):
@@ -28,3 +31,5 @@ class Session:
         self.workspace = Path(self.workspace).expanduser().resolve()
         if not isinstance(self.messages, Messages):
             raise TypeError("messages must be a Saturnus Messages instance.")
+        if not isinstance(self.usage, UsageTotals):
+            raise TypeError("usage must be a UsageTotals instance.")

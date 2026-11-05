@@ -37,7 +37,7 @@ class ModelInfo:
 # Verified 2026-11-04 against official DeepSeek and MiMo API documentation.
 # DeepSeek's /models example gives an exact token count. MiMo documents "1M"
 # without an exact integer, so its context_window remains unknown here.
-MODELS = (
+DEEPSEEK_MODELS = (
     ModelInfo(
         id="deepseek-flash",
         provider="deepseek",
@@ -52,6 +52,9 @@ MODELS = (
         supports_tools=True,
         thinking_modes=("off", "on", "low", "high", "max"),
     ),
+)
+
+MIMO_MODELS = (
     ModelInfo(
         id="mimo-v2.6-pro",
         provider="mimo",
@@ -65,6 +68,8 @@ MODELS = (
         thinking_modes=("off", "on"),
     ),
 )
+
+MODELS = (*DEEPSEEK_MODELS, *MIMO_MODELS)
 
 
 def list_models(

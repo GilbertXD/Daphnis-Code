@@ -2,17 +2,58 @@
 
 import json
 import os
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from saturnus import Messages
 
 from .session import Session
+from .usage import UsageTotals
+
+
+@dataclass(frozen=True)
+class SessionInfo:
+    id: str
+    workspace: Path
+    provider: str
+    model_id: str
+    message_count: int
+    updated_at: float
 
 
 class History:
-    def __init__(self, directory: str | Path) -> None:
-        self.directory = Path(directory).expanduser().resolve()
+    def __init__(self, directory: str | Path | None = None) -> None:
+        location = (
+            Path.home() / ".daphnis" / "sessions"
+            if directory is None
+            else Path(directory)
+        )
+        self.directory = location.expanduser().resolve()
+
+    def list_sessions(self) -> tuple[SessionInfo, ...]:
+        """List saved facts; invalid files raise rather than silently disappearing."""
+        if not self.directory.exists():
+            return ()
+        items = []
+        for path in self.directory.glob("*.json"):
+            try:
+                session = self.load(path.stem)
+                items.append(
+                    SessionInfo(
+                        session.id,
+                        Path(session.workspace),
+                        session.provider,
+                        session.model_id,
+                        len(session.messages),
+                        path.stat().st_mtime,
+                    )
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Cannot list saved session {path.name}: {exc}"
+                ) from exc
+        return tuple(sorted(items, key=lambda item: item.updated_at, reverse=True))
 
     def _path(self, session_id: str) -> Path:
         if (
@@ -32,6 +73,7 @@ class History:
             provider=session.provider,
             model_id=session.model_id,
             messages=Messages(session.messages.snapshot()),
+            usage=session.usage,
         )
         data = {
             "version": 1,
@@ -40,6 +82,7 @@ class History:
             "provider": validated.provider,
             "model_id": validated.model_id,
             "messages": validated.messages.snapshot(),
+            "usage": asdict(validated.usage),
         }
         serialized = json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -82,4 +125,7 @@ class History:
             provider=data["provider"],
             model_id=data["model_id"],
             messages=Messages(data["messages"]),
+            usage=UsageTotals.from_dict(data["usage"])
+            if "usage" in data
+            else UsageTotals(unrecorded=bool(data["messages"])),
         )

@@ -5,8 +5,13 @@ description = "Agent harness built on saturnus-llm."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "python-dotenv>=1.2.4",
     "saturnus-llm",
+    "textual>=8.2.8",
 ]
+
+[project.scripts]
+daphnis = "daphnis.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

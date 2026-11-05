@@ -21,6 +21,7 @@ from .context import Context
 from .events import EventBus
 from .models import LLM
 from .session import Session
+from .tools import ToolExecutor
 
 # Shared model selection is protected for the entire Turn, even across Agents.
 _MODEL_LOCKS: WeakKeyDictionary[LLM, asyncio.Lock] = WeakKeyDictionary()
@@ -67,7 +68,7 @@ class Agent:
         self,
         *,
         llm: LLM,
-        tools: ToolRegistry | None = None,
+        tools: ToolRegistry | ToolExecutor | None = None,
         context: Context | None = None,
         events: EventBus | None = None,
         max_requests: int = 20,
@@ -96,11 +97,20 @@ class Agent:
         **options: Any,
     ) -> dict[str, Any]:
         if not stream:
-            return await self.llm.create(messages=messages, **options)
+            response = await self.llm.create(messages=messages, **options)
+            if response.get("usage") is not None:
+                await self.events.emit(
+                    "model.usage", **event_fields, usage=response["usage"]
+                )
+            return response
         accumulator = ResponseAccumulator()
         async with self.llm.stream(messages=messages, **options) as chunks:
             async for chunk in chunks:
                 accumulator.add_chunk(chunk)
+                if chunk.get("usage") is not None:
+                    await self.events.emit(
+                        "model.usage", **event_fields, usage=chunk["usage"]
+                    )
                 await self.events.emit("model.delta", **event_fields, chunk=chunk)
         return accumulator.finalize()
 
@@ -193,7 +203,14 @@ class Agent:
                 if not isinstance(prompt, str):
                     raise TypeError("prompt must be a string.")
                 working.add_user(prompt)
-                definitions = self.tools.definitions() if self.tools is not None else []
+                tools = (
+                    self.tools.bind(
+                        session=session, events=self.events, turn_id=turn_id
+                    )
+                    if isinstance(self.tools, ToolExecutor)
+                    else self.tools
+                )
+                definitions = tools.definitions() if tools is not None else []
                 if definitions:
                     self.llm.require_tools()
                 options = {
@@ -251,7 +268,7 @@ class Agent:
                         session.messages = working
                         status = TurnStatus.COMPLETED
                         break
-                    if self.tools is None or not definitions:
+                    if tools is None or not definitions:
                         raise ValueError(
                             "Model requested tools but no tools are available."
                         )
@@ -266,15 +283,23 @@ class Agent:
                             "tool_call_id": call["id"],
                             "name": call["function"]["name"],
                         }
-                        await self.events.emit("tool.started", **tool_fields)
+                        await self.events.emit(
+                            "tool.started",
+                            **tool_fields,
+                            arguments=call["function"]["arguments"],
+                        )
                         side_effects = True
                         tool_error = None
                         content = None
                         tool_status = "FAILED"
                         try:
                             try:
-                                result = await self.tools.execute(call)
+                                result = await tools.execute(call)
                                 content = result.content
+                                if isinstance(
+                                    tools, ToolExecutor
+                                ) and not result.value.get("ok", False):
+                                    tool_error = result.value.get("error")
                             except (ToolCallValidationError, ToolExecutionError) as exc:
                                 if isinstance(exc.__cause__, FatalToolError):
                                     raise exc.__cause__

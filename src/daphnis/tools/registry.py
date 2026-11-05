@@ -1,0 +1,293 @@
+"""Select and authorize built-in tools before delegating execution to Saturnus."""
+
+import json
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from saturnus import ToolRegistry, ToolResult
+
+from ..events import EventBus
+from ..session import Session
+from .approval import (
+    ApprovalCallback,
+    ApprovalRequest,
+    CleanupError,
+    Decision,
+    Operation,
+    Target,
+    ToolError,
+    failure,
+)
+from .files import MAX_FILE_BYTES, prepare_list, prepare_patch, prepare_read
+from .search import prepare_search
+from .shell import prepare_command
+
+
+@dataclass(frozen=True)
+class _Binding:
+    workspace: Target
+    session_id: str
+    turn_id: str
+    events: EventBus
+
+
+@dataclass(frozen=True)
+class _Permit:
+    name: str
+    arguments: dict[str, Any]
+    operation: Operation
+
+
+_PERMIT: ContextVar[_Permit | None] = ContextVar("daphnis_tool_permit", default=None)
+_PREPARERS = {
+    "read_file": prepare_read,
+    "list_directory": prepare_list,
+    "search": prepare_search,
+    "apply_patch": prepare_patch,
+    "run_command": prepare_command,
+}
+
+
+def _guarded_handler(name):
+    async def handler(**arguments):
+        permit = _PERMIT.get()
+        if permit is None or permit.name != name or permit.arguments != arguments:
+            return failure(
+                "permission_denied", "Use Daphnis ToolExecutor.execute for this tool."
+            )
+        try:
+            permit.operation.verify()
+            return await permit.operation.run()
+        except CleanupError as exc:
+            # Runtime import avoids a dependency cycle with Agent's tools interface.
+            from ..agent import FatalToolError
+
+            raise FatalToolError(str(exc)) from exc
+        except ToolError as exc:
+            return failure(exc.code, str(exc), **exc.details)
+        except UnicodeError as exc:
+            return failure("invalid_utf8", str(exc))
+        except FileNotFoundError as exc:
+            return failure("file_not_found", str(exc))
+        except PermissionError as exc:
+            return failure("permission_denied", str(exc))
+        except OSError as exc:
+            return failure("io_error", str(exc))
+
+    return handler
+
+
+class ToolExecutor:
+    """A selected registry with per-call authorization and per-Turn binding."""
+
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        *,
+        approval: ApprovalCallback | None = None,
+        binding: _Binding | None = None,
+    ) -> None:
+        self._registry = registry
+        self._approval = approval
+        self._binding = binding
+
+    def definitions(self) -> list[dict[str, Any]]:
+        return self._registry.definitions()
+
+    def select(self, names: list[str]) -> "ToolExecutor":
+        return ToolExecutor(
+            self._registry.select(names), approval=self._approval, binding=self._binding
+        )
+
+    def bind(
+        self, *, session: Session, events: EventBus, turn_id: str
+    ) -> "ToolExecutor":
+        workspace = Target.capture(session.workspace, Path.cwd())
+        if workspace.identity is None or not workspace.path.is_dir():
+            raise ValueError(
+                "Built-in tools require an existing Session workspace directory."
+            )
+        return ToolExecutor(
+            self._registry,
+            approval=self._approval,
+            binding=_Binding(workspace, session.id, turn_id, events),
+        )
+
+    async def execute(self, call: dict[str, Any]) -> ToolResult:
+        call = deepcopy(call)
+        arguments = self._registry.validate_call(call)
+        name = call["function"]["name"]
+        binding = self._binding
+
+        def result(value):
+            return ToolResult(
+                tool_call_id=call["id"],
+                value=value,
+                content=json.dumps(value, ensure_ascii=False, allow_nan=False),
+                arguments=deepcopy(arguments),
+            )
+
+        if binding is None:
+            return result(
+                failure(
+                    "permission_denied", "Bind tools to a Session before execution."
+                )
+            )
+        fields = {
+            "session_id": binding.session_id,
+            "turn_id": binding.turn_id,
+            "tool_call_id": call["id"],
+            "name": name,
+        }
+        try:
+            operation = _PREPARERS[name](arguments, binding.workspace.path)
+            if operation.decision == Decision.ASK:
+                request = ApprovalRequest(
+                    session_id=binding.session_id,
+                    turn_id=binding.turn_id,
+                    tool_call_id=call["id"],
+                    tool_name=name,
+                    workspace=str(binding.workspace.path),
+                    reason=operation.reason,
+                    details={
+                        **operation.details,
+                        "targets": [str(t.path) for t in operation.targets],
+                    },
+                )
+                await binding.events.emit(
+                    "tool.approval_requested", **fields, request=asdict(request)
+                )
+                approved = False
+                if self._approval is not None:
+                    try:
+                        approved = await self._approval(deepcopy(request)) is True
+                    except Exception as exc:
+                        raise ToolError(
+                            "permission_denied",
+                            f"Approval callback failed: {type(exc).__name__}",
+                        ) from exc
+                if not approved:
+                    raise ToolError(
+                        "permission_denied",
+                        "Approval was refused or no approval callback is available.",
+                    )
+            elif operation.decision == Decision.DENY:
+                raise ToolError("command_blocked", operation.reason)
+            # The workspace may gain files, but must not be replaced or retargeted.
+            current = Target.capture(
+                binding.workspace.requested, binding.workspace.path
+            )
+            if (
+                current.path != binding.workspace.path
+                or current.identity is None
+                or current.identity[:3] != binding.workspace.identity[:3]
+            ):
+                raise ToolError(
+                    "target_changed", "Session workspace changed; rebind tools."
+                )
+            operation.verify()
+            token = _PERMIT.set(_Permit(name, deepcopy(arguments), operation))
+            try:
+                return await self._registry.execute(call)
+            finally:
+                _PERMIT.reset(token)
+        except ToolError as exc:
+            if exc.code in ("permission_denied", "command_blocked"):
+                await binding.events.emit(
+                    "tool.blocked",
+                    **fields,
+                    decision=Decision.DENY.value
+                    if exc.code == "command_blocked"
+                    else Decision.ASK.value,
+                    code=exc.code,
+                    reason=str(exc),
+                )
+            return result(failure(exc.code, str(exc), **exc.details))
+        except (OSError, ValueError) as exc:
+            return result(failure("invalid_operation", str(exc)))
+
+
+def create_tools(*, approval: ApprovalCallback | None = None) -> ToolExecutor:
+    """Build the five tools; use select() to choose the current enabled subset."""
+    registry = ToolRegistry()
+    text_path = {"type": "string", "minLength": 1}
+    definitions = {
+        "read_file": (
+            "Read bounded UTF-8 text, optionally selecting 1-based inclusive lines.",
+            {
+                "path": text_path,
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_FILE_BYTES,
+                },
+            },
+            ["path"],
+        ),
+        "list_directory": (
+            "List a directory without following symlink entries.",
+            {
+                "path": text_path,
+                "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000},
+            },
+            [],
+        ),
+        "search": (
+            "Bounded filename/content search; skips symlinks and common caches.",
+            {
+                "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "path": text_path,
+                "mode": {"enum": ["filename", "content", "both"]},
+                "case_sensitive": {"type": "boolean"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
+            },
+            ["query"],
+        ),
+        "apply_patch": (
+            "Apply plain unified diff: ---/+++ headers (a/ and b/ optional), "
+            "numbered @@ hunks, /dev/null for create/delete. Exact original text "
+            "required; no rename or Git metadata headers. Existing changes "
+            "require approval. Reports partial filesystem effects.",
+            {"patch": {"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES}},
+            ["patch"],
+        ),
+        "run_command": (
+            "Execute argv, never a shell string. No pipelines, shell/inline "
+            "interpreters or dangerous commands. Scripts/builds/uncertain writes "
+            "require approval; output is bounded.",
+            {
+                "argv": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 256,
+                    "items": {"type": "string", "maxLength": 65536},
+                },
+                "cwd": text_path,
+                "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600},
+                "max_output_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_FILE_BYTES,
+                },
+            },
+            ["argv"],
+        ),
+    }
+    for name, (description, properties, required) in definitions.items():
+        registry.register(
+            name=name,
+            description=description,
+            parameters={
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+            handler=_guarded_handler(name),
+        )
+    return ToolExecutor(registry, approval=approval)
