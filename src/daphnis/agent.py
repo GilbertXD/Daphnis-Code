@@ -15,6 +15,8 @@ from saturnus import (
     ToolCallValidationError,
     ToolExecutionError,
     ToolRegistry,
+    get_finish_reason,
+    get_message,
 )
 
 from .context import Context
@@ -116,30 +118,20 @@ class Agent:
 
     @staticmethod
     def _parse_response(response: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-        choices = response.get("choices")
-        if not isinstance(choices, list) or len(choices) != 1:
+        message = get_message(response)
+        if len(response["choices"]) != 1:
             raise ValueError("Agent requires exactly one response choice.")
-        choice = choices[0]
-        if not isinstance(choice, dict) or choice.get("index", 0) != 0:
-            raise ValueError("Agent requires response choice index 0.")
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            raise ValueError("Response has no complete assistant message.")
-        message = deepcopy(message)
         message.setdefault("role", "assistant")
         if message["role"] != "assistant":
             raise ValueError("Expected an assistant response.")
-        Messages([message])  # Reuse Saturnus structure/JSON validation.
-        reason = choice.get("finish_reason")
-        if reason is not None and not isinstance(reason, str):
-            raise ValueError("Invalid finish_reason type.")
+        reason = get_finish_reason(response)
         calls = message.get("tool_calls")
         if calls is not None and not isinstance(calls, list):
             raise ValueError("Tool calls must be a list or null.")
         if reason == "stop" and calls:
             raise ValueError("A stop response unexpectedly contains tool calls.")
         if reason == "tool_calls":
-            if not isinstance(calls, list) or not calls:
+            if not calls:
                 raise ValueError("Tool-call response has no tool calls.")
             ids: set[str] = set()
             for call in calls:

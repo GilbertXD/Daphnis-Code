@@ -62,6 +62,15 @@ def tool_call(call_id="call-1", name="echo", arguments='{"text": "hello"}'):
     }
 
 
+def stream_reply(*chunks):
+    data = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+    return httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=data + "data: [DONE]\n\n",
+    )
+
+
 def registry(handler=None):
     tools = ToolRegistry()
     tools.register(
@@ -167,6 +176,131 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state.messages), 7)
         self.assertEqual(len(tool_events), 4)
 
+    async def test_tool_turn_matches_across_nonstreaming_and_streaming(self):
+        call = tool_call()
+        responses = [reply("", finish="tool_calls", calls=[call]), reply()]
+        del responses[1]["choices"][0]["message"]["role"]
+        for response in responses:
+            response["usage"] = {"total_tokens": 12}
+        event_names = (
+            "turn.started",
+            "model.started",
+            "model.usage",
+            "model.delta",
+            "model.finished",
+            "tool.started",
+            "tool.finished",
+            "turn.finished",
+        )
+        observed = []
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                events = EventBus()
+                seen, requests = [], []
+                for name in event_names:
+                    events.on(name, seen.append)
+
+                def handler(request, requests=requests):
+                    body = json.loads(request.content)
+                    response = responses[len(requests)]
+                    requests.append(body["messages"])
+                    if not body.get("stream"):
+                        return httpx.Response(200, json=response)
+                    choice = response["choices"][0]
+                    delta = dict(choice["message"])
+                    if "tool_calls" in delta:
+                        delta["tool_calls"] = [{"index": 0, **call}]
+                    chunk = {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": choice["finish_reason"],
+                            }
+                        ],
+                        "usage": response["usage"],
+                    }
+                    return stream_reply(chunk)
+
+                state = session()
+                async with make_llm(handler) as llm:
+                    result = await Agent(llm=llm, tools=registry(), events=events).run(
+                        session=state, prompt="use tool", stream=stream
+                    )
+
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                self.assertEqual((result.model_requests, result.tool_calls), (2, 1))
+                self.assertEqual(result.message["role"], "assistant")
+                self.assertEqual(result.message["content"], "done")
+                committed = state.messages.snapshot()
+                self.assertEqual(requests[1], committed[:-1])
+                self.assertEqual(
+                    requests[1][-1],
+                    {"role": "tool", "tool_call_id": "call-1", "content": "hello"},
+                )
+                self.assertTrue(
+                    all(
+                        event.session_id == state.id and event.turn_id == result.turn_id
+                        for event in seen
+                    )
+                )
+                deltas = [event.data for event in seen if event.name == "model.delta"]
+                self.assertEqual(len(deltas), 2 if stream else 0)
+                if stream:
+                    self.assertEqual(deltas[0]["request_number"], 1)
+                    self.assertEqual(
+                        deltas[0]["chunk"]["choices"][0]["finish_reason"], "tool_calls"
+                    )
+                observed.append(
+                    (
+                        committed,
+                        [
+                            (event.name, event.data)
+                            for event in seen
+                            if event.name != "model.delta"
+                        ],
+                    )
+                )
+
+        self.assertEqual(observed[0], observed[1])
+        _, shared_events = observed[0]
+        self.assertEqual(
+            [name for name, _ in shared_events],
+            [
+                "turn.started",
+                "model.started",
+                "model.usage",
+                "model.finished",
+                "tool.started",
+                "tool.finished",
+                "model.started",
+                "model.usage",
+                "model.finished",
+                "turn.finished",
+            ],
+        )
+        self.assertEqual(
+            [data for name, data in shared_events if name == "model.finished"],
+            [
+                {
+                    "request_number": 1,
+                    "finish_reason": "tool_calls",
+                    "response": responses[0],
+                },
+                {
+                    "request_number": 2,
+                    "finish_reason": "stop",
+                    "response": responses[1],
+                },
+            ],
+        )
+        tool_finished = next(
+            data for name, data in shared_events if name == "tool.finished"
+        )
+        self.assertEqual(tool_finished["tool_call_id"], "call-1")
+        self.assertEqual(tool_finished["content"], "hello")
+        self.assertEqual(shared_events[-1][1]["status"], "COMPLETED")
+
     async def test_stream_and_event_isolation_subscription_and_unsubscription(self):
         chunks = [
             {
@@ -182,12 +316,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         def handler(request):
-            data = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                content=data + "data: [DONE]\n\n",
-            )
+            return stream_reply(*chunks)
 
         events = EventBus()
         seen = []
@@ -236,6 +365,52 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             "custom.notification", session_id=state.id, turn_id=result.turn_id, value=2
         )
         self.assertEqual([event.data["value"] for event in custom], [1])
+
+    async def test_invalid_response_does_not_commit_or_start_tools(self):
+        valid = reply()["choices"][0]
+        cases = (
+            ({"choices": [valid, {**valid, "index": 1}]}, "exactly one"),
+            ({"choices": [{**valid, "index": 1}]}, "no choice with index 0"),
+            ({"choices": [{"message": valid["message"]}]}, ".index must be"),
+            ({"choices": [{**valid, "message": None}]}, ".message must be"),
+            (
+                {"choices": [{**valid, "message": {"role": "user"}}]},
+                "Expected an assistant",
+            ),
+            (reply(content=42), ".message.content must be"),
+            (reply(finish=False), ".finish_reason must be"),
+            (reply(finish=None), "Model did not finish normally"),
+            (
+                reply(calls=[tool_call()]),
+                "stop response unexpectedly contains tool calls",
+            ),
+            (reply(finish="tool_calls", calls=[]), "no tool calls"),
+            (
+                reply(finish="tool_calls", calls=[tool_call(arguments={})]),
+                "Incomplete or duplicate tool-call identity",
+            ),
+        )
+        for response, error in cases:
+            with self.subTest(error=error):
+                state = session()
+                state.messages.add_user("previous question")
+                state.messages.add_assistant("previous answer")
+                original = state.messages.snapshot()
+                events = EventBus()
+                tool_events = []
+                events.on("tool.started", tool_events.append)
+                async with make_llm(
+                    lambda request, response=response: httpx.Response(
+                        200, json=response
+                    )
+                ) as llm:
+                    result = await Agent(llm=llm, tools=registry(), events=events).run(
+                        session=state, prompt="new question"
+                    )
+                self.assertEqual(result.status, TurnStatus.FAILED)
+                self.assertIn(error, result.error)
+                self.assertEqual(state.messages.snapshot(), original)
+                self.assertEqual(tool_events, [])
 
     async def test_failure_limits_and_unsafe_tools_do_not_commit(self):
         cases = (
