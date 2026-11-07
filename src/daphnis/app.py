@@ -5,16 +5,28 @@ import logging
 import os
 import shlex
 from collections.abc import Mapping, Sequence
+from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from saturnus import ChatClient
+
 from .agent import Agent, TurnResult, TurnStatus
 from .context import Context
 from .events import EventBus
 from .history import History, SessionInfo
-from .models import LLM, MODELS, CapabilityError, ModelInfo, get_model, list_models
+from .models import (
+    MODELS,
+    CapabilityError,
+    ModelInfo,
+    list_models,
+    provider_compatibility,
+    require_tools,
+    resolve_model,
+)
+from .models.models import validate_catalog
 from .session import Session
 from .tools import ApprovalRequest, create_tools
 from .usage import UsageTracker
@@ -88,10 +100,11 @@ class Application:
         interactive: bool = False,
     ) -> None:
         self.catalog = tuple(catalog)
+        validate_catalog(self.catalog)
         self._connections = {
             name: dict(options) for name, options in connections.items()
         }
-        self._llms: dict[str, LLM] = {}
+        self._clients: dict[str, ChatClient] = {}
         self._closed = False
         self.history = history if history is not None else History()
         self.session = Session(
@@ -111,32 +124,34 @@ class Application:
         self.all_tools = tuple(
             item["function"]["name"] for item in self._tools.definitions()
         )
-        self._llm(provider, model_id)
-        self.enabled_tools = self.all_tools if self.model.supports_tools is True else ()
+        model = self._model_for(provider, model_id)
+        self._client(provider)
+        self.enabled_tools = self.all_tools if model.supports_tools is True else ()
 
-    def _llm(self, provider: str, model_id: str) -> LLM:
+    def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:
             raise ValueError(f"厂商 {provider} 未配置独立连接。")
-        if provider not in self._llms:
-            options = {"timeout": 60.0, **self._connections[provider]}
-            self._llms[provider] = LLM(
-                provider=provider,
-                model_id=model_id,
-                catalog=self.catalog,
-                **options,
+        return self._connections[provider]
+
+    def _client(self, provider: str) -> ChatClient:
+        if provider not in self._clients:
+            options = {"timeout": 60.0, **self._connection(provider)}
+            options["compatibility"] = provider_compatibility(
+                provider, override=options.get("compatibility")
             )
-        return self._llms[provider]
+            self._clients[provider] = ChatClient(**options)
+        return self._clients[provider]
+
+    def _model_for(self, provider: str, model_id: str) -> ModelInfo:
+        self._connection(provider)
+        provider_compatibility(provider)
+        return resolve_model(provider, model_id, catalog=self.catalog)
 
     @property
     def model(self) -> ModelInfo:
-        try:
-            return get_model(
-                self.session.provider, self.session.model_id, catalog=self.catalog
-            )
-        except KeyError:
-            if self.session.provider == "compatible":
-                return ModelInfo(provider="compatible", id=self.session.model_id)
-            raise
+        return resolve_model(
+            self.session.provider, self.session.model_id, catalog=self.catalog
+        )
 
     @property
     def running(self) -> bool:
@@ -170,8 +185,7 @@ class Application:
 
     def set_model(self, provider: str, model_id: str) -> str:
         self._idle()
-        llm = self._llm(provider, model_id)
-        llm.select_model(model_id)
+        model = self._model_for(provider, model_id)
         updated = Session(
             id=self.session.id,
             workspace=self.session.workspace,
@@ -184,11 +198,11 @@ class Application:
         self.session = updated
         notices = [f"模型：{provider} / {model_id}"]
         if self.thinking is not None and self.thinking not in (
-            self.model.thinking_modes or ()
+            model.thinking_modes or ()
         ):
             self.thinking = None
             notices.append("原思考档位不适用，已恢复服务端默认。")
-        if self.enabled_tools and self.model.supports_tools is not True:
+        if self.enabled_tools and model.supports_tools is not True:
             self.enabled_tools = ()
             notices.append("工具能力未确认支持，已停用工具。")
         return "\n".join(notices)
@@ -203,10 +217,7 @@ class Application:
         self._idle()
         self._tools.select(list(names))  # Saturnus validates names and duplicates.
         if names:
-            self._llm(self.session.provider, self.session.model_id).select_model(
-                self.session.model_id
-            )
-            self._llm(self.session.provider, self.session.model_id).require_tools()
+            require_tools(self.model)
         self.enabled_tools = tuple(names)
 
     def sessions(self) -> tuple[SessionInfo, ...]:
@@ -230,13 +241,12 @@ class Application:
         restored = self.history.load(session_id)
         if not Path(restored.workspace).is_dir():
             raise ValueError("该会话原工作区已不存在。")
-        llm = self._llm(restored.provider, restored.model_id)
-        llm.select_model(restored.model_id)
+        model = self._model_for(restored.provider, restored.model_id)
         self.session = restored
         self.usage.select_session(restored.id, restored.usage)
-        if self.thinking not in (self.model.thinking_modes or ()):
+        if self.thinking not in (model.thinking_modes or ()):
             self.thinking = None
-        if self.model.supports_tools is not True:
+        if model.supports_tools is not True:
             self.enabled_tools = ()
 
     async def _request_approval(self, request: ApprovalRequest) -> bool:
@@ -269,9 +279,16 @@ class Application:
 
     async def send(self, prompt: str, *, stream: bool = True) -> TurnResult:
         self._idle()
-        llm = self._llm(self.session.provider, self.session.model_id)
+        session = self.session
+        provider = session.provider
+        custom_compatibility = (
+            self._connection(provider).get("compatibility") is not None
+        )
         agent = Agent(
-            llm=llm,
+            client=self._client(provider),
+            provider=provider,
+            catalog=self.catalog,
+            custom_compatibility=custom_compatibility,
             tools=self._tools.select(list(self.enabled_tools)),
             events=self.events,
             context=Context(
@@ -286,7 +303,7 @@ class Application:
         async def run():
             try:
                 result = await agent.run(
-                    session=self.session,
+                    session=session,
                     prompt=prompt,
                     stream=stream,
                     thinking_mode=self.thinking,
@@ -336,13 +353,14 @@ class Application:
         if self._closed:
             return
         self._closed = True
-        try:
-            await self.cancel()
-            await self.events.drain()
-        finally:
-            self.usage.close()
-            for llm in self._llms.values():
-                await llm.aclose()
+        async with AsyncExitStack() as stack:
+            for client in self._clients.values():
+                stack.push_async_callback(client.aclose)
+            try:
+                await self.cancel()
+                await self.events.drain()
+            finally:
+                self.usage.close()
 
     async def command(self, text: str) -> CommandResult:
         words = shlex.split(text)

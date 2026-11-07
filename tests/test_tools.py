@@ -10,10 +10,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from saturnus import ToolCallValidationError
+from saturnus import ChatClient, ToolCallValidationError
 
 from daphnis import Agent, EventBus, Session, TurnStatus
-from daphnis.models import LLM, ModelInfo
+from daphnis.models import ModelInfo
 from daphnis.tools import create_tools
 
 
@@ -366,24 +366,27 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            async with LLM(
-                provider="compatible",
-                model_id="test",
+            async with ChatClient(
                 base_url="https://model.test",
-                catalog=(
-                    ModelInfo(id="test", provider="compatible", supports_tools=True),
-                ),
                 transport=httpx.MockTransport(handler),
-            ) as llm:
+            ) as client:
                 state = Session(
                     workspace=workspace, provider="compatible", model_id="test"
                 )
                 tools = create_tools(approval=approve_change).select(
                     ["read_file", "apply_patch"]
                 )
-                result = await Agent(llm=llm, tools=tools, events=events).run(
-                    session=state, prompt="read, create, modify"
-                )
+                result = await Agent(
+                    client=client,
+                    provider="compatible",
+                    catalog=(
+                        ModelInfo(
+                            id="test", provider="compatible", supports_tools=True
+                        ),
+                    ),
+                    tools=tools,
+                    events=events,
+                ).run(session=state, prompt="read, create, modify")
             self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
             self.assertEqual(result.tool_calls, 3)
             self.assertEqual(len(approvals), 1)

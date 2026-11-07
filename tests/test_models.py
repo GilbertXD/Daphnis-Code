@@ -2,9 +2,17 @@ import json
 import unittest
 
 import httpx
-from saturnus import Compatibility
+from saturnus import ChatClient, Compatibility, ValidationError
 
-from daphnis.models import LLM, CapabilityError, ModelInfo, get_model
+from daphnis import Agent
+from daphnis.models import (
+    CapabilityError,
+    ModelInfo,
+    get_model,
+    prepare_request_options,
+    provider_compatibility,
+    resolve_model,
+)
 
 MESSAGES = [{"role": "user", "content": "hello"}]
 TOOLS = [
@@ -30,6 +38,20 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                 {"reasoning_effort": "low"},
             ),
             (
+                "deepseek",
+                "deepseek-flash",
+                "off",
+                "max_tokens",
+                {"reasoning_effort": "none"},
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-pro",
+                "on",
+                "max_tokens",
+                {"reasoning_effort": "high"},
+            ),
+            (
                 "mimo",
                 "mimo-v2.6-pro",
                 "off",
@@ -38,46 +60,54 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             ),
             ("compatible", "my-local-model", None, "max_tokens", {}),
         )
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=RESPONSE)
+
         for provider, model_id, mode, output_field, thinking_fields in cases:
-            with self.subTest(provider=provider):
-
-                def handler(request):
-                    body = json.loads(request.content)
-                    self.assertEqual(request.url.host, f"{provider}.test")
-                    self.assertEqual(request.url.path, "/v1/chat/completions")
-                    self.assertEqual(
-                        request.headers["authorization"], "Bearer test-key"
-                    )
-                    self.assertEqual(request.headers["x-request"], "test")
-                    self.assertEqual(body["model"], model_id)
-                    self.assertEqual(body[output_field], 512)
-                    self.assertEqual(body["vendor_option"], {"keep": True})
-                    self.assertNotIn("output_limit", body)
-                    self.assertNotIn("thinking_mode", body)
-                    for field, value in thinking_fields.items():
-                        self.assertEqual(body[field], value)
-                    if mode is None:
-                        self.assertNotIn("thinking", body)
-                        self.assertNotIn("reasoning_effort", body)
-                    return httpx.Response(200, json=RESPONSE)
-
-                async with LLM(
-                    provider=provider,
-                    model_id=model_id,
+            with self.subTest(provider=provider, mode=mode):
+                model = resolve_model(provider, model_id)
+                extra_body = {"vendor_option": {"keep": True}}
+                options = prepare_request_options(
+                    model=model,
+                    thinking_mode=mode,
+                    output_limit=512,
+                    extra_body=extra_body,
+                )
+                async with ChatClient(
                     base_url=f"https://{provider}.test/v1",
                     api_key="test-key",
+                    compatibility=provider_compatibility(provider),
                     transport=httpx.MockTransport(handler),
-                ) as llm:
-                    response = await llm.create(
+                ) as client:
+                    response = await client.create(
+                        model=model.id,
                         messages=MESSAGES,
-                        thinking_mode=mode,
-                        output_limit=512,
-                        extra_body={"vendor_option": {"keep": True}},
+                        extra_body=options,
                         extra_headers={"x-request": "test"},
                     )
-                    self.assertEqual(response, RESPONSE)
+                self.assertEqual(response, RESPONSE)
+                self.assertEqual(extra_body, {"vendor_option": {"keep": True}})
+                request = requests.pop()
+                body = json.loads(request.content)
+                self.assertEqual(request.url.host, f"{provider}.test")
+                self.assertEqual(request.url.path, "/v1/chat/completions")
+                self.assertEqual(request.headers["authorization"], "Bearer test-key")
+                self.assertEqual(request.headers["x-request"], "test")
+                self.assertEqual(
+                    body,
+                    {
+                        "model": model_id,
+                        "messages": MESSAGES,
+                        output_field: 512,
+                        **extra_body,
+                        **thinking_fields,
+                    },
+                )
 
-    async def test_capability_rejection_and_model_switch(self):
+    def test_capability_rejection_and_provider_scoped_catalog(self):
         catalog = (
             ModelInfo(
                 id="shared",
@@ -95,60 +125,45 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                 id="plain", provider="deepseek", supports_tools=False, thinking_modes=()
             ),
         )
-        self.assertTrue(get_model("deepseek", "shared", catalog=catalog).supports_tools)
+        supported = get_model("deepseek", "shared", catalog=catalog)
+        self.assertEqual(
+            prepare_request_options(model=supported, tools=TOOLS, thinking_mode="high"),
+            {"tools": TOOLS, "thinking_mode": "high"},
+        )
         self.assertFalse(
             get_model("compatible", "shared", catalog=catalog).supports_tools
         )
 
-        def handler(request):
-            body = json.loads(request.content)
-            self.assertEqual(body["tools"], TOOLS)
-            self.assertEqual(body["reasoning_effort"], "high")
-            return httpx.Response(200, json=RESPONSE)
-
-        async with LLM(
-            provider="deepseek",
-            model_id="shared",
-            catalog=catalog,
-            base_url="https://deepseek.test/v1",
-            transport=httpx.MockTransport(handler),
-        ) as llm:
-            await llm.create(messages=MESSAGES, tools=TOOLS, thinking_mode="high")
-            llm.select_model("plain")
-            with self.assertRaisesRegex(CapabilityError, "unsupported"):
-                await llm.create(messages=MESSAGES, tools=TOOLS)
-            with self.assertRaisesRegex(CapabilityError, "unsupported"):
-                await llm.create(messages=MESSAGES, thinking_mode="high")
-
-        def unexpected_request(request):
-            self.fail("Invalid requests must be rejected before network I/O.")
-
-        async with LLM(
-            provider="compatible",
-            model_id="unregistered",
-            base_url="https://local.test/v1",
-            transport=httpx.MockTransport(unexpected_request),
-        ) as llm:
-            self.assertIsNone(llm.model.supports_tools)
-            self.assertIsNone(llm.model.thinking_modes)
-            with self.assertRaisesRegex(CapabilityError, "unknown"):
-                await llm.create(messages=MESSAGES, tools=TOOLS)
-            with self.assertRaisesRegex(CapabilityError, "unknown"):
-                await llm.create(messages=MESSAGES, thinking_mode="on")
-            with self.assertRaisesRegex(ValueError, "explicit request arguments"):
-                await llm.create(
-                    messages=MESSAGES, extra_body={"thinking": {"type": "enabled"}}
+        plain = resolve_model("deepseek", "plain", catalog=catalog)
+        unknown = resolve_model("compatible", "unregistered", catalog=catalog)
+        self.assertIsNone(unknown.supports_tools)
+        self.assertIsNone(unknown.thinking_modes)
+        for model, error in ((plain, "unsupported"), (unknown, "unknown")):
+            with self.subTest(model=model.id):
+                with self.assertRaisesRegex(CapabilityError, error):
+                    prepare_request_options(model=model, tools=TOOLS)
+                with self.assertRaisesRegex(CapabilityError, error):
+                    prepare_request_options(model=model, thinking_mode="high")
+                with self.assertRaisesRegex(CapabilityError, error):
+                    prepare_request_options(
+                        model=model, extra_body={"tool_choice": "auto"}
+                    )
+                self.assertEqual(
+                    prepare_request_options(
+                        model=model, extra_body={"tool_choice": "none"}
+                    ),
+                    {"tool_choice": "none"},
                 )
 
     async def test_explicit_generic_capabilities_and_compatibility(self):
-        catalog = (
-            ModelInfo(
-                id="custom",
-                provider="compatible",
-                supports_tools=True,
-                thinking_modes=("off", "high"),
-            ),
+        model = ModelInfo(
+            id="custom",
+            provider="compatible",
+            supports_tools=True,
+            thinking_modes=("off", "high"),
         )
+        with self.assertRaisesRegex(ValueError, "explicit Compatibility mapping"):
+            prepare_request_options(model=model, thinking_mode="high")
 
         def handler(request):
             body = json.loads(request.content)
@@ -157,25 +172,70 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["tools"], TOOLS)
             return httpx.Response(200, json=RESPONSE)
 
-        async with LLM(
-            provider="compatible",
-            model_id="custom",
-            catalog=catalog,
+        override = Compatibility(
+            field_mappings={
+                "thinking_mode": "reasoning_effort",
+                "output_limit": "max_completion_tokens",
+            }
+        )
+        async with ChatClient(
             base_url="https://custom.test/v1",
             transport=httpx.MockTransport(handler),
-            compatibility=Compatibility(
-                field_mappings={
-                    "thinking_mode": "reasoning_effort",
-                    "output_limit": "max_completion_tokens",
-                }
-            ),
-        ) as llm:
-            await llm.create(
+            compatibility=provider_compatibility("compatible", override=override),
+        ) as client:
+            await client.create(
+                model=model.id,
                 messages=MESSAGES,
-                thinking_mode="high",
-                tools=TOOLS,
-                output_limit=128,
+                extra_body=prepare_request_options(
+                    model=model,
+                    thinking_mode="high",
+                    tools=TOOLS,
+                    output_limit=128,
+                    custom_compatibility=True,
+                ),
             )
+
+    async def test_managed_fields_and_invalid_output_limits_are_rejected(self):
+        model = get_model("deepseek", "deepseek-flash")
+        for field in (
+            "model",
+            "messages",
+            "stream",
+            "tools",
+            "thinking_mode",
+            "thinking",
+            "reasoning_effort",
+            "output_limit",
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "explicit request arguments"),
+            ):
+                prepare_request_options(model=model, extra_body={field: None})
+        for limit in (0, -1, True, "512"):
+            with (
+                self.subTest(limit=limit),
+                self.assertRaisesRegex(ValueError, "positive integer"),
+            ):
+                prepare_request_options(model=model, output_limit=limit)
+        with self.assertRaises(TypeError):
+            prepare_request_options(model=model, extra_body=[])
+
+        async with ChatClient(
+            base_url="https://model.test",
+            compatibility=provider_compatibility(model.provider),
+            transport=httpx.MockTransport(
+                lambda request: self.fail("unexpected request")
+            ),
+        ) as client:
+            with self.assertRaisesRegex(ValidationError, "max_tokens.*already present"):
+                await client.create(
+                    model=model.id,
+                    messages=MESSAGES,
+                    extra_body=prepare_request_options(
+                        model=model, output_limit=512, extra_body={"max_tokens": 128}
+                    ),
+                )
 
     async def test_stream_preserves_raw_chunks_and_closes_on_exit(self):
         chunk = {
@@ -196,7 +256,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
         for early_exit in (False, True):
             tracked = TrackedStream()
 
-            def handler(request):
+            def handler(request, tracked=tracked):
                 body = json.loads(request.content)
                 self.assertIs(body["stream"], True)
                 self.assertEqual(body["thinking"], {"type": "enabled"})
@@ -206,14 +266,18 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                     stream=tracked,
                 )
 
-            async with LLM(
-                provider="mimo",
-                model_id="mimo-v2.6-flash",
+            model = get_model("mimo", "mimo-v2.6-flash")
+            async with ChatClient(
                 base_url="https://mimo.test/v1",
+                compatibility=provider_compatibility(model.provider),
                 transport=httpx.MockTransport(handler),
-            ) as llm:
+            ) as client:
                 received = []
-                async with llm.stream(messages=MESSAGES, thinking_mode="on") as chunks:
+                async with client.stream(
+                    model=model.id,
+                    messages=MESSAGES,
+                    extra_body=prepare_request_options(model=model, thinking_mode="on"),
+                ) as chunks:
                     async for item in chunks:
                         received.append(item)
                         if early_exit:
@@ -223,19 +287,15 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_model_and_duplicate_key_are_rejected(self):
         with self.assertRaises(KeyError):
-            LLM(
-                provider="deepseek",
-                model_id="not-registered",
-                base_url="https://test.test",
-            )
+            resolve_model("deepseek", "not-registered")
+        with self.assertRaisesRegex(ValueError, "Unknown provider"):
+            provider_compatibility("unknown")
         duplicate = ModelInfo(id="duplicate", provider="compatible")
-        with self.assertRaisesRegex(ValueError, "duplicate"):
-            LLM(
-                provider="compatible",
-                model_id="duplicate",
-                base_url="https://test.test",
-                catalog=(duplicate, duplicate),
-            )
+        async with ChatClient(base_url="https://test.test") as client:
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                Agent(
+                    client=client, provider="compatible", catalog=(duplicate, duplicate)
+                )
 
 
 if __name__ == "__main__":

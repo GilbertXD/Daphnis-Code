@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from saturnus import Messages, ToolRegistry
+from saturnus import ChatClient, Messages, ToolRegistry
 
 from daphnis import (
     Agent,
@@ -17,7 +17,7 @@ from daphnis import (
     Session,
     TurnStatus,
 )
-from daphnis.models import LLM, ModelInfo
+from daphnis.models import ModelInfo, provider_compatibility
 
 CATALOG = tuple(
     ModelInfo(id=name, provider="compatible", supports_tools=True, thinking_modes=())
@@ -25,14 +25,16 @@ CATALOG = tuple(
 )
 
 
-def make_llm(handler):
-    return LLM(
-        provider="compatible",
-        model_id="model-a",
+def make_client(handler):
+    return ChatClient(
         base_url="https://model.test/v1",
-        catalog=CATALOG,
+        compatibility=provider_compatibility("compatible"),
         transport=httpx.MockTransport(handler),
     )
+
+
+def make_agent(client, **options):
+    return Agent(client=client, provider="compatible", catalog=CATALOG, **options)
 
 
 def session(model_id="model-a"):
@@ -101,9 +103,9 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(state.messages), 2 * (len(requests) - 1))
             return httpx.Response(200, json=reply(f"answer-{len(requests)}"))
 
-        async with make_llm(handler) as llm:
-            agent = Agent(
-                llm=llm, context=Context(system_prompt="Be concise."), tools=registry()
+        async with make_client(handler) as client:
+            agent = make_agent(
+                client, context=Context(system_prompt="Be concise."), tools=registry()
             )
             for text in ("first", "second"):
                 result = await agent.run(session=state, prompt=text)
@@ -166,8 +168,8 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             )
             return httpx.Response(200, json=reply())
 
-        async with make_llm(handler) as llm:
-            result = await Agent(llm=llm, tools=tools, events=events).run(
+        async with make_client(handler) as client:
+            result = await make_agent(client, tools=tools, events=events).run(
                 session=state, prompt="use tools"
             )
         self.assertEqual(result.status, TurnStatus.COMPLETED)
@@ -223,10 +225,10 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                     return stream_reply(chunk)
 
                 state = session()
-                async with make_llm(handler) as llm:
-                    result = await Agent(llm=llm, tools=registry(), events=events).run(
-                        session=state, prompt="use tool", stream=stream
-                    )
+                async with make_client(handler) as client:
+                    result = await make_agent(
+                        client, tools=registry(), events=events
+                    ).run(session=state, prompt="use tool", stream=stream)
 
                 self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertEqual((result.model_requests, result.tool_calls), (2, 1))
@@ -335,9 +337,9 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         events.on("model.delta", async_failure)
         unsubscribe = events.on("model.delta", seen.append)
         state = session()
-        async with make_llm(handler) as llm:
+        async with make_client(handler) as client:
             with self.assertLogs("daphnis.events", level="ERROR"):
-                result = await Agent(llm=llm, events=events).run(
+                result = await make_agent(client, events=events).run(
                     session=state, prompt="stream", stream=True
                 )
                 await events.drain()
@@ -399,14 +401,14 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 events = EventBus()
                 tool_events = []
                 events.on("tool.started", tool_events.append)
-                async with make_llm(
+                async with make_client(
                     lambda request, response=response: httpx.Response(
                         200, json=response
                     )
-                ) as llm:
-                    result = await Agent(llm=llm, tools=registry(), events=events).run(
-                        session=state, prompt="new question"
-                    )
+                ) as client:
+                    result = await make_agent(
+                        client, tools=registry(), events=events
+                    ).run(session=state, prompt="new question")
                 self.assertEqual(result.status, TurnStatus.FAILED)
                 self.assertIn(error, result.error)
                 self.assertEqual(state.messages.snapshot(), original)
@@ -443,10 +445,10 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 state.messages.add_user("old question")
                 state.messages.add_assistant("old answer")
                 original = state.messages.snapshot()
-                async with make_llm(
+                async with make_client(
                     lambda request: httpx.Response(200, json=response)
-                ) as llm:
-                    result = await Agent(llm=llm, tools=tools, **options).run(
+                ) as client:
+                    result = await make_agent(client, tools=tools, **options).run(
                         session=state, prompt="new question"
                     )
                 self.assertEqual(result.status, TurnStatus.FAILED)
@@ -457,12 +459,12 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             raise FatalToolError("environment unavailable")
 
         state = session()
-        async with make_llm(
+        async with make_client(
             lambda request: httpx.Response(
                 200, json=reply(None, finish="tool_calls", calls=[tool_call()])
             )
-        ) as llm:
-            result = await Agent(llm=llm, tools=registry(unsafe)).run(
+        ) as client:
+            result = await make_agent(client, tools=registry(unsafe)).run(
                 session=state, prompt="use tool"
             )
         self.assertEqual(result.status, TurnStatus.FAILED)
@@ -498,13 +500,13 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         events.on("model.delta", lambda event: received.set())
         events.on("turn.finished", finished.append)
         state = session()
-        async with make_llm(
+        async with make_client(
             lambda request: httpx.Response(
                 200, headers={"content-type": "text/event-stream"}, stream=stream
             )
-        ) as llm:
+        ) as client:
             task = asyncio.create_task(
-                Agent(llm=llm, events=events).run(
+                make_agent(client, events=events).run(
                     session=state, prompt="stream", stream=True
                 )
             )
@@ -541,8 +543,8 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         tool_finished = []
         events.on("tool.finished", tool_finished.append)
         state = session()
-        async with make_llm(handler) as llm:
-            agent = Agent(llm=llm, tools=registry(handler_tool), events=events)
+        async with make_client(handler) as client:
+            agent = make_agent(client, tools=registry(handler_tool), events=events)
             task = asyncio.create_task(agent.run(session=state, prompt="tool"))
             await asyncio.wait_for(entered.wait(), 2)
             task.cancel()
@@ -555,10 +557,10 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             result = await agent.run(session=state, prompt="next")
             self.assertEqual(result.status, TurnStatus.COMPLETED)
 
-    async def test_session_exclusion_and_shared_model_selection_are_serialized(self):
+    async def test_shared_client_allows_parallel_sessions_with_distinct_models(self):
         entered = asyncio.Event()
         release = asyncio.Event()
-        model_ids = []
+        requests = []
 
         async def wait_tool(text):
             entered.set()
@@ -567,33 +569,105 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request):
             body = json.loads(request.content)
-            model_ids.append(body["model"])
+            requests.append((body["model"], body["max_tokens"]))
             response = (
                 reply(None, finish="tool_calls", calls=[tool_call()])
-                if len(model_ids) == 1
-                else reply()
+                if len(requests) == 1
+                else reply(body["model"])
             )
             return httpx.Response(200, json=response)
 
         first_session, second_session = session(), session("model-b")
-        async with make_llm(handler) as llm:
-            first = Agent(llm=llm, tools=registry(wait_tool))
-            second = Agent(llm=llm)
-            one = asyncio.create_task(first.run(session=first_session, prompt="one"))
-            await asyncio.wait_for(entered.wait(), 2)
-            two = asyncio.create_task(second.run(session=second_session, prompt="two"))
-            await asyncio.sleep(0)
-            with self.assertRaisesRegex(RuntimeError, "active Turn"):
-                await second.run(session=first_session, prompt="overlap")
-            self.assertEqual(model_ids, ["model-a"])
-            release.set()
-            results = await asyncio.wait_for(asyncio.gather(one, two), 2)
-        self.assertEqual(model_ids, ["model-a", "model-a", "model-b"])
-        self.assertTrue(
-            all(result.status == TurnStatus.COMPLETED for result in results)
+        async with make_client(handler) as client:
+            first = make_agent(client, tools=registry(wait_tool))
+            second = make_agent(client)
+            one = asyncio.create_task(
+                first.run(session=first_session, prompt="one", output_limit=100)
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                with self.assertRaisesRegex(RuntimeError, "active Turn"):
+                    await second.run(session=first_session, prompt="overlap")
+                two = await asyncio.wait_for(
+                    second.run(session=second_session, prompt="two", output_limit=200),
+                    2,
+                )
+                self.assertEqual(two.status, TurnStatus.COMPLETED, two.error)
+                self.assertEqual(two.message["content"], "model-b")
+                self.assertFalse(one.done())
+                self.assertEqual(len(first_session.messages), 0)
+            finally:
+                release.set()
+                result = await asyncio.wait_for(one, 2)
+        self.assertEqual(
+            requests, [("model-a", 100), ("model-b", 200), ("model-a", 100)]
         )
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(result.message["content"], "model-a")
         self.assertEqual(first_session.messages.get(0)["content"], "one")
         self.assertEqual(second_session.messages.get(0)["content"], "two")
+
+    async def test_session_identity_change_during_turn_prevents_commit(self):
+        state = session()
+        state.messages.add_user("previous message")
+        original = state.messages.snapshot()
+        requests = []
+
+        def change_model(text):
+            state.model_id = "model-b"
+            return text
+
+        def handler(request):
+            requests.append(json.loads(request.content)["model"])
+            response = (
+                reply(None, finish="tool_calls", calls=[tool_call()])
+                if len(requests) == 1
+                else reply()
+            )
+            return httpx.Response(200, json=response)
+
+        async with make_client(handler) as client:
+            result = await make_agent(client, tools=registry(change_model)).run(
+                session=state, prompt="use tool"
+            )
+        self.assertEqual(requests, ["model-a", "model-a"])
+        self.assertEqual(result.status, TurnStatus.FAILED)
+        self.assertIn("Session changed", result.error)
+        self.assertTrue(result.external_side_effects_possible)
+        self.assertEqual(state.messages.snapshot(), original)
+
+    async def test_provider_and_tool_capabilities_are_checked_before_request(self):
+        states = (
+            (
+                Session(workspace="/tmp", provider="mimo", model_id="mimo-v2.6-pro"),
+                "provider",
+            ),
+            (session("plain"), "unsupported"),
+            (session("unknown"), "unknown"),
+        )
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(200, json=reply())
+
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client,
+                provider="compatible",
+                catalog=(
+                    ModelInfo(id="plain", provider="compatible", supports_tools=False),
+                ),
+                tools=registry(),
+            )
+            for state, error in states:
+                with self.subTest(error=error):
+                    result = await agent.run(session=state, prompt="use tool")
+                    self.assertEqual(result.status, TurnStatus.FAILED)
+                    self.assertIn(error, result.error)
+                    self.assertEqual(result.model_requests, 0)
+                    self.assertEqual(len(state.messages), 0)
+        self.assertEqual(requests, [])
 
     async def test_history_round_trip_atomic_failure_and_invalid_files(self):
         state = session()

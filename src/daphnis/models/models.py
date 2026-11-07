@@ -72,6 +72,11 @@ MIMO_MODELS = (
 MODELS = (*DEEPSEEK_MODELS, *MIMO_MODELS)
 
 
+def validate_catalog(catalog: Sequence[ModelInfo]) -> None:
+    if len({(model.provider, model.id) for model in catalog}) != len(catalog):
+        raise ValueError("Model catalog contains duplicate (provider, id) keys.")
+
+
 def list_models(
     provider: str | None = None, *, catalog: Sequence[ModelInfo] = MODELS
 ) -> tuple[ModelInfo, ...]:
@@ -91,3 +96,15 @@ def get_model(
     if len(matches) > 1:
         raise ValueError(f"Duplicate model registration: {(provider, model_id)!r}.")
     return matches[0]
+
+
+def resolve_model(
+    provider: str, model_id: str, *, catalog: Sequence[ModelInfo] = MODELS
+) -> ModelInfo:
+    """Resolve model capabilities, allowing unregistered generic model IDs."""
+    try:
+        return get_model(provider, model_id, catalog=catalog)
+    except KeyError:
+        if provider == "compatible":
+            return ModelInfo(id=model_id, provider=provider)
+        raise

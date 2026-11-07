@@ -8,10 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from saturnus import Compatibility
 
 from daphnis import History, TurnStatus
 from daphnis.app import Application
-from daphnis.models import ModelInfo
+from daphnis.models import CapabilityError, ModelInfo
 
 CATALOG = (
     ModelInfo(
@@ -19,6 +20,9 @@ CATALOG = (
     ),
     ModelInfo(
         id="b", provider="mimo", supports_tools=True, thinking_modes=("off", "on")
+    ),
+    ModelInfo(
+        id="plain", provider="deepseek", supports_tools=False, thinking_modes=("high",)
     ),
 )
 
@@ -39,10 +43,24 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
             def handler(request):
                 received.append(
-                    (request.headers["authorization"], json.loads(request.content))
+                    (
+                        request.url.host,
+                        request.headers["authorization"],
+                        json.loads(request.content),
+                    )
                 )
                 return response({"role": "assistant", "content": "hello"})
 
+            class TrackedTransport(httpx.MockTransport):
+                closed = False
+
+                async def aclose(self):
+                    self.closed = True
+                    await super().aclose()
+
+            transports = {
+                name: TrackedTransport(handler) for name in ("deepseek", "mimo")
+            }
             app = Application(
                 workspace=root,
                 provider="deepseek",
@@ -52,9 +70,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     name: {
                         "base_url": f"https://{name}.test",
                         "api_key": f"{name}-test-key",
-                        "transport": httpx.MockTransport(handler),
+                        "transport": transport,
                     }
-                    for name in ("deepseek", "mimo")
+                    for name, transport in transports.items()
                 },
                 history=history,
             )
@@ -67,31 +85,102 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     history.load(old).messages.snapshot(),
                     app.session.messages.snapshot(),
                 )
-                app.set_model("mimo", "b")
-                self.assertIsNone(app.thinking)
-                await app.send("again", stream=False)
-                self.assertEqual(
-                    [item[0] for item in received],
-                    ["Bearer deepseek-test-key", "Bearer mimo-test-key"],
-                )
-                self.assertNotIn("thinking", received[1][1])
-                self.assertEqual((await app.command("/clear")).action, "clear")
-                count = len(app.session.messages)
+                original = app.session.messages.snapshot()
                 await app.command("/new")
                 self.assertEqual(len(app.session.messages), 0)
+                client = app._clients["deepseek"]
+                app.set_model("deepseek", "plain")
+                self.assertEqual(app.enabled_tools, ())
+                with self.assertRaisesRegex(CapabilityError, "unsupported"):
+                    app.set_tools(("read_file",))
+                self.assertEqual(
+                    (await app.send("same provider", stream=False)).status,
+                    TurnStatus.COMPLETED,
+                )
+                self.assertIs(app._clients["deepseek"], client)
+                app.set_model("mimo", "b")
+                self.assertNotIn("mimo", app._clients)
+                self.assertIsNone(app.thinking)
+                self.assertEqual(
+                    (await app.send("again", stream=False)).status, TurnStatus.COMPLETED
+                )
+                self.assertEqual((await app.command("/clear")).action, "clear")
                 self.assertEqual(len(app.sessions()), 2)
                 await app.command(f"/session {old}")
-                self.assertEqual(len(app.session.messages), count)
+                self.assertEqual(
+                    (app.session.provider, app.session.model_id), ("deepseek", "a")
+                )
+                self.assertEqual(app.session.messages.snapshot(), original)
                 await app.command("/tools none")
                 self.assertEqual(app.enabled_tools, ())
                 await app.command("/tools on read_file")
                 self.assertEqual(app.enabled_tools, ("read_file",))
+                self.assertEqual(
+                    (await app.send("restored", stream=False)).status,
+                    TurnStatus.COMPLETED,
+                )
+                self.assertIs(app._clients["deepseek"], client)
+                self.assertEqual(
+                    [(host, key, body["model"]) for host, key, body in received],
+                    [
+                        ("deepseek.test", "Bearer deepseek-test-key", "a"),
+                        ("deepseek.test", "Bearer deepseek-test-key", "plain"),
+                        ("mimo.test", "Bearer mimo-test-key", "b"),
+                        ("deepseek.test", "Bearer deepseek-test-key", "a"),
+                    ],
+                )
+                self.assertEqual(received[1][2]["reasoning_effort"], "high")
+                self.assertNotIn("tools", received[1][2])
+                self.assertNotIn("thinking", received[2][2])
             finally:
                 await app.close()
+            self.assertTrue(all(transport.closed for transport in transports.values()))
             with patch("daphnis.history.Path.home", return_value=root):
                 self.assertEqual(
                     History().directory, root.resolve() / ".daphnis/sessions"
                 )
+
+    async def test_generic_thinking_uses_explicit_connection_compatibility(self):
+        model = ModelInfo(id="local", provider="compatible", thinking_modes=("high",))
+        override = Compatibility(
+            field_mappings={"thinking_mode": "vendor_thinking"},
+            value_mappings={"thinking_mode": {"high": {"level": 3}}},
+        )
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return response({"role": "assistant", "content": "done"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            for compatibility in (None, override):
+                app = Application(
+                    workspace=temporary,
+                    provider=model.provider,
+                    model_id=model.id,
+                    catalog=(model,),
+                    history=History(Path(temporary) / "sessions"),
+                    connections={
+                        model.provider: {
+                            "base_url": "https://local.test",
+                            "compatibility": compatibility,
+                            "transport": httpx.MockTransport(handler),
+                        },
+                    },
+                )
+                try:
+                    app.set_thinking("high")
+                    result = await app.send("think", stream=False)
+                finally:
+                    await app.close()
+                if compatibility is None:
+                    self.assertEqual(result.status, TurnStatus.FAILED)
+                    self.assertIn("explicit Compatibility mapping", result.error)
+                    self.assertEqual(requests, [])
+                else:
+                    self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                    self.assertEqual(requests[0]["vendor_thinking"], {"level": 3})
+                    self.assertNotIn("thinking_mode", requests[0])
 
     async def test_noninteractive_denial_and_interactive_cancel_are_safe(self):
         with tempfile.TemporaryDirectory() as temporary:
