@@ -726,7 +726,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             path.write_text("{invalid", encoding="utf-8")
             with self.assertRaises(ValueError):
                 history.load(state.id)
-            path.write_text(json.dumps(data | {"version": 3}), encoding="utf-8")
+            path.write_text(json.dumps(data | {"version": 1}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "version"):
                 history.load(state.id)
             path.write_text(json.dumps(data | {"messages": None}), encoding="utf-8")
@@ -737,21 +737,10 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             )
             with self.assertRaisesRegex(TypeError, "enabled_tools"):
                 history.load(state.id)
-
-            data.pop("thinking")
-            data.pop("enabled_tools")
-            data["version"] = 1
-            legacy_json = json.dumps(data)
-            path.write_text(legacy_json, encoding="utf-8")
-            legacy = history.load(state.id)
-            self.assertIsNone(legacy.thinking)
-            self.assertEqual(legacy.enabled_tools, ())
-            self.assertEqual(path.read_text(encoding="utf-8"), legacy_json)
-            history.save(legacy)
-            upgraded = history.load(state.id)
-            self.assertEqual(json.loads(path.read_bytes())["version"], 2)
-            self.assertEqual(upgraded.messages.snapshot(), state.messages.snapshot())
-            self.assertEqual(upgraded.usage, state.usage)
+            del data["usage"]
+            path.write_text(json.dumps(data), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing fields"):
+                history.load(state.id)
 
 
 class SessionTests(unittest.TestCase):

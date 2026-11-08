@@ -117,16 +117,23 @@ class History:
         if not isinstance(data, dict):
             raise ValueError("Session data must be a JSON object.")
         version = data.get("version")
-        if type(version) is not int or version not in (1, 2):
+        if type(version) is not int or version != 2:
             raise ValueError("Unsupported session file version.")
-        required = {"id", "workspace", "provider", "model_id", "messages"}
-        if version == 2:
-            required.update(("thinking", "enabled_tools"))
+        required = {
+            "id",
+            "workspace",
+            "provider",
+            "model_id",
+            "thinking",
+            "enabled_tools",
+            "messages",
+            "usage",
+        }
         if not required.issubset(data) or data["id"] != session_id:
             raise ValueError("Session data is missing fields or has a mismatched id.")
         if not isinstance(data["messages"], list):
             raise ValueError("Session messages must be a JSON array.")
-        enabled_tools = data["enabled_tools"] if version == 2 else []
+        enabled_tools = data["enabled_tools"]
         if not isinstance(enabled_tools, list):
             raise TypeError("Session enabled_tools must be a JSON array.")
         return Session(
@@ -134,10 +141,8 @@ class History:
             workspace=data["workspace"],
             provider=data["provider"],
             model_id=data["model_id"],
-            thinking=data["thinking"] if version == 2 else None,
+            thinking=data["thinking"],
             enabled_tools=tuple(enabled_tools),
             messages=Messages(data["messages"]),
-            usage=UsageTotals.from_dict(data["usage"])
-            if "usage" in data
-            else UsageTotals(unrecorded=bool(data["messages"])),
+            usage=UsageTotals.from_dict(data["usage"]),
         )
