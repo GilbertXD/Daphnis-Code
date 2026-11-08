@@ -5,7 +5,7 @@ from typing import Any
 
 
 def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:
-    """Reuse .env/environment configuration; provider profiles never share keys."""
+    """Read the current environment; provider profiles never share keys."""
     provider = os.getenv("LLM_PROVIDER", "")
     model_id = os.getenv("LLM_MODEL", "")
     connections = {}
