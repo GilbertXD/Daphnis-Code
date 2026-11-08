@@ -49,7 +49,7 @@ class History:
                         path.stat().st_mtime,
                     )
                 )
-            except (OSError, ValueError) as exc:
+            except (OSError, TypeError, ValueError) as exc:
                 raise ValueError(
                     f"Cannot list saved session {path.name}: {exc}"
                 ) from exc
@@ -74,13 +74,17 @@ class History:
             model_id=session.model_id,
             messages=Messages(session.messages.snapshot()),
             usage=session.usage,
+            thinking=session.thinking,
+            enabled_tools=session.enabled_tools,
         )
         data = {
-            "version": 1,
+            "version": 2,
             "id": validated.id,
             "workspace": str(validated.workspace),
             "provider": validated.provider,
             "model_id": validated.model_id,
+            "thinking": validated.thinking,
+            "enabled_tools": list(validated.enabled_tools),
             "messages": validated.messages.snapshot(),
             "usage": asdict(validated.usage),
         }
@@ -112,18 +116,26 @@ class History:
             data = json.load(source)
         if not isinstance(data, dict):
             raise ValueError("Session data must be a JSON object.")
-        if type(data.get("version")) is not int or data["version"] != 1:
+        version = data.get("version")
+        if type(version) is not int or version not in (1, 2):
             raise ValueError("Unsupported session file version.")
         required = {"id", "workspace", "provider", "model_id", "messages"}
+        if version == 2:
+            required.update(("thinking", "enabled_tools"))
         if not required.issubset(data) or data["id"] != session_id:
             raise ValueError("Session data is missing fields or has a mismatched id.")
         if not isinstance(data["messages"], list):
             raise ValueError("Session messages must be a JSON array.")
+        enabled_tools = data["enabled_tools"] if version == 2 else []
+        if not isinstance(enabled_tools, list):
+            raise TypeError("Session enabled_tools must be a JSON array.")
         return Session(
             id=data["id"],
             workspace=data["workspace"],
             provider=data["provider"],
             model_id=data["model_id"],
+            thinking=data["thinking"] if version == 2 else None,
+            enabled_tools=tuple(enabled_tools),
             messages=Messages(data["messages"]),
             usage=UsageTotals.from_dict(data["usage"])
             if "usage" in data

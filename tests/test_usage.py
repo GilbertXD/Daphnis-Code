@@ -156,6 +156,8 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app._history.load(old).usage, totals)
                 path = app._history.directory / f"{old}.json"
                 legacy = json.loads(path.read_text())
+                legacy["version"] = 1
+                del legacy["thinking"], legacy["enabled_tools"]
                 del legacy["usage"]
                 path.write_text(json.dumps(legacy))
                 self.assertTrue(app._history.load(old).usage.unrecorded)

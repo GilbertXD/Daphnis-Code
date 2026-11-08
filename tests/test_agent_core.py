@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ from daphnis import (
     TurnStatus,
 )
 from daphnis.models import ModelInfo, provider_compatibility
+from daphnis.usage import UsageTotals
 
 CATALOG = tuple(
     ModelInfo(id=name, provider="compatible", supports_tools=True, thinking_modes=())
@@ -670,7 +672,12 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [])
 
     async def test_history_round_trip_atomic_failure_and_invalid_files(self):
-        state = session()
+        state = replace(
+            session(),
+            thinking="high",
+            enabled_tools=("read_file", "run_command"),
+            usage=UsageTotals(10, 2, 12, 1, 1),
+        )
         state.messages = Messages(
             [
                 {"role": "user", "content": "hello"},
@@ -694,13 +701,21 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 (state.id, state.provider, state.model_id, state.workspace),
             )
             self.assertEqual(restored.messages.snapshot(), state.messages.snapshot())
+            self.assertEqual(restored.thinking, state.thinking)
+            self.assertEqual(restored.enabled_tools, state.enabled_tools)
+            self.assertEqual(restored.usage, state.usage)
             path = Path(temporary) / f"{state.id}.json"
             original = path.read_bytes()
-            with patch(
-                "daphnis.history.os.replace", side_effect=OSError("disk unavailable")
+            data = json.loads(original)
+            self.assertEqual(data["version"], 2)
+            self.assertEqual(data["enabled_tools"], ["read_file", "run_command"])
+            with (
+                patch(
+                    "daphnis.history.os.replace", side_effect=OSError("disk unavailable")
+                ),
+                self.assertRaises(OSError),
             ):
-                with self.assertRaises(OSError):
-                    history.save(state)
+                history.save(replace(state, thinking="off"))
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(list(Path(temporary).glob("*.tmp")), [])
             with self.assertRaises(FileNotFoundError):
@@ -710,16 +725,54 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             path.write_text("{invalid", encoding="utf-8")
             with self.assertRaises(ValueError):
                 history.load(state.id)
-            data = json.loads(original)
-            data["version"] = 2
-            path.write_text(json.dumps(data), encoding="utf-8")
+            path.write_text(json.dumps(data | {"version": 3}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "version"):
                 history.load(state.id)
-            data["version"] = 1
-            data["messages"] = None
-            path.write_text(json.dumps(data), encoding="utf-8")
+            path.write_text(json.dumps(data | {"messages": None}), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "messages"):
                 history.load(state.id)
+            path.write_text(
+                json.dumps(data | {"enabled_tools": "read_file"}), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(TypeError, "enabled_tools"):
+                history.load(state.id)
+
+            data.pop("thinking")
+            data.pop("enabled_tools")
+            data["version"] = 1
+            legacy_json = json.dumps(data)
+            path.write_text(legacy_json, encoding="utf-8")
+            legacy = history.load(state.id)
+            self.assertIsNone(legacy.thinking)
+            self.assertEqual(legacy.enabled_tools, ())
+            self.assertEqual(path.read_text(encoding="utf-8"), legacy_json)
+            history.save(legacy)
+            upgraded = history.load(state.id)
+            self.assertEqual(json.loads(path.read_bytes())["version"], 2)
+            self.assertEqual(upgraded.messages.snapshot(), state.messages.snapshot())
+            self.assertEqual(upgraded.usage, state.usage)
+
+
+class SessionTests(unittest.TestCase):
+    def test_execution_settings_defaults_and_validation(self):
+        fresh = session()
+        self.assertIsNone(fresh.thinking)
+        self.assertEqual(fresh.enabled_tools, ())
+        for settings, error, field in (
+            ({"thinking": 1}, ValueError, "thinking"),
+            ({"thinking": " "}, ValueError, "thinking"),
+            ({"enabled_tools": "read_file"}, TypeError, "enabled_tools"),
+            ({"enabled_tools": ("",)}, ValueError, "enabled_tools"),
+            ({"enabled_tools": (1,)}, ValueError, "enabled_tools"),
+            ({"enabled_tools": ("read_file", "read_file")}, ValueError, "duplicates"),
+        ):
+            with self.subTest(settings=settings), self.assertRaisesRegex(error, field):
+                Session(
+                    workspace=fresh.workspace,
+                    provider=fresh.provider,
+                    model_id=fresh.model_id,
+                    **settings,
+                )
 
 
 if __name__ == "__main__":

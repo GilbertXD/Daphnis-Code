@@ -1,4 +1,4 @@
-"""Committed conversation state, independent of execution and storage."""
+"""Committed conversation state and execution preferences."""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,6 +17,8 @@ class Session:
     id: str = field(default_factory=lambda: uuid4().hex)
     messages: Messages = field(default_factory=Messages)
     usage: UsageTotals = field(default_factory=UsageTotals)
+    thinking: str | None = None
+    enabled_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):
@@ -33,3 +35,15 @@ class Session:
             raise TypeError("messages must be a Saturnus Messages instance.")
         if not isinstance(self.usage, UsageTotals):
             raise TypeError("usage must be a UsageTotals instance.")
+        if self.thinking is not None and (
+            not isinstance(self.thinking, str) or not self.thinking.strip()
+        ):
+            raise ValueError("thinking must be a non-empty string or None.")
+        if not isinstance(self.enabled_tools, tuple):
+            raise TypeError("enabled_tools must be a tuple.")
+        if any(
+            not isinstance(name, str) or not name.strip() for name in self.enabled_tools
+        ):
+            raise ValueError("enabled_tools must contain non-empty tool names.")
+        if len(set(self.enabled_tools)) != len(self.enabled_tools):
+            raise ValueError("enabled_tools must not contain duplicates.")
