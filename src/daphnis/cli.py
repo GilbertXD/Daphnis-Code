@@ -9,7 +9,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .agent import TurnStatus
-from .app import Application, environment_connections
+from .app import Application
+from .config import environment_connections
 
 
 def safe_error(error: object) -> str:
