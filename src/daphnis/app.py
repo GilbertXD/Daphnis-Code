@@ -61,16 +61,7 @@ class Application:
         self._clients: dict[str, ChatClient] = {}
         self._closed = False
         self._history = history if history is not None else History()
-        self._session = Session(
-            workspace=workspace, provider=provider, model_id=model_id
-        )
-        if not Path(self._session.workspace).is_dir():
-            raise ValueError("Workspace 必须是现有目录。")
-        self.events = EventBus()
-        self._usage = UsageTracker(self.events)
-        self._usage.select_session(self._session.id, self._session.usage)
         self._interactive = interactive
-        self._thinking: str | None = None
         self._task: asyncio.Task[TurnResult] | None = None
         self._approval: asyncio.Future[bool] | None = None
         self._pending_approval: ApprovalRequest | None = None
@@ -79,8 +70,18 @@ class Application:
             item["function"]["name"] for item in self._tools.definitions()
         )
         model = self._model_for(provider, model_id)
+        self._session = Session(
+            workspace=workspace,
+            provider=provider,
+            model_id=model_id,
+            enabled_tools=self._all_tools if model.supports_tools is True else (),
+        )
+        if not Path(self._session.workspace).is_dir():
+            raise ValueError("Workspace 必须是现有目录。")
+        self.events = EventBus()
+        self._usage = UsageTracker(self.events)
+        self._usage.select_session(self._session.id, self._session.usage)
         self._client(provider)
-        self._enabled_tools = self._all_tools if model.supports_tools is True else ()
 
     def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:
@@ -151,7 +152,8 @@ class Application:
     async def _run_turn(self, prompt: str, *, stream: bool = True) -> TurnResult:
         self._ensure_idle()
         session = self._session
-        thinking = self._thinking
+        thinking = session.thinking
+        enabled_tools = session.enabled_tools
         provider = session.provider
         custom_compatibility = (
             self._connection(provider).get("compatibility") is not None
@@ -161,7 +163,7 @@ class Application:
             provider=provider,
             catalog=self._catalog,
             custom_compatibility=custom_compatibility,
-            tools=self._tools.select(list(self._enabled_tools)),
+            tools=self._tools.select(list(enabled_tools)),
             events=self.events,
             context=Context(
                 system_prompt=(
@@ -184,13 +186,13 @@ class Application:
                 # Token use remains a fact even when working messages roll back.
                 try:
                     if self._has_usage_to_save():
-                        self._save_session()
+                        self._save_session(session)
                 except Exception:
                     logger.exception("本轮已取消，已报告的用量未能保存。")
                 raise
             if result.status == TurnStatus.COMPLETED or self._has_usage_to_save():
                 try:
-                    self._save_session()
+                    self._save_session(session)
                 except Exception as exc:
                     raise SessionSaveError(result, exc) from exc
             return result
@@ -203,9 +205,9 @@ class Application:
             if self._task is task:
                 self._task = None
 
-    def _save_session(self) -> None:
-        self._session.usage = self._usage.session
-        self._history.save(self._session)
+    def _save_session(self, session: Session) -> None:
+        session.usage = self._usage.session
+        self._history.save(session)
 
     def _has_usage_to_save(self) -> bool:
         return self._usage.session != self._session.usage and (

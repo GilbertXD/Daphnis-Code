@@ -48,7 +48,7 @@ class Operations:
 
     @property
     def thinking(self) -> str | None:
-        return self._app._thinking
+        return self._app._session.thinking
 
     @property
     def all_tools(self) -> tuple[str, ...]:
@@ -56,7 +56,7 @@ class Operations:
 
     @property
     def enabled_tools(self) -> tuple[str, ...]:
-        return self._app._enabled_tools
+        return self._app._session.enabled_tools
 
     @property
     def running(self) -> bool:
@@ -94,36 +94,54 @@ class Operations:
         app = self._app
         app._ensure_idle()
         model = app._model_for(provider, model_id)
-        updated = replace(
-            app._session, provider=provider, model_id=model_id, usage=app._usage.session
-        )
-        app._history.save(updated)
-        app._session = updated
+        current = app._session
+        thinking, enabled_tools = current.thinking, current.enabled_tools
         notices = [f"模型：{provider} / {model_id}"]
-        if app._thinking is not None and app._thinking not in (
-            model.thinking_modes or ()
-        ):
-            app._thinking = None
+        if thinking is not None and thinking not in (model.thinking_modes or ()):
+            thinking = None
             notices.append("原思考档位不适用，已恢复服务端默认。")
-        if app._enabled_tools and model.supports_tools is not True:
-            app._enabled_tools = ()
+        if enabled_tools and model.supports_tools is not True:
+            enabled_tools = ()
             notices.append("工具能力未确认支持，已停用工具。")
+        updated = replace(
+            current,
+            provider=provider,
+            model_id=model_id,
+            thinking=thinking,
+            enabled_tools=enabled_tools,
+        )
+        app._save_session(updated)
+        app._session = updated
         return "\n".join(notices)
 
+    @staticmethod
+    def _validate_thinking(model: ModelInfo, mode: str | None) -> None:
+        if mode is not None and mode not in (model.thinking_modes or ()):
+            raise CapabilityError(f"该模型不支持思考档位 {mode!r}，或能力尚未确认。")
+
+    def _validate_tools(self, model: ModelInfo, names: tuple[str, ...]) -> None:
+        self._app._tools.select(list(names))  # Saturnus validates names and duplicates.
+        if names:
+            require_tools(model)
+
     def set_thinking(self, mode: str | None) -> None:
-        self._app._ensure_idle()
-        if mode is not None and mode not in (self.model.thinking_modes or ()):
-            raise CapabilityError("该模型不支持此思考选项，或能力尚未确认。")
-        self._app._thinking = mode
+        app = self._app
+        app._ensure_idle()
+        self._validate_thinking(self.model, mode)
+        updated = replace(app._session, thinking=mode)
+        app._save_session(updated)
+        app._session = updated
 
     def set_tools(self, names: Sequence[str]) -> None:
         app = self._app
         app._ensure_idle()
+        if isinstance(names, (str, bytes)):
+            raise TypeError("names must be a sequence of tool names.")
         selected = tuple(names)
-        app._tools.select(list(selected))  # Saturnus validates names and duplicates.
-        if selected:
-            require_tools(self.model)
-        app._enabled_tools = selected
+        self._validate_tools(self.model, selected)
+        updated = replace(app._session, enabled_tools=selected)
+        app._save_session(updated)
+        app._session = updated
 
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()
@@ -131,11 +149,14 @@ class Operations:
     def new_session(self) -> SessionSnapshot:
         app = self._app
         app._ensure_idle()
-        app._save_session()
+        current = app._session
+        app._save_session(current)
         fresh = Session(
-            workspace=app._session.workspace,
-            provider=app._session.provider,
-            model_id=app._session.model_id,
+            workspace=current.workspace,
+            provider=current.provider,
+            model_id=current.model_id,
+            thinking=current.thinking,
+            enabled_tools=current.enabled_tools,
         )
         app._history.save(fresh)
         app._session = fresh
@@ -149,12 +170,10 @@ class Operations:
         if not Path(restored.workspace).is_dir():
             raise ValueError("该会话原工作区已不存在。")
         model = app._model_for(restored.provider, restored.model_id)
+        self._validate_thinking(model, restored.thinking)
+        self._validate_tools(model, restored.enabled_tools)
         app._session = restored
         app._usage.select_session(restored.id, restored.usage)
-        if app._thinking not in (model.thinking_modes or ()):
-            app._thinking = None
-        if model.supports_tools is not True:
-            app._enabled_tools = ()
 
     async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream)
