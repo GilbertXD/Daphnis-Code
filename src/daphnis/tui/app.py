@@ -1,7 +1,7 @@
-"""Textual terminal presentation. Business operations stay in Application."""
+"""Textual terminal presentation over Operations and EventBus."""
 
 import asyncio
-import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,10 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, SelectionList, Static
 from textual.widgets.option_list import Option
 
-from ..app import Application, SessionSaveError
-from ..cli import safe_error
-from ..events import Event
+from ..app import SessionSaveError
+from ..events import Event, EventBus
+from ..operations import Operations
+from ..terminal_commands import CommandResult, safe_error, terminal_command
 from .approval import ApprovalScreen
 from .chat import ChatView
 from .input import PromptInput
@@ -103,9 +104,9 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
     #tools-buttons Button { margin-left: 1; }
     """
 
-    def __init__(self, application: Application) -> None:
+    def __init__(self, ops: Operations) -> None:
         super().__init__()
-        self.application = application
+        self.ops = ops
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tools-box"):
@@ -117,8 +118,8 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
             )
             yield SelectionList(
                 *[
-                    (name, name, name in self.application.enabled_tools)
-                    for name in self.application.all_tools
+                    (name, name, name in self.ops.enabled_tools)
+                    for name in self.ops.all_tools
                 ],
                 id="tool-selections",
             )
@@ -170,12 +171,12 @@ class DaphnisApp(App[None]):
     #approval-yes { background: $warning; color: $background; }
     """
 
-    def __init__(self, application: Application) -> None:
+    def __init__(self, ops: Operations, events: EventBus) -> None:
         super().__init__()
         self.register_theme(THEME)
         self.theme = "daphnis"
-        self.application = application
-        self.application.interactive = True
+        self.ops = ops
+        self.events = events
         self._subscriptions = []
         self._sending = False
         self._shutting_down = False
@@ -207,9 +208,10 @@ class DaphnisApp(App[None]):
             "tool.approval_requested",
             "tool.blocked",
         ):
-            self._subscriptions.append(self.application.events.on(name, self._forward))
-        await self.query_one(ChatView).restore(self.application.session)
-        if not len(self.application.session.messages):
+            self._subscriptions.append(self.events.on(name, self._forward))
+        messages = self.ops.message_snapshot()
+        await self.query_one(ChatView).restore(messages)
+        if not messages:
             await self.query_one(ChatView).add(
                 "从一个任务开始",
                 "描述你的目标，一起把它完成。\n\n"
@@ -224,15 +226,17 @@ class DaphnisApp(App[None]):
             self.post_message(CoreNotification(event))
 
     def update_status(self) -> None:
-        app = self.application
+        ops = self.ops
+        session = ops.session
+        busy = self._sending or ops.running
         state = (
             "approval"
-            if app.pending_approval
+            if ops.pending_approval
             else "running"
-            if self._sending
+            if busy
             else "ready"
         )
-        workspace = str(app.session.workspace)
+        workspace = str(session.workspace)
         home = str(Path.home())
         if workspace.startswith(home + "/"):
             workspace = "~" + workspace[len(home) :]
@@ -241,19 +245,19 @@ class DaphnisApp(App[None]):
         heading.add_column(justify="right", no_wrap=True)
         label = Text("♄  daphnis", style=f"bold {ACCENT}")
         label.append("  /  " + workspace, style=MUTED)
-        color = WARNING if self._sending else SUCCESS
+        color = WARNING if busy else SUCCESS
         heading.add_row(label, Text("● " + state, style=color))
         self.query_one("#heading", Static).update(heading)
-        self.query_one("#heading", Static).tooltip = f"会话 {app.session.id}"
+        self.query_one("#heading", Static).tooltip = f"会话 {session.id}"
         self.query_one(UsageView).update_usage(
-            app.usage.turn,
-            app.usage.session,
-            model_id=app.session.model_id,
-            thinking=app.thinking,
-            tools=len(app.enabled_tools),
+            ops.turn_usage,
+            ops.session_usage,
+            model_id=session.model_id,
+            thinking=ops.thinking,
+            tools=len(ops.enabled_tools),
         )
         for picker in self.query(ModelPicker):
-            picker.disabled = self._sending
+            picker.disabled = busy
 
     async def on_core_notification(self, message: CoreNotification) -> None:
         if self._shutting_down:
@@ -261,7 +265,7 @@ class DaphnisApp(App[None]):
         event = message.event
         await self.query_one(ChatView).event(event)
         if event.name == "tool.approval_requested":
-            request = self.application.pending_approval
+            request = self.ops.pending_approval
             if request is not None and (request.turn_id, request.tool_call_id) == (
                 event.turn_id,
                 event.data["tool_call_id"],
@@ -272,9 +276,10 @@ class DaphnisApp(App[None]):
                 def answered(value):
                     if self._approval_screen is screen:
                         self._approval_screen = None
-                    self.application.resolve_approval(
-                        request.turn_id, request.tool_call_id, value is True
-                    )
+                    if not self._shutting_down:
+                        self.ops.resolve_approval(
+                            request.turn_id, request.tool_call_id, value is True
+                        )
 
                 self.push_screen(screen, answered)
         elif event.name == "turn.finished" and self._approval_screen is not None:
@@ -283,7 +288,7 @@ class DaphnisApp(App[None]):
         self.update_status()
 
     async def on_prompt_input_submitted(self, message: PromptInput.Submitted) -> None:
-        if self._sending:
+        if self._sending or self.ops.running:
             return
         prompt = self.query_one(PromptInput)
         text = message.text
@@ -307,7 +312,7 @@ class DaphnisApp(App[None]):
 
     async def _send(self, text: str) -> None:
         try:
-            result = await self.application.send(text, stream=True)
+            result = await self.ops.send(text, stream=True)
             if result.error and not self._shutting_down:
                 await self.query_one(ChatView).add(
                     "运行结果", safe_error(result.error), classes="notice"
@@ -339,17 +344,20 @@ class DaphnisApp(App[None]):
                 self.update_status()
 
     async def _command(self, text: str) -> None:
+        await self._perform_command(lambda: terminal_command(self.ops, text))
+
+    async def _perform_command(self, action: Callable[[], CommandResult]) -> None:
         try:
-            result = await self.application.command(text)
+            result = action()
             chat = self.query_one(ChatView)
             show_text = True
             if result.action == "clear":
                 await chat.clear_display()
             elif result.action == "reload":
-                await chat.restore(self.application.session)
+                await chat.restore(self.ops.message_snapshot())
             elif result.action == "models":
                 await chat.query(ModelPicker).remove()
-                await chat.mount(ModelPicker(self.application))
+                await chat.mount(ModelPicker(self.ops))
                 chat.scroll_end(animate=False)
                 show_text = False
             elif result.action == "thinking":
@@ -357,7 +365,7 @@ class DaphnisApp(App[None]):
                     ("服务端默认", "default", False),
                     *[
                         (mode, mode, False)
-                        for mode in self.application.model.thinking_modes
+                        for mode in self.ops.model.thinking_modes or ()
                     ],
                 ]
                 self.push_screen(
@@ -366,17 +374,17 @@ class DaphnisApp(App[None]):
                 )
                 show_text = False
             elif result.action == "tools":
-                self.push_screen(ToolsScreen(self.application), self._tools_selected)
+                self.push_screen(ToolsScreen(self.ops), self._tools_selected)
                 show_text = False
             elif result.action == "sessions":
-                items = self.application.sessions()
+                items = self.ops.list_sessions()
                 if items:
                     choices = [
                         (
                             f"{item.id[:12]} · {item.provider}/{item.model_id}\n"
                             f"{item.workspace} · {item.message_count} 条",
                             item.id,
-                            not self.application.configured(item.provider),
+                            not self.ops.configured(item.provider),
                         )
                         for item in items
                     ]
@@ -396,28 +404,44 @@ class DaphnisApp(App[None]):
             )
 
     async def on_model_picker_selected(self, message: ModelPicker.Selected) -> None:
-        await self._command(shlex.join(["/model", message.provider, message.model_id]))
+        await self._perform_command(
+            lambda: CommandResult(
+                text=self.ops.set_model(message.provider, message.model_id)
+            )
+        )
         self.query_one(PromptInput).focus()
 
-    def _thinking_selected(self, value) -> None:
-        if value is not None:
-            self.run_worker(self._command(f"/thinking {value}"), exit_on_error=False)
+    async def _thinking_selected(self, value: str | None) -> None:
+        if value is None:
+            return
+
+        def select() -> CommandResult:
+            self.ops.set_thinking(None if value == "default" else value)
+            return CommandResult(text=f"Thinking：{self.ops.thinking or '服务端默认'}")
+
+        await self._perform_command(select)
 
     def _tools_selected(self, value) -> None:
         if value is not None:
             try:
-                self.application.set_tools(value)
+                self.ops.set_tools(value)
                 self.update_status()
             except Exception as exc:
                 self.notify(safe_error(exc), severity="error")
 
-    def _session_selected(self, value) -> None:
-        if value is not None:
-            self.run_worker(self._command(f"/session {value}"), exit_on_error=False)
+    async def _session_selected(self, value: str | None) -> None:
+        if value is None:
+            return
+
+        def select() -> CommandResult:
+            self.ops.restore_session(value)
+            return CommandResult("reload", f"恢复会话：{self.ops.session.id}")
+
+        await self._perform_command(select)
 
     async def action_cancel_or_quit(self) -> None:
-        if self._sending or self.application.running:
-            await self.application.cancel()
+        if self._sending or self.ops.running:
+            await self.ops.cancel()
             if self._approval_screen is not None:
                 self._approval_screen.dismiss(False)
                 self._approval_screen = None
@@ -425,14 +449,14 @@ class DaphnisApp(App[None]):
             await self.action_quit_safely()
 
     async def action_interrupt(self) -> None:
-        if self._sending or self.application.running:
+        if self._sending or self.ops.running:
             await self.action_cancel_or_quit()
         else:
             self.query_one(PromptInput).focus()
 
     async def action_quit_safely(self) -> None:
         self._shutting_down = True
-        await self.application.close()
+        await self.ops.close()
         self.exit()
 
     async def on_unmount(self) -> None:
@@ -440,4 +464,4 @@ class DaphnisApp(App[None]):
         for unsubscribe in self._subscriptions:
             unsubscribe()
         self._subscriptions.clear()
-        await self.application.close()
+        await self.ops.close()

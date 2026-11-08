@@ -87,3 +87,7 @@ class EventBus:
         """Wait for dispatched async notifications; cancellation propagates."""
         while self._tasks:
             await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+
+    def clear(self) -> None:
+        """Remove subscriptions; already dispatched notifications can still drain."""
+        self._listeners.clear()

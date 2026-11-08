@@ -2,7 +2,6 @@
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
 
@@ -11,40 +10,20 @@ from dotenv import load_dotenv
 from .agent import TurnStatus
 from .app import Application
 from .config import environment_connections
+from .operations import Operations
+from .terminal_commands import safe_error, terminal_command
 
 
-def safe_error(error: object) -> str:
-    text = str(error)
-    for name in (
-        "LLM_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "MIMO_API_KEY",
-        "COMPATIBLE_API_KEY",
-    ):
-        key = os.getenv(name)
-        if key:
-            text = text.replace(key, "[REDACTED]")
-    return text
-
-
-async def execute(application: Application, prompt: str | None) -> int:
-    try:
-        if prompt is not None:
-            if prompt.lstrip().startswith("/"):
-                print((await application.command(prompt)).text)
-                return 0
-            result = await application.send(prompt, stream=False)
-            if result.status == TurnStatus.COMPLETED:
-                print(result.message.get("content") or "")
-                return 0
-            print(safe_error(result.error or result.status), file=sys.stderr)
-            return 1
-        from .tui.app import DaphnisApp
-
-        await DaphnisApp(application).run_async()
+async def execute(ops: Operations, prompt: str) -> int:
+    if prompt.lstrip().startswith("/"):
+        print(terminal_command(ops, prompt).text)
         return 0
-    finally:
-        await application.close()
+    result = await ops.send(prompt, stream=False)
+    if result.status == TurnStatus.COMPLETED:
+        print(result.message.get("content") or "")
+        return 0
+    print(safe_error(result.error or result.status), file=sys.stderr)
+    return 1
 
 
 def main() -> int:
@@ -72,17 +51,24 @@ def main() -> int:
         print(safe_error(exc), file=sys.stderr)
         return 2
 
+    ops = Operations(application)
+
     async def run():
         try:
             if args.session:
-                application.restore_session(args.session)
+                ops.restore_session(args.session)
             if args.thinking:
-                application.set_thinking(
+                ops.set_thinking(
                     None if args.thinking == "default" else args.thinking
                 )
-            return await execute(application, args.prompt)
+            if args.prompt is not None:
+                return await execute(ops, args.prompt)
+            from .tui.app import DaphnisApp
+
+            await DaphnisApp(ops, application.events).run_async()
+            return 0
         finally:
-            await application.close()
+            await ops.close()
 
     try:
         return asyncio.run(run())

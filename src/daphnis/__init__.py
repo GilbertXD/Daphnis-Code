@@ -4,6 +4,7 @@ from .agent import Agent, FatalToolError, TurnResult, TurnStatus
 from .context import Context
 from .events import Event, EventBus
 from .history import History
+from .operations import Operations
 from .session import Session
 
 __all__ = [
@@ -13,6 +14,7 @@ __all__ = [
     "EventBus",
     "FatalToolError",
     "History",
+    "Operations",
     "Session",
     "TurnResult",
     "TurnStatus",

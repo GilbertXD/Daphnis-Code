@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-from daphnis import EventBus, History, TurnStatus
+from daphnis import EventBus, History, Operations, TurnStatus
 from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.usage import UsageTotals, UsageTracker
@@ -129,39 +129,39 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             app = application(root, handler)
+            ops = Operations(app)
             seen = []
             off = app.events.on("model.usage", seen.append)
             try:
-                result = await app.send("read", stream=True)
+                result = await ops.send("read", stream=True)
                 self.assertEqual(result.status, TurnStatus.COMPLETED)
                 self.assertEqual(result.model_requests, 2)
                 self.assertEqual(len(seen), 2)
-                self.assertEqual(app.usage.turn, UsageTotals(300, 30, 330, 2, 2))
-                await app.send("again", stream=False)
-                self.assertEqual(app.usage.turn, UsageTotals(50, 5, 55, 1, 1))
-                self.assertEqual(app.usage.session, UsageTotals(350, 35, 385, 3, 3))
-                await app.send("missing usage", stream=False)
-                self.assertEqual(app.usage.turn, UsageTotals(requests=1))
+                self.assertEqual(ops.turn_usage, UsageTotals(300, 30, 330, 2, 2))
+                await ops.send("again", stream=False)
+                self.assertEqual(ops.turn_usage, UsageTotals(50, 5, 55, 1, 1))
+                self.assertEqual(ops.session_usage, UsageTotals(350, 35, 385, 3, 3))
+                await ops.send("missing usage", stream=False)
+                self.assertEqual(ops.turn_usage, UsageTotals(requests=1))
                 totals = UsageTotals(350, 35, 385, 4, 3)
-                old = app.session.id
-                await app.command("/clear")
-                app.set_model("mimo", "b")
-                self.assertEqual(app.usage.session, totals)
-                app.new_session()
-                self.assertIsNone(app.usage.turn)
-                self.assertEqual(app.usage.session, UsageTotals())
-                app.restore_session(old)
-                self.assertIsNone(app.usage.turn)
-                self.assertEqual(app.usage.session, totals)
-                self.assertEqual(app.history.load(old).usage, totals)
-                path = app.history.directory / f"{old}.json"
+                old = ops.session.id
+                ops.set_model("mimo", "b")
+                self.assertEqual(ops.session_usage, totals)
+                ops.new_session()
+                self.assertIsNone(ops.turn_usage)
+                self.assertEqual(ops.session_usage, UsageTotals())
+                ops.restore_session(old)
+                self.assertIsNone(ops.turn_usage)
+                self.assertEqual(ops.session_usage, totals)
+                self.assertEqual(app._history.load(old).usage, totals)
+                path = app._history.directory / f"{old}.json"
                 legacy = json.loads(path.read_text())
                 del legacy["usage"]
                 path.write_text(json.dumps(legacy))
-                self.assertTrue(app.history.load(old).usage.unrecorded)
+                self.assertTrue(app._history.load(old).usage.unrecorded)
             finally:
                 off()
-                await app.close()
+                await ops.close()
 
     async def test_failed_and_cancelled_usage_is_saved_without_working_messages(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -196,20 +196,21 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             app = application(root, handler)
+            ops = Operations(app)
             try:
-                failed = await app.send("invalid response", stream=False)
+                failed = await ops.send("invalid response", stream=False)
                 self.assertEqual(failed.status, TurnStatus.FAILED)
-                self.assertEqual(app.usage.turn, UsageTotals(10, 3, 13, 1, 1))
-                task = asyncio.create_task(app.send("cancel stream", stream=True))
+                self.assertEqual(ops.turn_usage, UsageTotals(10, 3, 13, 1, 1))
+                task = asyncio.create_task(ops.send("cancel stream", stream=True))
                 await asyncio.wait_for(entered.wait(), 2)
-                await app.cancel()
+                await ops.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
                 self.assertTrue(pending.closed)
-                self.assertEqual(app.usage.session, UsageTotals(30, 8, 38, 2, 2))
-                self.assertEqual(len(app.session.messages), 0)
-                restored = app.history.load(app.session.id)
+                self.assertEqual(ops.session_usage, UsageTotals(30, 8, 38, 2, 2))
+                self.assertEqual(len(ops.message_snapshot()), 0)
+                restored = app._history.load(ops.session.id)
                 self.assertEqual(len(restored.messages), 0)
-                self.assertEqual(restored.usage, app.usage.session)
+                self.assertEqual(restored.usage, ops.session_usage)
             finally:
-                await app.close()
+                await ops.close()

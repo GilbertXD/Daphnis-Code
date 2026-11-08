@@ -7,7 +7,7 @@ from pathlib import Path
 import httpx
 from textual.widgets import OptionList, SelectionList
 
-from daphnis import Event, History
+from daphnis import Event, History, Operations
 from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.tui.app import ChoiceScreen, DaphnisApp, ToolsScreen
@@ -59,6 +59,7 @@ def controller(root, handler):
             for name in ("deepseek", "mimo")
         },
         history=History(root / "sessions"),
+        interactive=True,
     )
 
 
@@ -89,7 +90,8 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     },
                 ),
             )
-            ui = DaphnisApp(app)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(100, 36)) as pilot:
                 prompt = ui.query_one(PromptInput)
                 prompt.load_text("line")
@@ -100,7 +102,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(prompt.text, "line\n\n")
                 await submit(ui, pilot, "hello")
                 await until(
-                    pilot, lambda: len(app.session.messages) == 2 and not ui._sending
+                    pilot, lambda: len(ops.message_snapshot()) == 2 and not ui._sending
                 )
                 chat = ui.query_one(ChatView)
                 self.assertEqual(len(chat.assistants), 1)
@@ -108,18 +110,23 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 usage = str(ui.query_one(UsageView).render())
                 self.assertIn("本轮 in 12 out 8 total 20", usage)
                 self.assertIn("会话 in 12 out 8 total 20", usage)
-                old = app.session.id
+                old = ops.session.id
                 await submit(ui, pilot, "/clear")
                 await pilot.pause()
-                self.assertEqual(len(app.session.messages), 2)
+                self.assertEqual(len(ops.message_snapshot()), 2)
                 await submit(ui, pilot, "/new")
-                await until(pilot, lambda: app.session.id != old)
-                self.assertEqual(len(app.session.messages), 0)
+                await until(pilot, lambda: ops.session.id != old)
+                self.assertEqual(len(ops.message_snapshot()), 0)
                 self.assertIn(
                     "会话 in 0 out 0 total 0", str(ui.query_one(UsageView).render())
                 )
-                await submit(ui, pilot, f"/session {old}")
-                await until(pilot, lambda: app.session.id == old)
+                await submit(ui, pilot, "/session")
+                await until(pilot, lambda: isinstance(ui.screen, ChoiceScreen))
+                sessions = ui.screen.query_one(OptionList)
+                sessions.focus()
+                sessions.highlighted = list(ui.screen.values.values()).index(old)
+                await pilot.press("enter")
+                await until(pilot, lambda: ops.session.id == old)
                 self.assertIn(
                     "会话 in 12 out 8 total 20", str(ui.query_one(UsageView).render())
                 )
@@ -130,7 +137,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 async with asyncio.timeout(2):
-                    await pilot.press("ctrl+q")
+                    await pilot.press("ctrl+c")
                 self.assertTrue(app._closed)
 
     async def test_approval_yes_no_and_cancel_waiting(self):
@@ -164,7 +171,8 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 )
 
             app = controller(root, handler)
-            ui = DaphnisApp(app)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(110, 40)) as pilot:
                 await submit(ui, pilot, "edit")
                 await until(pilot, lambda: isinstance(ui.screen, ApprovalScreen))
@@ -177,7 +185,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("y")
                 await until(pilot, lambda: not ui._sending)
                 self.assertEqual(target.read_text(), "new\n")
-                committed = app.session.messages.snapshot()
+                committed = ops.message_snapshot()
                 await submit(ui, pilot, "wait then cancel")
                 await until(pilot, lambda: isinstance(ui.screen, ApprovalScreen))
                 await pilot.press("ctrl+c")
@@ -187,8 +195,8 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                         not ui._sending and not isinstance(ui.screen, ApprovalScreen)
                     ),
                 )
-                self.assertIsNone(app.pending_approval)
-                self.assertEqual(app.session.messages.snapshot(), committed)
+                self.assertIsNone(ops.pending_approval)
+                self.assertEqual(ops.message_snapshot(), committed)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
 
     async def test_provider_columns_thinking_and_tool_selection(self):
@@ -197,8 +205,9 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
             app = controller(
                 root, lambda request: sse({"role": "assistant", "content": "hello"})
             )
-            app.set_thinking("high")
-            ui = DaphnisApp(app)
+            ops = Operations(app)
+            ops.set_thinking("high")
+            ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(100, 36)) as pilot:
                 await submit(ui, pilot, "/model")
                 await until(pilot, lambda: bool(ui.query(ModelPicker)))
@@ -209,28 +218,34 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 options.focus()
                 options.highlighted = 0
                 await pilot.press("enter")
-                await until(pilot, lambda: app.session.provider == "mimo")
-                self.assertIsNone(app.thinking)
+                await until(pilot, lambda: ops.session.provider == "mimo")
+                self.assertIsNone(ops.thinking)
                 await submit(ui, pilot, "/model 1")
-                await until(pilot, lambda: app.session.provider == "deepseek")
+                await until(pilot, lambda: ops.session.provider == "deepseek")
                 await submit(ui, pilot, "/model b")
-                await until(pilot, lambda: app.session.provider == "mimo")
+                await until(pilot, lambda: ops.session.provider == "mimo")
                 await submit(ui, pilot, "/thinking")
                 await until(pilot, lambda: isinstance(ui.screen, ChoiceScreen))
                 self.assertNotIn("high", ui.screen.values.values())
-                await pilot.press("escape")
+                thinking = ui.screen.query_one(OptionList)
+                thinking.focus()
+                thinking.highlighted = list(ui.screen.values.values()).index("on")
+                await pilot.press("enter")
+                await until(pilot, lambda: ops.thinking == "on")
+                self.assertIn("on", str(ui.query_one(UsageView).render()))
                 await submit(ui, pilot, "/tools")
                 await until(pilot, lambda: isinstance(ui.screen, ToolsScreen))
                 ui.screen.query_one(SelectionList).deselect_all()
                 await pilot.click("#tools-apply")
-                self.assertEqual(app.enabled_tools, ())
+                self.assertEqual(ops.enabled_tools, ())
 
     async def test_tool_folding_expands_errors_and_shows_real_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = controller(
                 Path(temporary), lambda request: self.fail("No model call")
             )
-            ui = DaphnisApp(app)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(100, 36)) as pilot:
                 chat = ui.query_one(ChatView)
                 for index in range(6):
@@ -240,12 +255,12 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                         "arguments": json.dumps({"path": f"file-{index}.txt"}),
                     }
                     await chat.event(
-                        Event("tool.started", app.session.id, "turn", data)
+                        Event("tool.started", ops.session.id, "turn", data)
                     )
                     await chat.event(
                         Event(
                             "tool.finished",
-                            app.session.id,
+                            ops.session.id,
                             "turn",
                             {**data, "status": "COMPLETED"},
                         )
@@ -260,7 +275,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await chat.event(
                     Event(
                         "tool.finished",
-                        app.session.id,
+                        ops.session.id,
                         "turn",
                         {
                             "name": "read_file",
@@ -274,7 +289,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await chat.event(
                     Event(
                         "tool.started",
-                        app.session.id,
+                        ops.session.id,
                         "turn",
                         {
                             "name": "run_command",
@@ -286,7 +301,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await chat.event(
                     Event(
                         "tool.finished",
-                        app.session.id,
+                        ops.session.id,
                         "turn",
                         {
                             "name": "run_command",
@@ -304,7 +319,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await chat.event(
                     Event(
                         "tool.started",
-                        app.session.id,
+                        ops.session.id,
                         "turn",
                         {
                             "name": "apply_patch",
@@ -316,7 +331,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await chat.event(
                     Event(
                         "tool.finished",
-                        app.session.id,
+                        ops.session.id,
                         "turn",
                         {
                             "name": "apply_patch",
@@ -352,14 +367,23 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.Event().wait()
 
             app = controller(Path(temporary), handler)
-            ui = DaphnisApp(app)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(80, 24)) as pilot:
                 await submit(ui, pilot, "wait")
                 await asyncio.wait_for(entered.wait(), 2)
                 await pilot.press("escape")
                 await until(pilot, lambda: not ui._sending)
-                self.assertEqual(len(app.session.messages), 0)
+                self.assertEqual(len(ops.message_snapshot()), 0)
                 self.assertFalse(app._closed)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
                 await pilot.press("escape")
                 self.assertIs(ui.focused, ui.query_one(PromptInput))
+                entered.clear()
+                await submit(ui, pilot, "wait then quit")
+                await asyncio.wait_for(entered.wait(), 2)
+                async with asyncio.timeout(2):
+                    await pilot.press("ctrl+q")
+                self.assertTrue(app._closed)
+                self.assertFalse(ops.running)
+                self.assertEqual(ops.message_snapshot(), [])

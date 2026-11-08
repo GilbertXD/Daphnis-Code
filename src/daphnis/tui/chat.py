@@ -14,7 +14,6 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Collapsible, Static
 
 from ..events import Event
-from ..session import Session
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -252,10 +251,10 @@ class ChatView(VerticalScroll):
         self.pending_user = None
         self._tool_group = None
 
-    async def restore(self, session: Session) -> None:
+    async def restore(self, messages: list[dict[str, Any]]) -> None:
         await self.clear_display()
         calls = {}
-        for message in session.messages.snapshot():
+        for message in messages:
             role = message["role"]
             for call in message.get("tool_calls") or ():
                 calls[call["id"]] = call["function"]

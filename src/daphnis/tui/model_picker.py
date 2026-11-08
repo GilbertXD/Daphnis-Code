@@ -10,7 +10,7 @@ from textual.message import Message
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
-from ..app import Application
+from ..operations import Operations
 from .theme import ACCENT, MUTED, SUCCESS, TEXT
 
 
@@ -45,12 +45,12 @@ class ModelPicker(Vertical):
             super().__init__()
             self.provider, self.model_id = provider, model_id
 
-    def __init__(self, application: Application) -> None:
+    def __init__(self, ops: Operations) -> None:
         super().__init__()
-        self.application = application
+        self.ops = ops
         self.groups = {
             provider: models
-            for provider, models in application.model_groups().items()
+            for provider, models in ops.list_models().items()
             if models
         }
         self.values: dict[str, tuple[str, str]] = {}
@@ -64,7 +64,7 @@ class ModelPicker(Vertical):
                     name = {"deepseek": "DeepSeek", "mimo": "MiMo"}.get(
                         provider, provider
                     )
-                    if not self.application.configured(provider):
+                    if not self.ops.configured(provider):
                         name += " · 未配置"
                     yield Static(
                         name + "  /  上下文", classes="model-provider", markup=False
@@ -81,8 +81,7 @@ class ModelPicker(Vertical):
         self.refresh_models()
 
     def refresh_models(self) -> None:
-        app = self.application
-        model = app.model
+        model = self.ops.model
         summary = Text("✓ ", style=SUCCESS)
         summary.append(model.id, style=f"bold {ACCENT}")
         summary.append(
@@ -122,7 +121,7 @@ class ModelPicker(Vertical):
                     style="on #1e2340" if active else None,
                 )
                 options.append(
-                    Option(row, id=key, disabled=not app.configured(provider))
+                    Option(row, id=key, disabled=not self.ops.configured(provider))
                 )
             self.query_one(f"#models-{index}", OptionList).clear_options().add_options(
                 options
