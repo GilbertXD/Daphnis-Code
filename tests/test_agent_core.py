@@ -711,7 +711,8 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data["enabled_tools"], ["read_file", "run_command"])
             with (
                 patch(
-                    "daphnis.history.os.replace", side_effect=OSError("disk unavailable")
+                    "daphnis.history.os.replace",
+                    side_effect=OSError("disk unavailable"),
                 ),
                 self.assertRaises(OSError),
             ):

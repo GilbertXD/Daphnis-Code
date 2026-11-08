@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -88,6 +89,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValidationError):
                     ops.set_tools(("missing_tool",))
                 self.assertEqual(ops.enabled_tools, ops.all_tools)
+                ops.set_tools(("read_file",))
                 result = await ops.send("hello", stream=False)
                 self.assertEqual(result.status, TurnStatus.COMPLETED)
                 old = ops.session.id
@@ -101,23 +103,36 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ops.message_snapshot(), original)
                 peer = Operations(app)
                 before = (ops.session, ops.thinking, ops.enabled_tools)
-                with (
-                    patch.object(
-                        history, "save", side_effect=OSError("disk unavailable")
-                    ),
-                    self.assertRaises(OSError),
+                path = history.directory / f"{old}.json"
+                old_file = path.read_bytes()
+                for change, args in (
+                    (ops.set_model, ("deepseek", "plain")),
+                    (ops.set_thinking, ("off",)),
+                    (ops.set_tools, ((),)),
                 ):
-                    ops.set_model("deepseek", "plain")
-                self.assertEqual((ops.session, ops.thinking, ops.enabled_tools), before)
-                self.assertEqual(history.load(old).model_id, "a")
+                    with (
+                        self.subTest(change=change.__name__),
+                        patch(
+                            "daphnis.history.os.replace",
+                            side_effect=OSError("disk unavailable"),
+                        ),
+                    ):
+                        with self.assertRaises(OSError):
+                            change(*args)
+                        self.assertEqual(
+                            (ops.session, ops.thinking, ops.enabled_tools), before
+                        )
+                        self.assertEqual(path.read_bytes(), old_file)
                 fresh = ops.new_session()
                 self.assertNotEqual(fresh.id, old)
                 self.assertEqual(peer.session, fresh)
                 self.assertEqual(len(ops.message_snapshot()), 0)
                 client = app._clients["deepseek"]
-                ops.set_model("deepseek", "plain")
+                self.assertIn("已停用工具", ops.set_model("deepseek", "plain"))
                 self.assertEqual(peer.model.id, "plain")
+                self.assertEqual(ops.thinking, "high")
                 self.assertEqual(ops.enabled_tools, ())
+                self.assertEqual(history.load(fresh.id).enabled_tools, ())
                 with self.assertRaisesRegex(CapabilityError, "unsupported"):
                     ops.set_tools(("read_file",))
                 self.assertEqual(
@@ -140,9 +155,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     (ops.session.provider, ops.session.model_id), ("deepseek", "a")
                 )
                 self.assertEqual(ops.message_snapshot(), original)
-                ops.set_tools(())
-                self.assertEqual(ops.enabled_tools, ())
-                ops.set_tools(("read_file",))
+                self.assertEqual(ops.thinking, "high")
                 self.assertEqual(ops.enabled_tools, ("read_file",))
                 self.assertEqual(
                     (await ops.send("restored", stream=False)).status,
@@ -161,6 +174,12 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(received[1][2]["reasoning_effort"], "high")
                 self.assertNotIn("tools", received[1][2])
                 self.assertNotIn("thinking", received[2][2])
+                restored_request = received[3][2]
+                self.assertEqual(restored_request["reasoning_effort"], "high")
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in restored_request["tools"]],
+                    ["read_file"],
+                )
             finally:
                 await ops.close()
             self.assertTrue(all(transport.closed for transport in transports.values()))
@@ -172,6 +191,87 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     History().directory, root.resolve() / ".daphnis/sessions"
                 )
+
+    async def test_session_settings_survive_switch_and_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = History(root / "sessions")
+
+            def make_ops():
+                return Operations(
+                    Application(
+                        workspace=root,
+                        provider="deepseek",
+                        model_id="a",
+                        catalog=CATALOG,
+                        history=history,
+                        connections={
+                            name: {
+                                "base_url": f"https://{name}.test",
+                                "transport": httpx.MockTransport(
+                                    lambda _: self.fail("Unexpected model request")
+                                ),
+                            }
+                            for name in ("deepseek", "mimo")
+                        },
+                    )
+                )
+
+            expected = ("high", ("read_file",))
+            ops = make_ops()
+            try:
+                session_a = ops.session
+                ops.set_thinking("high")
+                self.assertEqual(history.load(session_a.id).thinking, "high")
+                ops.set_tools(("read_file",))
+                saved_a = history.load(session_a.id)
+                self.assertEqual((saved_a.thinking, saved_a.enabled_tools), expected)
+
+                session_b = ops.new_session()
+                self.assertNotEqual(session_a.id, session_b.id)
+                self.assertEqual((ops.thinking, ops.enabled_tools), expected)
+                self.assertIn("已恢复服务端默认", ops.set_model("mimo", "b"))
+                self.assertIsNone(ops.thinking)
+                self.assertEqual(ops.enabled_tools, ("read_file",))
+                ops.set_thinking("off")
+                ops.set_tools(("list_directory",))
+                ops.restore_session(session_a.id)
+                self.assertEqual(ops.session, session_a)
+                self.assertEqual((ops.thinking, ops.enabled_tools), expected)
+            finally:
+                await ops.close()
+
+            restarted = make_ops()
+            try:
+                restarted.restore_session(session_a.id)
+                self.assertEqual(restarted.session, session_a)
+                self.assertEqual(
+                    (restarted.thinking, restarted.enabled_tools), expected
+                )
+
+                for settings, error, detail in (
+                    ({"thinking": "removed-mode"}, CapabilityError, "removed-mode"),
+                    (
+                        {"enabled_tools": ("removed-tool",)},
+                        ValidationError,
+                        "removed-tool",
+                    ),
+                    ({"model_id": "plain"}, CapabilityError, "unsupported"),
+                ):
+                    with self.subTest(settings=settings):
+                        invalid = replace(saved_a, id="invalid-settings", **settings)
+                        history.save(invalid)
+                        path = history.directory / f"{invalid.id}.json"
+                        original = path.read_bytes()
+                        with self.assertRaisesRegex(error, detail):
+                            restarted.restore_session(invalid.id)
+                        self.assertEqual(restarted.session, session_a)
+                        self.assertEqual(
+                            (restarted.thinking, restarted.enabled_tools), expected
+                        )
+                        self.assertEqual(path.read_bytes(), original)
+            finally:
+                await restarted.close()
 
     async def test_generic_thinking_uses_explicit_connection_compatibility(self):
         model = ModelInfo(id="local", provider="compatible", thinking_modes=("high",))
@@ -419,3 +519,4 @@ class CLITests(unittest.TestCase):
                 (updated,) = history.list_sessions()
                 self.assertEqual(updated.id, saved.id)
                 self.assertEqual(updated.message_count, 4)
+                self.assertEqual(history.load(updated.id).thinking, "high")

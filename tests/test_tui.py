@@ -111,15 +111,24 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("本轮 in 12 out 8 total 20", usage)
                 self.assertIn("会话 in 12 out 8 total 20", usage)
                 old = ops.session.id
+                await submit(ui, pilot, "/thinking high")
+                await until(pilot, lambda: ops.thinking == "high")
+                await submit(ui, pilot, "/tools none")
+                await until(pilot, lambda: not ops.enabled_tools)
                 await submit(ui, pilot, "/clear")
                 await pilot.pause()
                 self.assertEqual(len(ops.message_snapshot()), 2)
                 await submit(ui, pilot, "/new")
                 await until(pilot, lambda: ops.session.id != old)
                 self.assertEqual(len(ops.message_snapshot()), 0)
-                self.assertIn(
-                    "会话 in 0 out 0 total 0", str(ui.query_one(UsageView).render())
-                )
+                usage = str(ui.query_one(UsageView).render())
+                self.assertIn("会话 in 0 out 0 total 0", usage)
+                self.assertIn("思考 high", usage)
+                self.assertIn("0 tools", usage)
+                await submit(ui, pilot, "/thinking default")
+                await until(pilot, lambda: ops.thinking is None)
+                await submit(ui, pilot, "/tools all")
+                await until(pilot, lambda: ops.enabled_tools == ops.all_tools)
                 await submit(ui, pilot, "/session")
                 await until(pilot, lambda: isinstance(ui.screen, ChoiceScreen))
                 sessions = ui.screen.query_one(OptionList)
@@ -127,9 +136,10 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 sessions.highlighted = list(ui.screen.values.values()).index(old)
                 await pilot.press("enter")
                 await until(pilot, lambda: ops.session.id == old)
-                self.assertIn(
-                    "会话 in 12 out 8 total 20", str(ui.query_one(UsageView).render())
-                )
+                usage = str(ui.query_one(UsageView).render())
+                self.assertIn("会话 in 12 out 8 total 20", usage)
+                self.assertIn("思考 high", usage)
+                self.assertIn("0 tools", usage)
                 self.assertTrue(
                     any(
                         row.text == "hello" and row.title == "助手"
