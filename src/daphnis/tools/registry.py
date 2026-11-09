@@ -157,7 +157,9 @@ class ToolExecutor:
             trusted=self._trusted,
         )
 
-    async def execute(self, call: dict[str, Any]) -> ToolResult:
+    async def execute(
+        self, call: dict[str, Any], *, request_number: int = 0
+    ) -> ToolResult:
         call = deepcopy(call)
         arguments = self._registry.validate_call(call)
         name = call["function"]["name"]
@@ -180,6 +182,7 @@ class ToolExecutor:
         fields = {
             "session_id": binding.session_id,
             "turn_id": binding.turn_id,
+            "request_number": request_number,
             "tool_call_id": call["id"],
             "name": name,
         }
@@ -333,17 +336,21 @@ def create_tools(
             ["query"],
         ),
         "apply_patch": (
-            "Apply plain unified diff: ---/+++ headers (a/ and b/ optional), "
-            "numbered @@ hunks, /dev/null for create/delete. Exact original text "
-            "required; no rename or Git metadata headers. Existing changes "
-            "require approval. Reports partial filesystem effects.",
+            (
+                "Apply plain unified diff: ---/+++ headers (a/ and b/ optional), "
+                "numbered @@ hunks, /dev/null for create/delete. Exact original text "
+                "required; no rename or Git metadata headers. Requires approval "
+                "and reports partial filesystem effects."
+            ),
             {"patch": {"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES}},
             ["patch"],
         ),
         "run_command": (
-            "Execute argv, never a shell string. No pipelines, shell/inline "
-            "interpreters or dangerous commands. Scripts/builds/uncertain writes "
-            "require approval; output is bounded.",
+            (
+                "Execute argv, never a shell string. No pipelines, shell/inline "
+                "interpreters or dangerous commands. Scripts/builds/uncertain writes "
+                "require approval; output is bounded."
+            ),
             {
                 "argv": {
                     "type": "array",

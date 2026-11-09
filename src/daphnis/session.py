@@ -19,6 +19,7 @@ class Session:
     usage: UsageTotals = field(default_factory=UsageTotals)
     thinking: str | None = None
     enabled_tools: tuple[str, ...] = ()
+    _saved_revision: tuple[str, str] | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):

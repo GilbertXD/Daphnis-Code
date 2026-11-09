@@ -416,6 +416,39 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state.messages.snapshot(), original)
                 self.assertEqual(tool_events, [])
 
+    async def test_stop_requires_visible_text_or_refusal(self):
+        for fields, expected in (
+            ({}, TurnStatus.FAILED),
+            ({"content": None}, TurnStatus.FAILED),
+            ({"content": ""}, TurnStatus.FAILED),
+            ({"content": "  ", "reasoning_content": "thinking"}, TurnStatus.FAILED),
+            ({"content": "answer"}, TurnStatus.COMPLETED),
+            ({"content": [{"type": "text", "text": "answer"}]}, TurnStatus.COMPLETED),
+            ({"content": None, "refusal": "Cannot comply."}, TurnStatus.COMPLETED),
+        ):
+            with self.subTest(fields=fields):
+                state = session()
+                response = reply(None)
+                response["choices"][0]["message"] = {"role": "assistant", **fields}
+                async with make_client(
+                    lambda request, response=response: httpx.Response(200, json=response)
+                ) as client:
+                    result = await make_agent(client).run(session=state, prompt="answer")
+                self.assertEqual(result.status, expected, result.error)
+                if expected == TurnStatus.FAILED:
+                    self.assertIn("no visible text or refusal", result.error)
+                    self.assertEqual(len(state.messages), 0)
+                else:
+                    self.assertEqual(result.message, state.messages.snapshot()[-1])
+
+        async with make_client(lambda request: stream_reply(
+            {"choices": [{"index": 0, "delta": {"role": "assistant", "refusal": "Cannot "}}]},
+            {"choices": [{"index": 0, "delta": {"refusal": "comply."}, "finish_reason": "stop"}]},
+        )) as client:
+            result = await make_agent(client).run(session=session(), prompt="answer", stream=True)
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(result.message["refusal"], "Cannot comply.")
+
     async def test_failure_limits_and_unsafe_tools_do_not_commit(self):
         cases = (
             ("length", {}, registry(), reply("partial", finish="length")),
@@ -448,7 +481,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 state.messages.add_assistant("old answer")
                 original = state.messages.snapshot()
                 async with make_client(
-                    lambda request: httpx.Response(200, json=response)
+                    lambda request, response=response: httpx.Response(200, json=response)
                 ) as client:
                     result = await make_agent(client, tools=tools, **options).run(
                         session=state, prompt="new question"

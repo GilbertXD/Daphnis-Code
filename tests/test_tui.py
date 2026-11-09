@@ -336,6 +336,39 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#tools-apply")
                 self.assertEqual(ops.enabled_tools, ())
 
+    async def test_tool_ids_reused_across_requests_have_separate_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in ("first.txt", "second.txt"):
+                (root / path).write_text(path)
+
+            def handler(request):
+                messages = json.loads(request.content)["messages"]
+                count = sum(message["role"] == "tool" for message in messages)
+                if count == 2:
+                    return sse({"role": "assistant", "content": "done"})
+                name = ("first.txt", "second.txt")[count]
+                return sse({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "reused", "type": "function",
+                        "function": {"name": "read_file", "arguments": json.dumps({"path": name})},
+                    }],
+                }, "tool_calls")
+
+            app = controller(root, handler)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "read both")
+                await until(pilot, lambda: bool(ops.message_snapshot()) and not ui._sending)
+                chat = ui.query_one(ChatView)
+                rows = list(chat.query("ChatRow.tool"))
+                self.assertEqual([Path(row.text).name for row in rows], ["first.txt", "second.txt"])
+                await chat.restore(ops.message_snapshot())
+                restored = list(chat.query("ChatRow.tool"))
+                self.assertEqual([Path(row.text).name for row in restored], ["first.txt", "second.txt"])
+
     async def test_tool_folding_expands_errors_and_shows_real_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = controller(
@@ -411,7 +444,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 self.assertEqual(
-                    chat.tools[("turn", "run")].output, "actual tool output"
+                    chat.tools[("turn", 0, "run")].output, "actual tool output"
                 )
                 await chat.event(
                     Event(
@@ -439,7 +472,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 self.assertIn(
-                    "invalid arguments", chat.tools[("turn", "invalid")].outcome
+                    "invalid arguments", chat.tools[("turn", 0, "invalid")].outcome
                 )
                 self.assertEqual(
                     patch_counts(

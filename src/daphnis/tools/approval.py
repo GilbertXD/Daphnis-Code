@@ -56,6 +56,16 @@ def signature(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def verify_directory(path: Path, identity: tuple[int, ...] | None) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+        current = signature(path.stat(follow_symlinks=False))
+    except (OSError, RuntimeError) as exc:
+        raise ToolError("target_changed", f"Directory moved or changed: {path}") from exc
+    if identity is None or resolved != path or current[:3] != identity[:3]:
+        raise ToolError("target_changed", f"Directory moved or changed: {path}")
+
+
 @dataclass(frozen=True)
 class Target:
     requested: Path
@@ -100,14 +110,15 @@ class Target:
         current = Path(self.path.anchor)
         try:
             for component in self.path.parts[1:-1]:
-                current = current / component
                 if create:
+                    verify_directory(current, signature(os.fstat(fd)))
                     try:
                         os.mkdir(component, dir_fd=fd)
                         if created is not None:
-                            created.append(str(current))
+                            created.append(str(current / component))
                     except FileExistsError:
                         pass
+                current = current / component
                 next_fd = os.open(
                     component,
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -177,12 +188,8 @@ class ApprovalRequest:
 ApprovalCallback = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 
 
-def path_decision(
-    workspace: Path, targets: tuple[Target, ...], *, writes_existing: bool = False
-) -> Decision:
-    if writes_existing or any(
-        not target.path.is_relative_to(workspace) for target in targets
-    ):
+def path_decision(workspace: Path, targets: tuple[Target, ...]) -> Decision:
+    if any(not target.path.is_relative_to(workspace) for target in targets):
         return Decision.ASK
     return Decision.ALLOW
 
@@ -315,9 +322,9 @@ def _git_command(arguments: list[str]) -> tuple[str, list[str]]:
             return option, arguments[index + 1 :]
         if option in ("-C", "--git-dir", "--work-tree"):
             index += 2
-        elif option.startswith(("-C", "--git-dir=", "--work-tree=")):
-            index += 1
-        elif option in ("--no-pager", "--bare", "--literal-pathspecs"):
+        elif option.startswith(("-C", "--git-dir=", "--work-tree=")) or option in (
+            "--no-pager", "--bare", "--literal-pathspecs"
+        ):
             index += 1
         else:
             raise ToolError(
@@ -356,7 +363,7 @@ def blocked_reason(program: str, arguments: list[str], workspace: Path) -> str |
         for argument in arguments:
             if argument.startswith("-"):
                 continue
-            target = Target.capture(argument, workspace).path
+            target = Target.capture(workspace / argument, workspace).path
             critical = {Path(path).resolve() for path in CRITICAL_DIRECTORIES}
             if target in critical or target == Path.home().resolve():
                 return "Deletion of a root or critical directory is blocked."
@@ -441,34 +448,37 @@ def trusted_read_program(path: Path) -> bool:
     return True
 
 
-def read_arguments(program: str, arguments: list[str]) -> list[str] | None:
-    """Return explicitly read paths, or None if options need approval."""
+def read_arguments(
+    program: str, arguments: list[str]
+) -> tuple[list[str], list[str]] | None:
+    """Recognize portable options before literal operands for system reads."""
     if program in ("echo", "pwd", "uname"):
-        return []
-    paths = []
+        return arguments, []
+    allowed_flags = {"cat": "benstuv", "ls": "aAlhndpF1", "wc": "clmw"}
     index = 0
-    positional = False
-    allowed_flags = {"cat": "benstuvAET", "ls": "aAlhndpF1", "wc": "clmwL"}
-    while index < len(arguments):
+    while index < len(arguments) and arguments[index].startswith("-"):
         argument = arguments[index]
-        if argument == "--" and not positional:
-            positional = True
-        elif argument.startswith("-") and not positional:
-            if program in ("head", "tail") and argument in ("-n", "-c"):
-                index += 1
-                if index >= len(arguments) or not arguments[index].isdigit():
-                    return None
-            elif not (
-                program in allowed_flags
-                and len(argument) > 1
-                and not argument.startswith("--")
-                and all(flag in allowed_flags[program] for flag in argument[1:])
-            ):
+        if argument == "--":
+            break
+        if program in ("head", "tail") and argument in ("-n", "-c"):
+            index += 1
+            if index >= len(arguments) or not re.fullmatch(r"[0-9]+", arguments[index]):
                 return None
-        else:
-            paths.append(argument)
+        elif not (
+            len(argument) > 1
+            and all(flag in allowed_flags.get(program, "") for flag in argument[1:])
+        ):
+            return None
         index += 1
-    return paths or (["."] if program == "ls" else [])
+    separator = arguments[index:index + 1] == ["--"]
+    paths = arguments[index + separator:]
+    if any(
+        path in ("", "-") or path.startswith("~")
+        or (not separator and path.startswith("-"))
+        for path in paths
+    ):
+        return None
+    return arguments[:index], paths or (["."] if program == "ls" else [])
 
 
 def resolve_program(value: str, workspace: Path) -> Target:

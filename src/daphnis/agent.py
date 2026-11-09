@@ -58,6 +58,21 @@ class FatalToolError(RuntimeError):
     """A tool handler can raise this when its environment cannot safely continue."""
 
 
+def assistant_text(message: dict[str, Any]) -> str:
+    """Visible Chat Completions text, including text parts and explicit refusal."""
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            part["text"] for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    if isinstance(content, str) and content.strip():
+        return content
+    refusal = message.get("refusal")
+    return refusal if isinstance(refusal, str) and refusal.strip() else ""
+
+
 async def _checkpoint() -> None:
     await asyncio.sleep(0)
     task = asyncio.current_task()
@@ -126,6 +141,7 @@ class Agent:
                 )
             return response
         accumulator = ResponseAccumulator()
+        refusals: dict[int, list[str]] = {}
         async with self._client.stream(
             model=model,
             messages=messages,
@@ -134,12 +150,20 @@ class Agent:
         ) as chunks:
             async for chunk in chunks:
                 accumulator.add_chunk(chunk)
+                for choice in chunk["choices"]:
+                    refusal = choice["delta"].get("refusal")
+                    if isinstance(refusal, str) and refusal:
+                        refusals.setdefault(choice["index"], []).append(refusal)
                 if chunk.get("usage") is not None:
                     await self.events.emit(
                         "model.usage", **event_fields, usage=chunk["usage"]
                     )
                 await self.events.emit("model.delta", **event_fields, chunk=chunk)
-        return accumulator.finalize()
+        response = accumulator.finalize()
+        for choice in response["choices"]:
+            if choice["index"] in refusals:
+                choice["message"]["refusal"] = "".join(refusals[choice["index"]])
+        return response
 
     @staticmethod
     def _parse_response(response: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -155,13 +179,15 @@ class Agent:
             raise ValueError("Tool calls must be a list or null.")
         if reason == "stop" and calls:
             raise ValueError("A stop response unexpectedly contains tool calls.")
+        if reason == "stop" and not assistant_text(message):
+            raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             if not calls:
                 raise ValueError("Tool-call response has no tool calls.")
             ids: set[str] = set()
             for call in calls:
                 if not isinstance(call, dict):
-                    raise ValueError("Tool call must be an object.")
+                    raise TypeError("Tool call must be an object.")
                 call_id = call.get("id")
                 function = call.get("function")
                 if (
@@ -311,7 +337,10 @@ class Agent:
                     tool_status = "FAILED"
                     try:
                         try:
-                            result = await tools.execute(call)
+                            if isinstance(tools, ToolExecutor):
+                                result = await tools.execute(call, request_number=requests)
+                            else:
+                                result = await tools.execute(call)
                             content = result.content
                             if isinstance(tools, ToolExecutor) and not result.value.get(
                                 "ok", False
@@ -333,11 +362,11 @@ class Agent:
                             tool_call_id=call["id"], content=content
                         )
                         tool_status = "ERROR" if tool_error else "COMPLETED"
-                    except asyncio.CancelledError:
+                    except asyncio.CancelledError as exc:
                         tool_status = "CANCELLED"
                         tool_error = {
                             "type": "CancelledError",
-                            "message": "Tool operation cancelled.",
+                            "message": str(exc) or "Tool operation cancelled.",
                         }
                         raise
                     except Exception as exc:
@@ -360,7 +389,7 @@ class Agent:
             status = TurnStatus.CANCELLED
             error = "Turn cancelled; executed tool side effects are not rolled back."
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Report unexpected failures as failed Turns.
             error = f"{type(exc).__name__}: {exc}"
         finally:
             try:

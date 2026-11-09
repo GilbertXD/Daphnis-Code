@@ -1,6 +1,7 @@
 """MCP tool discovery and calls over SDK transports."""
 
 import asyncio
+import json
 import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -24,10 +25,38 @@ from mcp.types import (
 )
 
 TOOL_PREFIX = "mcp__"
+MAX_TOOL_RESULT_BYTES = 65_536
 _CONNECT_TIMEOUT = 15
 _CALL_TIMEOUT = 30
 _HTTP_HEALTH_INTERVAL = 15
 _HTTP_HEALTH_TIMEOUT = 5
+
+
+def _result_fits(value: dict[str, Any]) -> bool:
+    # Match Saturnus ToolResult serialization, including UTF-8 and JSON escaping.
+    remaining = MAX_TOOL_RESULT_BYTES
+    for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(value):
+        if len(chunk) > remaining:
+            return False
+        remaining -= len(chunk.encode("utf-8"))
+        if remaining < 0:
+            return False
+    return True
+
+
+def _bounded_result(value: dict[str, Any]) -> dict[str, Any]:
+    if _result_fits(value):
+        return value
+    omitted = [key for key in ("text", "structured_content") if key in value]
+    limited = {key: item for key, item in value.items() if key not in omitted}
+    limited.update(truncated=True, limit_bytes=MAX_TOOL_RESULT_BYTES, omitted_fields=omitted)
+    for key in tuple(omitted):
+        limited[key] = value[key]
+        if _result_fits(limited):
+            omitted.remove(key)
+        else:
+            del limited[key]
+    return limited
 
 
 @dataclass(frozen=True)
@@ -451,7 +480,7 @@ class MCPConnection:
                 "code": "mcp_tool_error",
                 "message": "MCP Server 返回工具错误。",
             }
-        return value
+        return _bounded_result(value)
 
     async def aclose(self) -> None:
         self.state, self.error = "Disconnected", None

@@ -34,6 +34,7 @@ from .tools import (
 from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
+_EVENT_DRAIN_TIMEOUT = 0.5
 
 
 class SessionSaveError(RuntimeError):
@@ -68,6 +69,7 @@ class Application:
         }
         self._clients: dict[str, ChatClient] = {}
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
         self._interactive = interactive
         self._task: asyncio.Task[TurnResult] | None = None
@@ -409,15 +411,19 @@ class Application:
                 pass
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close_resources())
+        await asyncio.shield(self._close_task)
+
+    async def _close_resources(self) -> None:
         async with AsyncExitStack() as stack:
             for client in self._clients.values():
                 stack.push_async_callback(client.aclose)
             try:
                 await self._cancel_turn()
-                await self.events.drain()
+                self.events.clear()
+                await self.events.drain(timeout=_EVENT_DRAIN_TIMEOUT)
             finally:
                 async with self._mcp_lock:
                     for connection in self._mcp.values():

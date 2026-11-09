@@ -6,8 +6,9 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from saturnus import SaturnusError
 
-from .agent import TurnStatus
+from .agent import TurnStatus, assistant_text
 from .app import Application
 from .config import environment_connections, load_mcp_config
 from .operations import Operations
@@ -20,7 +21,7 @@ async def execute(ops: Operations, prompt: str) -> int:
         return 0
     result = await ops.send(prompt, stream=False)
     if result.status == TurnStatus.COMPLETED:
-        print(result.message.get("content") or "")
+        print(assistant_text(result.message))
         return 0
     print(safe_error(result.error or result.status), file=sys.stderr)
     return 1
@@ -48,7 +49,7 @@ def main() -> int:
             connections=connections,
             interactive=args.prompt is None,
         )
-    except Exception as exc:
+    except (OSError, SaturnusError, TypeError, ValueError) as exc:
         print(safe_error(exc), file=sys.stderr)
         return 2
 
@@ -82,6 +83,6 @@ def main() -> int:
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("已取消。", file=sys.stderr)
         return 130
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - Final CLI boundary for unexpected failures.
         print(safe_error(exc), file=sys.stderr)
         return 1

@@ -9,14 +9,51 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .approval import Operation, Target, ToolError, failure, path_decision, signature
+from .approval import (
+    Decision,
+    Operation,
+    Target,
+    ToolError,
+    failure,
+    path_decision,
+    signature,
+    verify_directory,
+)
 
 MAX_FILE_BYTES = 1_048_576
 MAX_PATCH_BYTES = 1_048_576
+_CREDENTIAL_NAMES = frozenset({
+    ".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".dockercfg", ".envrc",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "credentials.json", "application_default_credentials.json",
+})
+_CREDENTIAL_PATHS = frozenset({
+    (".aws", "credentials"), (".aws", "config"), (".docker", "config.json"),
+    (".kube", "config"), ("gh", "hosts.yml"),
+})
+
+
+def require_readable_path(target: Target) -> None:
+    """Protect content, including reads through a resolved symlink."""
+    for path in (target.path, target.requested):
+        name = path.name.casefold()
+        location = tuple(part.casefold() for part in path.parts[-2:])
+        if (
+            (name == ".env" or name.startswith(".env.")) and name != ".env.example"
+            or name in _CREDENTIAL_NAMES
+            or location in _CREDENTIAL_PATHS
+            or path.suffix.casefold() in {".pem", ".key", ".p12", ".pfx", ".ppk"}
+            or (name.startswith("id_") and not name.endswith(".pub")
+                and path.parent.name.casefold() == ".ssh")
+        ):
+            raise ToolError("sensitive_path", "Reading protected credentials is prohibited.")
 
 
 def read_bytes(target: Target, limit: int) -> tuple[bytes, bool]:
+    require_readable_path(target)
     with target.open() as fd:
+        if os.fstat(fd).st_nlink > 1:
+            raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
         data = bytearray()
         while len(data) <= limit:
             chunk = os.read(fd, min(65536, limit + 1 - len(data)))
@@ -32,6 +69,7 @@ def decode_text(data: bytes, truncated: bool) -> str:
 
 def prepare_read(arguments: dict[str, Any], workspace: Path) -> Operation:
     target = Target.capture(arguments["path"], workspace)
+    require_readable_path(target)
 
     async def run():
         data, truncated = read_bytes(target, arguments.get("max_bytes", 65536))
@@ -122,8 +160,7 @@ def _label(line: str, prefix: str) -> str | None:
     value = line[4:].rstrip("\r\n").split("\t", 1)[0]
     if value == "/dev/null":
         return None
-    if value.startswith(prefix):
-        value = value[len(prefix) :]
+    value = value.removeprefix(prefix)
     if not value or value.startswith('"'):
         raise ToolError("invalid_patch", "Patch headers require unquoted paths.")
     return value
@@ -239,59 +276,111 @@ def _apply_text(original: str, patch: FilePatch) -> str:
     return updated
 
 
+def _verify_displaced(stage: int, target: Target, original: bytes) -> None:
+    try:
+        fd = os.open("original", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage)
+    except OSError as exc:
+        raise ToolError("target_changed", "Patch target changed during commit.") from exc
+    with os.fdopen(fd, "rb") as stream:
+        before = signature(os.fstat(fd))
+        expected = target.identity
+        # Renaming changes ctime. Compare the other metadata and the actual bytes.
+        if (
+            expected is None
+            or before[:5] != expected[:5]
+            or stream.read(len(original) + 1) != original
+            or signature(os.fstat(fd)) != before
+        ):
+            raise ToolError("target_changed", "Patch target changed during commit.")
+
+
 def _write(
-    target: Target, action: str, content: str, created: list[str], applied: list[str]
+    target: Target, action: str, original: bytes | None, content: str, *,
+    workspace: Target, parent: Target, created: list[str], applied: list[str],
 ) -> None:
+    verify_directory(workspace.path, workspace.identity)
     target.verify()
     with target.parent(create=action == "create", created=created) as (fd, name):
-        if action == "delete":
-            if (
-                signature(os.stat(name, dir_fd=fd, follow_symlinks=False))
-                != target.identity
-            ):
-                raise ToolError("target_changed", "File changed before deletion.")
-            os.unlink(name, dir_fd=fd)
-            applied.append(str(target.path))
-            return
-        temporary = f".daphnis-{uuid4().hex}.tmp"
-        output = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o666,
-            dir_fd=fd,
-        )
+        def verify_parent() -> None:
+            verify_directory(workspace.path, workspace.identity)
+            opened = signature(os.fstat(fd))
+            verify_directory(parent.path, opened)
+            if parent.identity is not None and parent.identity[:3] != opened[:3]:
+                raise ToolError("target_changed", f"Patch parent was replaced: {parent.path}")
+
+        verify_parent()
+        staging = f".daphnis-{uuid4().hex}.tmp"
+        os.mkdir(staging, mode=0o700, dir_fd=fd)
+        stage = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        displaced = installed = keep_original = False
         try:
-            with os.fdopen(output, "wb") as stream:
-                stream.write(content.encode("utf-8"))
-                stream.flush()
-                if target.identity is not None:
-                    os.fchmod(stream.fileno(), stat.S_IMODE(target.identity[2]))
-                os.fsync(stream.fileno())
-            if action == "create":
-                # Atomic installation never overwrites a concurrently created file.
+            if action != "delete":
+                verify_parent()
+                output = os.open("updated", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                 0o666, dir_fd=stage)
+                with os.fdopen(output, "wb") as stream:
+                    stream.write(content.encode("utf-8"))
+                    stream.flush()
+                    if target.identity is not None:
+                        os.fchmod(stream.fileno(), stat.S_IMODE(target.identity[2]))
+                    os.fsync(stream.fileno())
+            verify_parent()
+            target.verify()
+            if original is not None:
+                # Hold the displaced inode until validation. A late writer's
+                # version can be restored or recovered even if the name races.
+                os.rename(name, "original", src_dir_fd=fd, dst_dir_fd=stage)
+                displaced = True
+                _verify_displaced(stage, target, original)
+                verify_parent()
+            if action != "delete":
                 os.link(
-                    temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False
+                    "updated", name, src_dir_fd=stage, dst_dir_fd=fd, follow_symlinks=False
                 )
-            else:
-                if (
-                    signature(os.stat(name, dir_fd=fd, follow_symlinks=False))
-                    != target.identity
-                ):
-                    raise ToolError(
-                        "target_changed", "File changed before replacement."
-                    )
-                os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
-            applied.append(str(target.path))
+                installed = True
+                applied.append(str(target.path))
+            if original is not None:
+                _verify_displaced(stage, target, original)
+            verify_parent()
+            if action == "delete":
+                applied.append(str(target.path))
+        except (OSError, ToolError) as exc:
+            if displaced and not installed:
+                try:
+                    verify_parent()
+                    os.link("original", name, src_dir_fd=stage, dst_dir_fd=fd,
+                            follow_symlinks=False)
+                except (OSError, ToolError):
+                    keep_original = True
+                    applied.append(str(target.path))
+            elif displaced:
+                keep_original = True
+            if keep_original:
+                raise ToolError(
+                    "target_changed",
+                    "Patch conflict; displaced file retained in the original directory.",
+                    recovery_file=str(parent.path / staging / "original"),
+                ) from exc
+            raise
         finally:
             try:
-                os.unlink(temporary, dir_fd=fd)
-            except FileNotFoundError:
-                pass
+                for entry in ("updated", "original"):
+                    if entry != "original" or not keep_original:
+                        try:
+                            os.unlink(entry, dir_fd=stage)
+                        except FileNotFoundError:
+                            continue
+            finally:
+                os.close(stage)
+            if not keep_original:
+                os.rmdir(staging, dir_fd=fd)
 
 
 def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
     patches = parse_patch(arguments["patch"])
     targets = tuple(Target.capture(patch.path, workspace) for patch in patches)
+    workspace_target = Target.capture(workspace, workspace)
+    parents = tuple(Target.capture(target.path.parent, workspace) for target in targets)
     if len({target.path for target in targets}) != len(targets):
         raise ToolError("invalid_patch", "Each normalized target may appear only once.")
     for target, patch in zip(targets, patches, strict=True):
@@ -307,29 +396,33 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
         updates = []
         for target, patch in zip(targets, patches, strict=True):
             if patch.action == "create":
-                original = ""
+                original, data = "", None
             else:
                 data, truncated = read_bytes(target, MAX_FILE_BYTES)
                 if truncated:
                     raise ToolError("file_too_large", "Patch target exceeds 1 MiB.")
                 original = decode_text(data, False)
-            updates.append(_apply_text(original, patch))
+            updates.append((data, _apply_text(original, patch)))
         applied: list[str] = []
         created: list[str] = []
         try:
-            for target, patch, updated in zip(targets, patches, updates, strict=True):
-                _write(target, patch.action, updated, created, applied)
+            for target, parent, patch, (original, updated) in zip(
+                targets, parents, patches, updates, strict=True
+            ):
+                _write(target, patch.action, original, updated, workspace=workspace_target,
+                       parent=parent, created=created, applied=applied)
         except (OSError, ToolError) as exc:
             return failure(
                 exc.code
                 if isinstance(exc, ToolError)
                 else "target_changed"
-                if isinstance(exc, FileExistsError)
+                if isinstance(exc, (FileExistsError, FileNotFoundError))
                 else "patch_failed",
                 str(exc),
                 applied_files=applied,
                 created_directories=created,
                 partial=bool(applied or created),
+                **(exc.details if isinstance(exc, ToolError) else {}),
             )
         return {
             "ok": True,
@@ -339,12 +432,8 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
         }
 
     return Operation(
-        path_decision(
-            workspace,
-            targets,
-            writes_existing=any(p.action != "create" for p in patches),
-        ),
-        "Apply an exact unified diff; existing content changes require approval.",
+        Decision.ASK,
+        "Apply an exact unified diff. Filesystem writes require confirmation.",
         targets,
         {
             "patch": arguments["patch"],
@@ -354,5 +443,6 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
             ],
         },
         run,
+        force_approval=True,
         allow_session_trust=False,
     )

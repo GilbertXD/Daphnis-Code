@@ -13,6 +13,7 @@ from rich.text import Text
 from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Collapsible, Static
 
+from ..agent import assistant_text
 from ..events import Event
 from ..mcp import TOOL_PREFIX
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
@@ -219,7 +220,7 @@ class ChatView(VerticalScroll):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.assistants: dict[tuple[str, int], ChatRow] = {}
-        self.tools: dict[tuple[str, str], ChatRow] = {}
+        self.tools: dict[tuple[str, int, str], ChatRow] = {}
         self.turn_rows: dict[str, list[ChatRow]] = {}
         self.pending_user: ChatRow | None = None
         self._tool_group: ToolGroup | None = None
@@ -260,8 +261,8 @@ class ChatView(VerticalScroll):
         calls = {}
         for message in messages:
             role = message["role"]
-            for call in message.get("tool_calls") or ():
-                calls[call["id"]] = call["function"]
+            if role == "assistant":
+                calls = {call["id"]: call["function"] for call in message.get("tool_calls") or ()}
             if role == "tool":
                 function = calls.get(message["tool_call_id"], {})
                 row = await self.add(
@@ -289,7 +290,7 @@ class ChatView(VerticalScroll):
                 if row.output or row.outcome.startswith("ERROR"):
                     row.tool_group.reveal()
             else:
-                content = message.get("content")
+                content = assistant_text(message) if role == "assistant" else message.get("content")
                 if (
                     role == "assistant"
                     and not content
@@ -328,7 +329,8 @@ class ChatView(VerticalScroll):
                 choices = data["response"].get("choices", [])
                 message = choices[0].get("message", {}) if choices else {}
             content, reasoning = (
-                message.get("content"),
+                (message.get("content") or message.get("refusal"))
+                if event.name == "model.delta" else assistant_text(message),
                 message.get("reasoning_content"),
             )
             if not content and not reasoning:
@@ -350,7 +352,7 @@ class ChatView(VerticalScroll):
                 )
             row.dirty = True
         elif event.name.startswith("tool."):
-            key = (event.turn_id, data["tool_call_id"])
+            key = (event.turn_id, data.get("request_number", 0), data["tool_call_id"])
             row = self.tools.get(key)
             if row is None:
                 row = await self.add(

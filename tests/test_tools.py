@@ -3,6 +3,7 @@ import difflib
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from saturnus import ChatClient, ToolCallValidationError
 
-from daphnis import Agent, EventBus, Session, TurnStatus
+from daphnis import Agent, EventBus, History, Operations, Session, TurnStatus
+from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools
 
@@ -52,6 +54,84 @@ async def approve(request):
 
 
 class ToolsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_credentials_do_not_reach_model_history_or_child_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            secret = "synthetic-P9-credential"
+            (workspace / ".env").write_text(f"MIMO_API_KEY={secret}\n")
+            (workspace / ".env.local").write_text(secret)
+            (workspace / ".env.example").write_text("MIMO_API_KEY=example\n")
+            (workspace / "alias").symlink_to(".env")
+            (workspace / "hardlink").hardlink_to(workspace / ".env")
+            (workspace / "private.pem").write_text(secret)
+            (workspace / "code.py").write_text("print('ordinary code')\n")
+            script = workspace / "child.py"
+            script.write_text("import os\nprint(os.getenv('MIMO_API_KEY', 'absent'))\n")
+            calls = [
+                call("read_file", path="./.env"),
+                call("read_file", path="alias"),
+                call("read_file", path="hardlink"),
+                call("search", query="synthetic-P9", mode="content"),
+                call("read_file", path=".env.example"),
+                call("read_file", path="code.py"),
+            ]
+            returned = []
+
+            def model(request):
+                messages = json.loads(request.content)["messages"]
+                if messages[-1]["role"] == "tool":
+                    returned.extend(
+                        json.loads(item["content"]) for item in messages
+                        if item["role"] == "tool"
+                    )
+                    message, finish = {"role": "assistant", "content": "done"}, "stop"
+                else:
+                    message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {**item, "id": str(index)}
+                            for index, item in enumerate(calls)
+                        ],
+                    }
+                    finish = "tool_calls"
+                return httpx.Response(200, json={
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish}]
+                })
+
+            history = History(workspace / "history")
+            app = Application(
+                workspace=workspace, provider="mimo", model_id="mimo-v2.6-flash",
+                connections={"mimo": {
+                    "base_url": "https://model.test", "transport": httpx.MockTransport(model)
+                }},
+                history=history,
+            )
+            try:
+                ops = Operations(app)
+                self.assertEqual((await ops.send("inspect", stream=False)).status, TurnStatus.COMPLETED)
+                saved = (history.directory / f"{ops.session.id}.json").read_text()
+            finally:
+                await app.close()
+            with patch.dict(os.environ, {"MIMO_API_KEY": secret}):
+                full = bound(workspace, approval=approve).select(
+                    ["run_command"], mode=ApprovalMode.FULL
+                )
+                denied = await full.execute(call("run_command", argv=["cat", "alias"]))
+                self.assertEqual(denied.value["error"]["code"], "sensitive_path")
+                child = await full.execute(
+                    call("run_command", argv=[sys.executable, str(script)])
+                )
+            self.assertNotIn(secret, json.dumps(returned))
+            self.assertNotIn(secret, saved)
+            self.assertEqual(
+                [item["error"]["code"] for item in returned[:3]], ["sensitive_path"] * 3
+            )
+            self.assertEqual(returned[3]["matches"], [])
+            self.assertIn("example", returned[4]["content"])
+            self.assertIn("ordinary code", returned[5]["content"])
+            self.assertEqual(child.value["stdout"].strip(), "absent")
+
     async def test_bounded_reads_listing_search_and_external_path_approval(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -128,6 +208,9 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             tools = bound(workspace)
             add = "--- /dev/null\n+++ b/sub/new.txt\n@@ -0,0 +1 @@\n+new\n"
             result = await tools.execute(call("apply_patch", patch=add))
+            self.assertEqual(result.value["error"]["code"], "permission_denied")
+            allowed = bound(workspace, approval=approve)
+            result = await allowed.execute(call("apply_patch", patch=add))
             self.assertTrue(result.value["ok"], result.value)
             target = workspace / "sub/new.txt"
             self.assertEqual(target.read_text(), "new\n")
@@ -136,13 +219,15 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             denied = await tools.execute(call("apply_patch", patch=change))
             self.assertEqual(denied.value["error"]["code"], "permission_denied")
             self.assertEqual(target.read_text(), "new\n")
-            allowed = bound(workspace, approval=approve)
             result = await allowed.execute(call("apply_patch", patch=change))
             self.assertTrue(result.value["ok"], result.value)
             deletion = "--- a/sub/new.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-changed\n"
             denied = await tools.execute(call("apply_patch", patch=deletion))
             self.assertEqual(denied.value["error"]["code"], "permission_denied")
             full = tools.select(["apply_patch"], mode=ApprovalMode.FULL)
+            result = await full.execute(call("apply_patch", patch=deletion))
+            self.assertEqual(result.value["error"]["code"], "permission_denied")
+            full = allowed.select(["apply_patch"], mode=ApprovalMode.FULL)
             result = await full.execute(call("apply_patch", patch=deletion))
             self.assertTrue(result.value["ok"], result.value)
             self.assertFalse(target.exists())
@@ -180,16 +265,16 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.value["error"]["code"], "target_changed")
             self.assertEqual(a.read_text(), "someone else's change\n")
             a.write_text("a\n")
-            real_replace = os.replace
+            real_rename = os.rename
             calls = []
 
             def fail_second(*args, **kwargs):
                 calls.append(args)
                 if len(calls) == 2:
                     raise OSError("injected disk failure")
-                return real_replace(*args, **kwargs)
+                return real_rename(*args, **kwargs)
 
-            with patch("daphnis.tools.files.os.replace", side_effect=fail_second):
+            with patch("daphnis.tools.files.os.rename", side_effect=fail_second):
                 result = await tools.execute(
                     call("apply_patch", patch=valid + diff("b.txt", "b\n", "B\n"))
                 )
@@ -216,6 +301,51 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 (workspace / "new.txt").read_text(), "created by someone else\n"
             )
+
+    async def test_patch_detects_moved_parent_and_late_concurrent_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            parent = workspace / "sub"
+            parent.mkdir(parents=True)
+            moved = root / "moved"
+            tools = bound(workspace, approval=approve)
+            real_sync = os.fsync
+
+            def move_after_staging(fd):
+                real_sync(fd)
+                parent.rename(moved)
+                parent.mkdir()
+
+            with patch("daphnis.tools.files.os.fsync", side_effect=move_after_staging):
+                created = await tools.execute(call(
+                    "apply_patch", patch="--- /dev/null\n+++ b/sub/new.txt\n@@ -0,0 +1 @@\n+ours\n"
+                ))
+            self.assertEqual(created.value.get("error", {}).get("code"), "target_changed")
+            self.assertFalse((moved / "new.txt").exists())
+            self.assertFalse((parent / "new.txt").exists())
+
+            target = workspace / "data.txt"
+            target.write_text("old\n")
+            real_replace, real_rename = os.replace, os.rename
+
+            def replace_after_edit(src, dst, **kwargs):
+                target.write_text("concurrent\n")
+                return real_replace(src, dst, **kwargs)
+
+            def rename_after_edit(src, dst, **kwargs):
+                target.write_text("concurrent\n")
+                return real_rename(src, dst, **kwargs)
+
+            with (
+                patch("daphnis.tools.files.os.replace", side_effect=replace_after_edit),
+                patch("daphnis.tools.files.os.rename", side_effect=rename_after_edit),
+            ):
+                changed = await tools.execute(call(
+                    "apply_patch", patch=diff("data.txt", "old\n", "ours\n")
+                ))
+            self.assertEqual(changed.value.get("error", {}).get("code"), "target_changed")
+            self.assertEqual(target.read_text(), "concurrent\n")
 
     async def test_dangerous_commands_never_reach_approval_or_spawn(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -250,7 +380,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 ["node", "--eval=console.log('blocked')"],
             ]
             with patch(
-                "asyncio.create_subprocess_exec", new_callable=AsyncMock
+                "asyncio.base_events.BaseEventLoop.subprocess_exec", new_callable=AsyncMock
             ) as spawn:
                 for argv in vectors:
                     with self.subTest(argv=argv):
@@ -289,6 +419,39 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.value["stdout_truncated"])
             self.assertLessEqual(len(result.value["stdout"].encode()), 100)
             self.assertIn("failure", result.value["stderr"])
+
+    async def test_shell_read_checks_use_the_path_the_command_will_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "data").write_text("outside")
+            (workspace / "data").write_text("inside")
+            (workspace / "~").symlink_to(outside, target_is_directory=True)
+            (workspace / "-data").write_text("literal")
+            tools = bound(workspace)
+            with patch.dict(os.environ, {"HOME": str(workspace)}):
+                for mode in ApprovalMode:
+                    selected = tools.select(["run_command"], mode=mode)
+                    ambiguous = await selected.execute(
+                        call("run_command", argv=["cat", "~/data"])
+                    )
+                    self.assertEqual(
+                        ambiguous.value.get("error", {}).get("code"), "permission_denied"
+                    )
+                self.assertEqual(
+                    (await tools.execute(call("run_command", argv=["cat", "--", "-data"])))
+                    .value["stdout"], "literal",
+                )
+                listing = await tools.execute(call("run_command", argv=["ls", "-a"]))
+                self.assertTrue(listing.value["ok"], listing.value)
+                self.assertIn("-data", listing.value["stdout"])
+                full = tools.select(["run_command"], mode=ApprovalMode.FULL)
+                for argv in (["cat", "../outside/data"], ["cat", "data", "-n"]):
+                    result = await full.execute(call("run_command", argv=argv))
+                    self.assertEqual(result.value["error"]["code"], "permission_denied")
 
     @unittest.skipUnless(os.name == "posix", "Process-group test requires POSIX")
     async def test_shell_timeout_and_cancel_terminate_child_group(self):
@@ -338,6 +501,34 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(result.value["terminated"])
                 self.assertEqual(stopped.read_text(), "terminated")
 
+    async def test_shell_timeout_reports_detached_descendants_as_unverified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            pid_file = workspace / "detached.pid"
+            child = workspace / "detached.py"
+            child.write_text("import time\ntime.sleep(30)\n")
+            parent = workspace / "parent.py"
+            parent.write_text(
+                "import pathlib, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, sys.argv[1]], start_new_session=True)\n"
+                "pathlib.Path(sys.argv[2]).write_text(str(child.pid))\n"
+                "time.sleep(30)\n"
+            )
+            try:
+                async with asyncio.timeout(5):
+                    result = await bound(workspace, approval=approve).execute(call(
+                        "run_command", argv=[sys.executable, str(parent), str(child), str(pid_file)],
+                        timeout=1.0,
+                    ))
+                pid = int(pid_file.read_text())
+                os.kill(pid, 0)
+                self.assertEqual(result.value["error"]["code"], "command_timeout")
+                self.assertEqual(result.value.get("termination_scope"), "original_process_group")
+                self.assertTrue(result.value.get("escaped_descendants_may_remain"))
+            finally:
+                if pid_file.exists():
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
     async def test_agent_read_create_approve_modify_and_finish(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
@@ -351,7 +542,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 approvals.append(request)
                 self.assertEqual(request.tool_name, "apply_patch")
                 self.assertFalse(request.can_trust)
-                self.assertEqual((workspace / "result.txt").read_text(), "created\n")
+                if len(approvals) == 1:
+                    self.assertFalse((workspace / "result.txt").exists())
+                else:
+                    self.assertEqual((workspace / "result.txt").read_text(), "created\n")
                 return ApprovalDecision.ALLOW_ONCE
 
             steps = [
@@ -413,8 +607,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 ).run(session=state, prompt="read, create, modify")
             self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
             self.assertEqual(result.tool_calls, 3)
-            self.assertEqual(len(approvals), 1)
-            self.assertEqual(len(requested_events), 1)
+            self.assertEqual(len(approvals), 2)
+            self.assertEqual(len(requested_events), 2)
             self.assertEqual((workspace / "result.txt").read_text(), "modified\n")
             self.assertEqual(len(state.messages), 8)
 

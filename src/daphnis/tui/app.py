@@ -3,10 +3,11 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from rich.table import Table
 from rich.text import Text
+from saturnus import SaturnusError
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -34,7 +35,7 @@ from .theme import ACCENT, MUTED, SUCCESS, THEME, WARNING
 
 
 class ChoiceScreen(ModalScreen[Any]):
-    BINDINGS = [Binding("escape", "close", "返回")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "close", "返回")]
     DEFAULT_CSS = """
     ChoiceScreen { align: center middle; background: $background 75%; }
     #choices-box { width: 90%; max-width: 96; height: auto; max-height: 90%;
@@ -97,7 +98,7 @@ class ChoiceScreen(ModalScreen[Any]):
 
 
 class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
-    BINDINGS = [Binding("escape", "close", "返回")]
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "close", "返回")]
     DEFAULT_CSS = """
     ToolsScreen { align: center middle; background: $background 75%; }
     #tools-box { width: 65; max-width: 95%; height: auto;
@@ -157,7 +158,7 @@ class CoreNotification(Message):
 
 class DaphnisApp(App[None]):
     TITLE = "Daphnis"
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "cancel_or_quit", "取消 / 退出", priority=True),
         Binding("ctrl+q", "quit_safely", "退出", priority=True),
         Binding("escape", "interrupt", "中断", show=False),
@@ -351,7 +352,7 @@ class DaphnisApp(App[None]):
                 await self.query_one(ChatView).add(
                     "保存失败", safe_error(exc), classes="notice"
                 )
-        except (Exception, asyncio.CancelledError) as exc:
+        except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - Restore the UI after any worker failure.
             if not self._shutting_down:
                 chat = self.query_one(ChatView)
                 if chat.pending_user is not None:
@@ -414,8 +415,10 @@ class DaphnisApp(App[None]):
                 if items:
                     choices = [
                         (
-                            f"{item.id[:12]} · {item.provider}/{item.model_id}\n"
-                            f"{item.workspace} · {item.message_count} 条",
+                            (
+                                f"{item.id[:12]} · {item.provider}/{item.model_id}\n"
+                                f"{item.workspace} · {item.message_count} 条"
+                            ),
                             item.id,
                             not self.ops.configured(item.provider),
                         )
@@ -431,7 +434,7 @@ class DaphnisApp(App[None]):
             for picker in self.query(ModelPicker):
                 picker.refresh_models()
             self.update_status()
-        except Exception as exc:
+        except (OSError, SaturnusError, RuntimeError, TypeError, ValueError) as exc:
             await self.query_one(ChatView).add(
                 "提示", safe_error(exc), classes="notice"
             )
@@ -459,7 +462,7 @@ class DaphnisApp(App[None]):
             try:
                 self.ops.set_tools(value)
                 self.update_status()
-            except Exception as exc:
+            except (OSError, SaturnusError, RuntimeError, TypeError, ValueError) as exc:
                 self.notify(safe_error(exc), severity="error")
 
     async def _session_selected(self, value: str | None) -> None:

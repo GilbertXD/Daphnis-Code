@@ -1,6 +1,7 @@
 """Argv-only subprocesses with bounded output and process-group cleanup."""
 
 import asyncio
+import logging
 import os
 import signal
 from pathlib import Path
@@ -22,6 +23,41 @@ from .approval import (
     resolve_program,
     trusted_read_program,
 )
+from .files import require_readable_path
+
+_AUTH_ENV = frozenset({
+    "API_KEY", "API_TOKEN", "TOKEN", "PASSWORD",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS", "AZURE_CLIENT_SECRET", "DOCKER_AUTH_CONFIG",
+    "KUBECONFIG", "GIT_ASKPASS", "SSH_ASKPASS",
+})
+_AUTH_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+logger = logging.getLogger(__name__)
+
+
+class _CommandOutput(asyncio.SubprocessProtocol):
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.buffers = {1: bytearray(), 2: bytearray()}
+        self.truncated = {1: False, 2: False}
+        self.reaped = asyncio.Event()
+        self.done = asyncio.get_running_loop().create_future()
+
+    def pipe_data_received(self, fd: int, data: bytes) -> None:
+        output = self.buffers[fd]
+        remaining = self.limit - len(output)
+        output.extend(data[:remaining])
+        self.truncated[fd] |= len(data) > remaining
+
+    def process_exited(self) -> None:
+        self.reaped.set()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if not self.done.done():
+            if exc is None:
+                self.done.set_result(None)
+            else:
+                self.done.set_exception(exc)
 
 
 async def _finish(task: asyncio.Task[Any]) -> Any:
@@ -34,102 +70,101 @@ async def _finish(task: asyncio.Task[Any]) -> Any:
     return task.result()
 
 
-async def _terminate(process: asyncio.subprocess.Process) -> None:
+async def _terminate(
+    transport: asyncio.SubprocessTransport, output: _CommandOutput
+) -> None:
     try:
         if os.name == "posix":
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(transport.get_pid(), signal.SIGTERM)
             except ProcessLookupError:
                 pass
             await asyncio.sleep(0.1)
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(transport.get_pid(), signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        elif process.returncode is None:
-            process.kill()
-        await asyncio.wait_for(process.wait(), 2)
+        elif transport.get_returncode() is None:
+            transport.kill()
+        await asyncio.wait_for(output.reaped.wait(), 2)
     except (OSError, TimeoutError) as exc:
-        raise CleanupError("Could not terminate and reap the command process.") from exc
+        raise CleanupError(
+            "Command cleanup failed; processes and external side effects may remain."
+        ) from exc
+    finally:
+        # A detached descendant can hold inherited output pipes open indefinitely.
+        transport.close()
 
 
 async def _run(
     argv: tuple[str, ...], cwd: Path, timeout: float, limit: int
 ) -> dict[str, Any]:
+    output = _CommandOutput(limit)
     spawn = asyncio.create_task(
-        asyncio.create_subprocess_exec(
+        asyncio.get_running_loop().subprocess_exec(
+            lambda: output,
             *argv,
             cwd=cwd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={
+                name: value for name, value in os.environ.items()
+                if name.upper() not in _AUTH_ENV and not name.upper().endswith(_AUTH_SUFFIXES)
+            },
             start_new_session=os.name == "posix",
         )
     )
     try:
-        process = await asyncio.shield(spawn)
+        transport, _ = await asyncio.shield(spawn)
     except asyncio.CancelledError:
+        output.done.cancel()
         try:
-            process = await _finish(spawn)
-        except Exception:
-            pass
+            transport, _ = await _finish(spawn)
+        except OSError as exc:
+            logger.warning("Command spawn failed during cancellation: %s", type(exc).__name__)
         else:
-            await _finish(asyncio.create_task(_terminate(process)))
-        raise
-
-    output = {"stdout": bytearray(), "stderr": bytearray()}
-    truncated = {"stdout": False, "stderr": False}
-
-    async def drain(name, reader):
-        while chunk := await reader.read(8192):
-            remaining = max(0, limit - len(output[name]))
-            output[name].extend(chunk[:remaining])
-            truncated[name] |= len(chunk) > remaining
-
-    readers = [
-        asyncio.create_task(drain("stdout", process.stdout)),
-        asyncio.create_task(drain("stderr", process.stderr)),
-    ]
-
-    async def cleanup():
-        try:
-            await _terminate(process)
-        finally:
-            for task in readers:
-                task.cancel()
-            await asyncio.gather(*readers, return_exceptions=True)
+            await _finish(asyncio.create_task(_terminate(transport, output)))
+        raise asyncio.CancelledError(
+            "Command cancelled; detached descendants and external side effects may remain."
+        ) from None
 
     timed_out = False
-    completion = asyncio.gather(process.wait(), *readers)
-    completion.add_done_callback(
-        lambda future: future.exception() if not future.cancelled() else None
-    )
     try:
         async with asyncio.timeout(timeout):
-            await completion
+            await output.done
     except TimeoutError:
         timed_out = True
-        await _finish(asyncio.create_task(cleanup()))
+        await _finish(asyncio.create_task(_terminate(transport, output)))
     except asyncio.CancelledError:
-        await _finish(asyncio.create_task(cleanup()))
-        raise
+        await _finish(asyncio.create_task(_terminate(transport, output)))
+        raise asyncio.CancelledError(
+            "Command cancelled; detached descendants and external side effects may remain."
+        ) from None
     except Exception:
-        await _finish(asyncio.create_task(cleanup()))
+        await _finish(asyncio.create_task(_terminate(transport, output)))
         raise
+    finally:
+        transport.close()
     result = {
-        "stdout": bytes(output["stdout"]).decode("utf-8", errors="replace"),
-        "stderr": bytes(output["stderr"]).decode("utf-8", errors="replace"),
-        "exit_code": process.returncode,
+        "stdout": output.buffers[1].decode("utf-8", errors="replace"),
+        "stderr": output.buffers[2].decode("utf-8", errors="replace"),
+        "exit_code": transport.get_returncode(),
         "timed_out": timed_out,
         "terminated": timed_out,
-        "stdout_truncated": truncated["stdout"],
-        "stderr_truncated": truncated["stderr"],
+        "stdout_truncated": output.truncated[1],
+        "stderr_truncated": output.truncated[2],
     }
     if timed_out:
         return failure(
-            "command_timeout", "Command timed out and was terminated.", **result
+            "command_timeout",
+            "Command timed out and its leader was reaped. Detached descendants and "
+            "external side effects may remain.",
+            **result,
+            termination_scope="original_process_group" if os.name == "posix" else "leader",
+            escaped_descendants_may_remain=True,
         )
-    if process.returncode != 0:
+    if transport.get_returncode() != 0:
         return failure(
             "command_failed", "Command exited with a nonzero status.", **result
         )
@@ -188,15 +223,26 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
                 targets.append(Target.capture(argument, cwd.path))
                 break
             index += 1
-    paths = read_arguments(program, argv[1:]) if program in READ_PROGRAMS else None
-    if paths is not None:
-        targets.extend(Target.capture(path, cwd.path) for path in paths)
+    inspected = read_arguments(program, argv[1:]) if program in READ_PROGRAMS else None
     decision = Decision.ASK
-    inspected_read = paths is not None and trusted_read_program(executable.path)
+    invocation = (str(executable.path), *argv[1:])
+    inspected_read = inspected is not None and trusted_read_program(executable.path)
+    if inspected is not None:
+        options, paths = inspected
+        operands = []
+        for path in paths:
+            target = Target.capture(path, cwd.path)
+            if program != "ls":
+                require_readable_path(target)
+                if target.identity is not None and target.path.stat().st_nlink > 1:
+                    raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
+            targets.append(target)
+            operands.append(str(target.path))
+        if operands and inspected_read:
+            invocation = (str(executable.path), *options, "--", *operands)
     if inspected_read:
         # The system executable itself is expected outside the workspace.
         decision = path_decision(workspace, tuple(targets))
-    invocation = (str(executable.path), *argv[1:])
 
     async def run():
         for target in (executable, *targets):

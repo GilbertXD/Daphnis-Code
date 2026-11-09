@@ -69,6 +69,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             requests = asyncio.Queue()
             outcomes = []
+            result_bytes = []
             calls = []
             advertised = set()
 
@@ -77,6 +78,10 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 messages = body["messages"]
                 advertised.update(tool["function"]["name"] for tool in body["tools"])
                 if messages[-1]["role"] == "tool":
+                    result_bytes[:] = [
+                        len(item["content"].encode()) for item in messages
+                        if item["role"] == "tool"
+                    ]
                     outcomes[:] = [
                         json.loads(item["content"])
                         for item in messages
@@ -148,6 +153,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     tool_call(add, "trusted", a=1, b=2),
                     tool_call(special, "denied", a=5, b=9),
                     tool_call(special, "error", a=-2, b=0),
+                    tool_call(add, "large-text", a=-3, b=0),
+                    tool_call(add, "large-structure", a=-4, b=0),
                 ]
                 send = asyncio.create_task(ops.send("exercise", stream=False))
                 details = await approve("approved", ApprovalDecision.TRUST_SESSION)
@@ -165,9 +172,16 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(outcomes[2]["structured_content"], {"sum": 3})
                 self.assertEqual(outcomes[3]["error"]["code"], "permission_denied")
                 self.assertEqual(outcomes[4]["error"]["code"], "mcp_tool_error")
+                for index, omitted in ((5, "text"), (6, "structured_content")):
+                    self.assertLessEqual(result_bytes[index], 65_536)
+                    self.assertTrue(outcomes[index]["truncated"])
+                    self.assertIn(omitted, outcomes[index]["omitted_fields"])
+                    self.assertNotIn(omitted, outcomes[index])
+                self.assertEqual(outcomes[5]["structured_content"], {"kind": "text"})
+                self.assertEqual(outcomes[6]["text"], "summary")
                 self.assertEqual(
                     log.read_text().splitlines(),
-                    ["add 12 30", "add 1 2", "math.add -2 0"],
+                    ["add 12 30", "add 1 2", "math.add -2 0", "add -3 0", "add -4 0"],
                 )
 
                 ops.new_session()

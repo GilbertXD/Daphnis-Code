@@ -42,6 +42,16 @@ async def call_tool(ctx, params):
         return CallToolResult(
             content=[TextContent(type="text", text="Demo error")], is_error=True
         )
+    if a == -3:
+        return CallToolResult(
+            content=[TextContent(type="text", text="界" * 30_000)],
+            structured_content={"kind": "text"},
+        )
+    if a == -4:
+        return CallToolResult(
+            content=[TextContent(type="text", text="summary")],
+            structured_content={"rows": ["x" * 4096] * 25},
+        )
     return CallToolResult(
         content=[TextContent(type="text", text=str(a + b))],
         structured_content={"sum": a + b},

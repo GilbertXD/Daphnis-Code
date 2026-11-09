@@ -83,10 +83,19 @@ class EventBus:
             except Exception:
                 logger.exception("Sync event listener failed for %s", event_name)
 
-    async def drain(self) -> None:
-        """Wait for dispatched async notifications; cancellation propagates."""
+    async def drain(self, *, timeout: float | None = None) -> None:
+        """With a timeout, cancel listeners still running at the deadline."""
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         while self._tasks:
-            await asyncio.gather(*tuple(self._tasks), return_exceptions=True)
+            await asyncio.wait(
+                tuple(self._tasks),
+                timeout=None if deadline is None else max(0, deadline - loop.time()),
+            )
+            if deadline is not None and loop.time() >= deadline:
+                for task in self._tasks:
+                    task.cancel()
+                return
 
     def clear(self) -> None:
         """Remove subscriptions; already dispatched notifications can still drain."""

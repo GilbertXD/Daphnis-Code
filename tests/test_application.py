@@ -38,6 +38,83 @@ def response(message, finish="stop"):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_close_bounds_listeners_and_shares_resource_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = Application(
+                workspace=temporary, provider="deepseek", model_id="a", catalog=CATALOG,
+                connections={"deepseek": {"base_url": "https://model.test"}},
+            )
+            listen, cancelled = asyncio.Event(), asyncio.Event()
+            closing, release = asyncio.Event(), asyncio.Event()
+            client = app._clients["deepseek"]
+            real_close = client.aclose
+
+            async def listener(event):
+                try:
+                    await listen.wait()
+                finally:
+                    cancelled.set()
+
+            async def close_client():
+                closing.set()
+                await release.wait()
+                await real_close()
+
+            app.events.on("probe", listener)
+            await app.events.emit("probe", session_id="", turn_id="")
+            with (
+                patch("daphnis.app._EVENT_DRAIN_TIMEOUT", 0.02, create=True),
+                patch.object(client, "aclose", side_effect=close_client) as close,
+            ):
+                first = asyncio.create_task(app.close())
+                second = asyncio.create_task(app.close())
+                try:
+                    await asyncio.wait_for(closing.wait(), 1)
+                    self.assertTrue(cancelled.is_set())
+                    self.assertFalse(first.done())
+                    self.assertFalse(second.done())
+                    first.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await first
+                    self.assertFalse(second.done())
+                    release.set()
+                    await asyncio.wait_for(second, 1)
+                    await app.close()
+                    close.assert_awaited_once()
+                finally:
+                    listen.set()
+                    release.set()
+                    await asyncio.gather(first, second, return_exceptions=True)
+
+    async def test_stale_application_cannot_overwrite_committed_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = History(root / "sessions")
+            options = {
+                "workspace": root, "provider": "deepseek", "model_id": "a",
+                "catalog": CATALOG,
+                "connections": {"deepseek": {
+                    "base_url": "https://model.test",
+                    "transport": httpx.MockTransport(
+                        lambda request: response({"role": "assistant", "content": "done"})
+                    ),
+                }},
+            }
+            a = Operations(Application(**options, history=history))
+            b = Operations(Application(**options, history=History(history.directory)))
+            try:
+                a.set_thinking("high")
+                b.restore_session(a.session.id)
+                await a.send("first writer", stream=False)
+                with self.assertRaisesRegex(RuntimeError, "Session write conflict"):
+                    await b.send("stale writer", stream=False)
+                saved = history.load(a.session.id).messages.snapshot()
+                self.assertEqual(saved[0]["content"], "first writer")
+                self.assertEqual(len(saved), 2)
+            finally:
+                await a.close()
+                await b.close()
+
     async def test_history_models_and_thinking_revalidation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -259,7 +336,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     ({"model_id": "plain"}, CapabilityError, "unsupported"),
                 ):
                     with self.subTest(settings=settings):
-                        invalid = replace(saved_a, id="invalid-settings", **settings)
+                        invalid = replace(saved_a, id=f"invalid-{next(iter(settings))}", **settings)
                         history.save(invalid)
                         path = history.directory / f"{invalid.id}.json"
                         original = path.read_bytes()
@@ -469,7 +546,10 @@ class CLITests(unittest.TestCase):
             bodies = []
 
             def handler(request):
-                bodies.append(json.loads(request.content))
+                body = json.loads(request.content)
+                bodies.append(body)
+                if body["messages"][-1]["content"] == "empty answer":
+                    return response({"role": "assistant", "content": ""})
                 return response({"role": "assistant", "content": "CLI ready"})
 
             connections = {
@@ -495,15 +575,18 @@ class CLITests(unittest.TestCase):
                 patch.object(cli, "load_dotenv"),
             ):
 
-                def run(*args):
+                def run(*args, error=None):
                     stdout, stderr = io.StringIO(), io.StringIO()
                     with (
                         patch("sys.argv", ["daphnis", *args]),
                         contextlib.redirect_stdout(stdout),
                         contextlib.redirect_stderr(stderr),
                     ):
-                        self.assertEqual(cli.main(), 0)
-                    self.assertEqual(stderr.getvalue(), "")
+                        self.assertEqual(cli.main(), 0 if error is None else 1)
+                    if error is None:
+                        self.assertEqual(stderr.getvalue(), "")
+                    else:
+                        self.assertIn(error, stderr.getvalue())
                     return stdout.getvalue()
 
                 self.assertEqual(
@@ -521,3 +604,11 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(updated.id, saved.id)
                 self.assertEqual(updated.message_count, 4)
                 self.assertEqual(history.load(updated.id).thinking, "high")
+                self.assertEqual(
+                    run(
+                        "--session", saved.id, "-p", "empty answer",
+                        error="no visible text or refusal",
+                    ),
+                    "",
+                )
+                self.assertEqual(len(history.load(saved.id).messages), 4)

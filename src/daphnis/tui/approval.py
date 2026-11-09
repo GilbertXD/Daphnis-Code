@@ -1,6 +1,7 @@
 """Explicit approval display; the Application resolves the actual Future."""
 
 import json
+from typing import ClassVar
 
 from rich.syntax import Syntax
 from textual.app import ComposeResult
@@ -14,7 +15,7 @@ from .theme import BACKGROUND
 
 
 class ApprovalScreen(ModalScreen[ApprovalDecision]):
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("y", "approve", "允许"),
         Binding("t", "toggle_trust", "切换会话信任"),
         Binding("n,escape", "deny", "拒绝"),

@@ -34,7 +34,7 @@ class UsageTotals:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "UsageTotals":
         if not isinstance(value, dict):
-            raise ValueError("Session usage must be an object.")
+            raise ValueError("Session usage must be an object.")  # noqa: TRY004 - Malformed history data.
         try:
             return cls(**value)
         except TypeError as exc:
@@ -102,10 +102,9 @@ class UsageTracker:
             return
         number = event.data["request_number"]
         self._requests.setdefault(number, None)
-        if event.name == "model.usage":
-            # Null/missing usage is not a new snapshot; an empty object is.
-            if event.data.get("usage") is not None:
-                self._requests[number] = _reported_usage(event.data["usage"])
+        # Null/missing usage is not a new snapshot; an empty object is.
+        if event.name == "model.usage" and event.data.get("usage") is not None:
+            self._requests[number] = _reported_usage(event.data["usage"])
         totals = UsageTotals()
         for usage in self._requests.values():
             totals = totals.plus(usage or UsageTotals(requests=1))

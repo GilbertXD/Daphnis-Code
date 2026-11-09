@@ -8,7 +8,7 @@ dependencies = [
     "httpx2>=2.16,<3",
     "mcp>=2,<3",
     "python-dotenv>=1.2.4",
-    "saturnus-llm",
+    "saturnus-llm==0.1.1",
     "textual>=8.2.8",
 ]
 
@@ -19,5 +19,5 @@ daphnis = "daphnis.cli:main"
 requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
 
-[tool.uv.sources]
-saturnus-llm = { path = "../Saturnus", editable = true }
+[dependency-groups]
+dev = ["ruff==0.17.4"]
