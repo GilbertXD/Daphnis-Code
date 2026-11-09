@@ -395,7 +395,13 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
             tools = bound(workspace)
-            result = await tools.execute(call("run_command", argv=["pwd"]))
+            # Hosted runners can put system binaries under runner-owned ancestors.
+            # Test both policy outcomes without changing production trust rules.
+            with patch("daphnis.tools.shell.trusted_read_program", return_value=False):
+                result = await tools.execute(call("run_command", argv=["pwd"]))
+                self.assertEqual(result.value["error"]["code"], "permission_denied")
+            with patch("daphnis.tools.shell.trusted_read_program", return_value=True):
+                result = await tools.execute(call("run_command", argv=["pwd"]))
             self.assertTrue(result.value["ok"], result.value)
             self.assertEqual(Path(result.value["stdout"].strip()).resolve(), workspace)
             script = workspace / "output.py"
@@ -432,7 +438,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             (workspace / "~").symlink_to(outside, target_is_directory=True)
             (workspace / "-data").write_text("literal")
             tools = bound(workspace)
-            with patch.dict(os.environ, {"HOME": str(workspace)}):
+            with (
+                patch.dict(os.environ, {"HOME": str(workspace)}),
+                patch("daphnis.tools.shell.trusted_read_program", return_value=True),
+            ):
                 for mode in ApprovalMode:
                     selected = tools.select(["run_command"], mode=mode)
                     ambiguous = await selected.execute(
@@ -441,10 +450,9 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         ambiguous.value.get("error", {}).get("code"), "permission_denied"
                     )
-                self.assertEqual(
-                    (await tools.execute(call("run_command", argv=["cat", "--", "-data"])))
-                    .value["stdout"], "literal",
-                )
+                literal = await tools.execute(call("run_command", argv=["cat", "--", "-data"]))
+                self.assertTrue(literal.value["ok"], literal.value)
+                self.assertEqual(literal.value["stdout"], "literal")
                 listing = await tools.execute(call("run_command", argv=["ls", "-a"]))
                 self.assertTrue(listing.value["ok"], listing.value)
                 self.assertIn("-data", listing.value["stdout"])

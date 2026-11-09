@@ -3,7 +3,7 @@
 ## 安装与启动
 
 需要 Python 3.11+ 和 uv。文件工具及历史写入依赖 POSIX 接口，支持 macOS 和 Linux
-上的本地文件系统。Windows 与网络文件系统未验证。
+上的本地文件系统。CI 使用 Ubuntu 24.04。Windows 与网络文件系统未验证。
 
 ```sh
 git clone https://github.com/GilbertXD/Daphnis-Code.git
