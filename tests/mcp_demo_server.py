@@ -62,6 +62,21 @@ async def main():
     if any(name in os.environ for name in ("LLM_API_KEY", "MIMO_API_KEY")):
         raise RuntimeError("Parent API keys reached the MCP process.")
     (root / "pid").write_text(str(os.getpid()))
+    if (root / "stderr-diagnostics").exists():
+        for chunk in (
+            b"fixture start \x1b]52;",
+            b"c;CLIPBOARD\x07 \x1b[",
+            b"31m\x1b[0m " + "\x9b31m\x9dHIDDEN\x9c".encode() + b" diagnostic \n",
+        ):
+            os.write(2, chunk)
+            await asyncio.sleep(0.02)
+        sys.stderr.buffer.write(b"x" * (256 * 1024) + b"AFTER-LIMIT")
+        sys.stderr.buffer.flush()
+        (root / "stderr-written").touch()
+    if (root / "stderr-exit").exists():
+        return
+    if (root / "stderr-stall").exists():
+        await asyncio.Event().wait()
     server = Server(
         "demo",
         on_list_tools=list_tools,

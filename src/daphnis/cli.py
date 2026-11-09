@@ -5,6 +5,7 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import TextIO
 
 from dotenv import load_dotenv
 from saturnus import SaturnusError
@@ -49,8 +50,13 @@ def main() -> int:
         logger.propagate = propagate
 
 
+class _TerminalArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message: str | None, file: TextIO | None = None) -> None:
+        super()._print_message(sanitize_terminal(message) if message else message, file)
+
+
 def _main() -> int:
-    parser = argparse.ArgumentParser(description="Daphnis terminal Coding Agent")
+    parser = _TerminalArgumentParser(description="Daphnis terminal Coding Agent")
     parser.add_argument("-p", "--prompt", help="执行一次任务，输出最终答案后退出")
     parser.add_argument("--workspace", type=Path, help="新会话的工作目录，默认当前目录")
     parser.add_argument("--session", help="恢复已有会话 ID，使用其保存的工作区")

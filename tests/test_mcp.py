@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -27,6 +28,118 @@ def tool_call(name, call_id, **arguments):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(os.name == "posix", "Requires POSIX stderr pipes")
+    async def test_stdio_stderr_is_drained_and_sanitized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stderr-diagnostics").touch()
+            script = """
+import asyncio
+import os
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+from mcp import stdio_client
+
+from daphnis.mcp import MCPConnection
+
+async def main():
+    demo, directory = sys.argv[1:]
+    root = Path(directory)
+    loop = asyncio.get_running_loop()
+    connect_read_pipe = loop.connect_read_pipe
+    read_pipes, write_pipes = [], []
+
+    async def track_read(factory, pipe):
+        result = await connect_read_pipe(factory, pipe)
+        read_pipes.append(pipe)
+        return result
+
+    @asynccontextmanager
+    async def track_write(parameters, *, errlog):
+        write_pipes.append(errlog)
+        async with stdio_client(parameters, errlog=errlog) as streams:
+            yield streams
+
+    async def error(name, detail):
+        raise AssertionError(detail)
+
+    async def changed(server):
+        pass
+
+    with patch.object(loop, "connect_read_pipe", track_read), patch("daphnis.mcp.stdio_client", track_write):
+        for scenario in ("normal", "exit", "cancel", "timeout", "spawn-error"):
+            read_pipes.clear()
+            write_pipes.clear()
+            for marker in ("stderr-exit", "stderr-stall", "stderr-written", "pid"):
+                (root / marker).unlink(missing_ok=True)
+            if scenario == "exit":
+                (root / "stderr-exit").touch()
+            elif scenario in ("cancel", "timeout"):
+                (root / "stderr-stall").touch()
+            command = str(root / "missing-program") if scenario == "spawn-error" else sys.executable
+            connection = MCPConnection("audit", command, [demo, directory])
+            with patch("daphnis.mcp._CONNECT_TIMEOUT", 1.5 if scenario == "timeout" else 8):
+                startup = asyncio.create_task(connection.start(error, changed))
+                try:
+                    if scenario == "cancel":
+                        async with asyncio.timeout(4):
+                            while not (root / "stderr-written").exists():
+                                await asyncio.sleep(0.01)
+                        startup.cancel()
+                    tools = await startup
+                except asyncio.CancelledError:
+                    assert scenario == "cancel"
+                except RuntimeError as exc:
+                    assert scenario in ("exit", "timeout", "spawn-error")
+                    if scenario == "timeout":
+                        assert "超时" in str(exc)
+                else:
+                    assert scenario == "normal" and "mcp__audit__add" in tools
+                    connection.state = "Connected"
+                    result = await connection.call("add", {"a": 2, "b": 3})
+                    assert result["structured_content"] == {"sum": 5}
+                finally:
+                    if not startup.done():
+                        startup.cancel()
+                        await asyncio.gather(startup, return_exceptions=True)
+                    await connection.aclose()
+            assert connection._task.done()
+            assert read_pipes and read_pipes[0].closed
+            assert len(write_pipes) == 1 and write_pipes[0].closed
+            if scenario != "spawn-error":
+                assert (root / "stderr-written").exists()
+                pid = int((root / "pid").read_text())
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise AssertionError("MCP child still running")
+
+asyncio.run(main())
+"""
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", script, str(DEMO), directory,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(process.communicate(), 18)
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+            self.assertEqual(process.returncode, 0, stderr[-1000:])
+            self.assertEqual(stderr.count(b"fixture start"), 4)
+            self.assertEqual(stderr.count(b" diagnostic "), 4)
+            self.assertIsNone(
+                re.search(rb"\x1b|\x07|\xc2[\x80-\x9f]|CLIPBOARD|HIDDEN|AFTER-LIMIT", stderr)
+            )
+            self.assertLess(len(stderr), 80 * 1024)
+            self.assertEqual(stderr.count(b"[MCP stderr truncated]"), 4)
+
     async def test_connection_exit_after_discovery_is_not_published(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

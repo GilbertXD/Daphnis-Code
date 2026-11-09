@@ -2,15 +2,16 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import httpx2
 from mcp import Client, StdioServerParameters, stdio_client
@@ -24,12 +25,70 @@ from mcp.types import (
     ToolListChangedNotification,
 )
 
+from ..terminal_text import sanitize_terminal
+
+logger = logging.getLogger(__name__)
 TOOL_PREFIX = "mcp__"
 MAX_TOOL_RESULT_BYTES = 65_536
 _CONNECT_TIMEOUT = 15
 _CALL_TIMEOUT = 30
 _HTTP_HEALTH_INTERVAL = 15
 _HTTP_HEALTH_TIMEOUT = 5
+_STDERR_LIMIT = 16 * 1024
+_STDERR_EOF_TIMEOUT = 0.25
+
+
+class _DiagnosticCapture(asyncio.Protocol):
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.truncated = False
+        self.closed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def data_received(self, data: bytes) -> None:
+        remaining = _STDERR_LIMIT - len(self.buffer)
+        self.buffer.extend(data[:remaining])
+        self.truncated |= len(data) > remaining
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self.closed.set_result(None)
+
+    def log(self, name: str) -> None:
+        text = sanitize_terminal(self.buffer.decode("utf-8", errors="replace")).rstrip()
+        if text or self.truncated:
+            note = "\n[MCP stderr truncated]" if self.truncated else ""
+            logger.warning("MCP %s stderr:\n%s%s", name, text, note)
+
+
+@asynccontextmanager
+async def _stdio_errlog(name: str) -> AsyncIterator[TextIO]:
+    if os.name != "posix":
+        # Anonymous pipes on these platforms need different async I/O support.
+        # Keep the SDK's process lifecycle and fail closed for diagnostics.
+        with os.fdopen(os.open(os.devnull, os.O_WRONLY), "w", encoding="utf-8") as errlog:
+            yield errlog
+        return
+
+    read_fd, write_fd = os.pipe()
+    with (
+        os.fdopen(read_fd, "rb", buffering=0) as pipe,
+        os.fdopen(write_fd, "w", encoding="utf-8") as errlog,
+    ):
+        capture = _DiagnosticCapture()
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+            lambda: capture, pipe
+        )
+        try:
+            yield errlog
+        finally:
+            errlog.close()
+            try:
+                # Normally the SDK has already reaped the child. A descendant
+                # may still hold stderr open, so EOF must never delay teardown.
+                await asyncio.wait((capture.closed,), timeout=_STDERR_EOF_TIMEOUT)
+            finally:
+                transport.close()
+                if capture.buffer:
+                    await asyncio.to_thread(capture.log, name)
 
 
 def _result_fits(value: dict[str, Any]) -> bool:
@@ -278,7 +337,12 @@ class MCPConnection:
     @asynccontextmanager
     async def _transport(self):
         if self._url is None:
-            async with stdio_client(self._stdio_parameters()) as (read, write):
+            parameters = self._stdio_parameters()
+            async with (
+                _stdio_errlog(self.name) as errlog,
+                stdio_client(parameters, errlog=errlog) as (read, write),
+            ):
+                errlog.close()  # The child owns its copy after the SDK spawns it.
                 yield _WatchedReadStream(read, self._stop), write
             return
 

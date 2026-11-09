@@ -1,33 +1,27 @@
 """Translate terminal commands to operations and presentation results."""
 
 import os
-import re
 import shlex
 from dataclasses import dataclass
 
 from .operations import Operations
+from .terminal_text import sanitize_terminal
 from .tools import ApprovalMode
+
+__all__ = [
+    "APPROVAL_MODE_TEXT",
+    "HELP",
+    "CommandResult",
+    "safe_error",
+    "sanitize_terminal",
+    "terminal_command",
+]
 
 APPROVAL_MODE_TEXT = {
     ApprovalMode.ASK: ("每次询问", "所有可执行工具调用都需要确认。"),
     ApprovalMode.AUTO: ("安全自动", "自动执行无需额外授权的操作，其余按规则确认。"),
     ApprovalMode.FULL: ("尽可能自动", "跳过常规审批，保留强制审批和硬编码禁止。"),
 }
-
-_TERMINAL_CONTROLS = re.compile(
-    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|\Z)"  # OSC
-    r"|(?:\x1b[PX^_]|[\x90\x98\x9e\x9f]).*?(?:\x1b\\|\x9c|\Z)"  # Control strings
-    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?"  # CSI, including incomplete sequences
-    r"|\x1b[ -/]*[0-~]"
-    r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]",
-    re.DOTALL,
-)
-
-
-def sanitize_terminal(text: str) -> str:
-    """Remove terminal commands while preserving printable text, tabs and LF."""
-    return _TERMINAL_CONTROLS.sub("", text)
-
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认

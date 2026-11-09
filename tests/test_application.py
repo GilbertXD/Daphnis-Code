@@ -745,6 +745,29 @@ class ConfigTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_argparse_sanitizes_errors_and_help(self):
+        from daphnis import cli
+
+        for args, code, visible in (
+            (["--未知\x1b]52;c;CLIPBOARD\x07", "值\x1b[31m红\x9b0m色"], 2, "--未知 值红色"),
+            (["--workspace=\x9b31m中文", "--session=\x1b[2J值"], 2, "--session"),
+            (["--workspace", "--thinking"], 2, "expected one argument"),
+            (["--help"], 0, "Daphnis terminal Coding Agent"),
+        ):
+            with self.subTest(code=code, visible=visible):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (
+                    patch("sys.argv", ["daphnis", *args]),
+                    contextlib.redirect_stdout(stdout),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as exit,
+                ):
+                    cli.main()
+                self.assertEqual(exit.exception.code, code)
+                rendered = stderr.getvalue() if code else stdout.getvalue()
+                self.assertIn(visible, rendered)
+                self.assertNotRegex(rendered, r"[\x1b\x07\x7f-\x9f]|CLIPBOARD")
+
     def test_prompt_entry_prints_only_final_answer_and_saves_session(self):
         from daphnis import cli
 
