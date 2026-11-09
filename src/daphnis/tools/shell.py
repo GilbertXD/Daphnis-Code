@@ -171,6 +171,21 @@ async def _run(
     return {"ok": True, **result}
 
 
+def _safe_without_file_operands(program: str, arguments: list[str]) -> bool:
+    if program == "pwd":
+        return not arguments
+    if program == "uname":
+        return not arguments or (
+            len(arguments) == 1 and arguments[0] in {"-a", "-s", "-n", "-r", "-v", "-m"}
+        )
+    if program == "echo":
+        return all(
+            not word or (word.isprintable() and not word.startswith("-") and "\\" not in word)
+            for word in arguments
+        )
+    return False
+
+
 def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
     argv = arguments["argv"]
     if not argv[0].strip():
@@ -226,7 +241,9 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
     inspected = read_arguments(program, argv[1:]) if program in READ_PROGRAMS else None
     decision = Decision.ASK
     invocation = (str(executable.path), *argv[1:])
-    inspected_read = inspected is not None and trusted_read_program(executable.path)
+    auto_allowed = _safe_without_file_operands(program, argv[1:]) and trusted_read_program(
+        executable.path
+    )
     if inspected is not None:
         options, paths = inspected
         operands = []
@@ -238,9 +255,9 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
                     raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
             targets.append(target)
             operands.append(str(target.path))
-        if operands and inspected_read:
+        if operands and trusted_read_program(executable.path):
             invocation = (str(executable.path), *options, "--", *operands)
-    if inspected_read:
+    if auto_allowed:
         # The system executable itself is expected outside the workspace.
         decision = path_decision(workspace, tuple(targets))
 
@@ -256,7 +273,7 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
 
     return Operation(
         decision,
-        "Execute inspected argv; scripts/builds/uncertain effects need approval.",
+        "Execute the displayed argv; file access and unclassified commands require confirmation.",
         # The executable is verified in run(), but isn't a data access target.
         tuple(targets),
         {
@@ -265,6 +282,5 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
             "timeout": arguments.get("timeout", 30.0),
         },
         run,
-        # Uninspected commands can read or write outside cwd via args or code.
-        force_approval=not inspected_read,
+        force_approval=not auto_allowed,
     )

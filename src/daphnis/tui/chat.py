@@ -16,6 +16,7 @@ from textual.widgets import Collapsible, Static
 from ..agent import assistant_text
 from ..events import Event
 from ..mcp import TOOL_PREFIX
+from ..terminal_commands import sanitize_terminal
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -34,8 +35,9 @@ class ChatRow(Static):
     def redraw(self) -> None:
         if not self.dirty:
             return
+        text = sanitize_terminal(self.text)
         if self.has_class("tool"):
-            state, _, detail = self.outcome.partition(" · ")
+            state, _, detail = sanitize_terminal(self.outcome).partition(" · ")
             label, icon, color = {
                 "COMPLETED": ("", "✓", SUCCESS),
                 "ERROR": ("失败", "×", ERROR),
@@ -48,7 +50,7 @@ class ChatRow(Static):
             line.add_column(width=1, no_wrap=True)
             line.add_column(width=7, no_wrap=True, overflow="ellipsis")
             line.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
-            name = self.title.removeprefix("工具 · ")
+            name = sanitize_terminal(self.title).removeprefix("工具 · ")
             name = {
                 "read_file": "Read",
                 "list_directory": "List",
@@ -56,7 +58,7 @@ class ChatRow(Static):
                 "run_command": "Run",
                 "search": "Search",
             }.get(name, name)
-            target = Text(self.text.splitlines()[0] if self.text else "", style=TEXT)
+            target = Text(text.splitlines()[0] if text else "", style=TEXT)
             if label:
                 target.append("  " + label, style=color)
             if state == "COMPLETED" and self.edits is not None:
@@ -81,7 +83,7 @@ class ChatRow(Static):
                     )
                 )
         else:
-            body = Markdown(self.text, code_theme="monokai")
+            body = Markdown(text, code_theme="monokai")
             if self.has_class("user"):
                 line = Table.grid(expand=True)
                 line.add_column(width=3)
@@ -89,13 +91,13 @@ class ChatRow(Static):
                 line.add_row(Text("❯", style=f"bold {ACCENT}"), body)
                 pieces = [line]
             elif self.title == "助手":
-                pieces = [body] if self.text else []
+                pieces = [body] if text else []
             else:
-                pieces = [Text("✧ " + self.title, style=ACCENT), body]
+                pieces = [Text("✧ " + sanitize_terminal(self.title), style=ACCENT), body]
         if self.reasoning:
-            pieces.append(Text("思考片段：" + self.reasoning[-400:], style="dim"))
+            pieces.append(Text("思考片段：" + sanitize_terminal(self.reasoning)[-400:], style="dim"))
         if self.outcome and not self.has_class("tool"):
-            pieces.append(Text(self.outcome, style="dim"))
+            pieces.append(Text(sanitize_terminal(self.outcome), style="dim"))
         self.update(Group(*pieces))
         self.dirty = False
 
@@ -162,7 +164,7 @@ def command_output(content: str | None) -> str:
     text = data.get("stdout") or data.get("stderr")
     if not isinstance(text, str) or not text.strip():
         return ""
-    lines = Text.from_ansi(text).plain.strip().splitlines()
+    lines = sanitize_terminal(text).strip().splitlines()
     return ("…\n" if len(lines) > 3 else "") + "\n".join(lines[-3:])[-360:]
 
 
@@ -275,7 +277,7 @@ class ChatView(VerticalScroll):
                 if function.get("name") == "run_command":
                     row.output = command_output(message.get("content"))
                 elif function.get("name", "").startswith(TOOL_PREFIX):
-                    row.output = (message.get("content") or "")[:2000]
+                    row.output = sanitize_terminal(message.get("content") or "")[:2000]
                 try:
                     result = json.loads(message.get("content") or "{}")
                     if isinstance(result, dict) and "ok" in result:
@@ -344,7 +346,7 @@ class ChatView(VerticalScroll):
                 if isinstance(content, str):
                     row.text += content
                 if isinstance(reasoning, str):
-                    row.reasoning = (row.reasoning + reasoning)[-400:]
+                    row.reasoning += reasoning
             else:
                 row.text = content if isinstance(content, str) else row.text
                 row.reasoning = (
@@ -384,7 +386,7 @@ class ChatView(VerticalScroll):
                 if data["name"] == "run_command":
                     row.output = command_output(data.get("content"))
                 elif data["name"].startswith(TOOL_PREFIX):
-                    row.output = (data.get("content") or "")[:2000]
+                    row.output = sanitize_terminal(data.get("content") or "")[:2000]
             row.dirty = True
             if row.output or row.outcome.startswith(("ERROR", "FAILED", "等待审批")):
                 row.tool_group.reveal()

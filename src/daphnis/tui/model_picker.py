@@ -11,6 +11,7 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..operations import Operations
+from ..terminal_commands import sanitize_terminal
 from .theme import ACCENT, MUTED, SUCCESS, TEXT
 
 
@@ -67,7 +68,8 @@ class ModelPicker(Vertical):
                     if not self.ops.configured(provider):
                         name += " · 未配置"
                     yield Static(
-                        name + "  /  上下文", classes="model-provider", markup=False
+                        sanitize_terminal(name) + "  /  上下文",
+                        classes="model-provider", markup=False,
                     )
                     yield OptionList(id=f"models-{index}", classes="model-options")
         yield Static(
@@ -83,9 +85,9 @@ class ModelPicker(Vertical):
     def refresh_models(self) -> None:
         model = self.ops.model
         summary = Text("✓ ", style=SUCCESS)
-        summary.append(model.id, style=f"bold {ACCENT}")
+        summary.append(sanitize_terminal(model.id), style=f"bold {ACCENT}")
         summary.append(
-            f"  ({model.provider})  │  上下文 {context_label(model.context_window)}"
+            f"  ({sanitize_terminal(model.provider)})  │  上下文 {context_label(model.context_window)}"
             "  │  输出上限 未记录",
             style=MUTED,
         )
@@ -116,7 +118,7 @@ class ModelPicker(Vertical):
                         f"{'●' if active else '○'} {number}",
                         style=ACCENT if active else MUTED,
                     ),
-                    Text(item.id, style=f"bold {ACCENT}" if active else TEXT),
+                    Text(sanitize_terminal(item.id), style=f"bold {ACCENT}" if active else TEXT),
                     Text(context_label(item.context_window), style=MUTED),
                     style="on #1e2340" if active else None,
                 )

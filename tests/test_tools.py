@@ -444,22 +444,40 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             ):
                 for mode in ApprovalMode:
                     selected = tools.select(["run_command"], mode=mode)
-                    ambiguous = await selected.execute(
-                        call("run_command", argv=["cat", "~/data"])
-                    )
-                    self.assertEqual(
-                        ambiguous.value.get("error", {}).get("code"), "permission_denied"
-                    )
-                literal = await tools.execute(call("run_command", argv=["cat", "--", "-data"]))
+                    for argv in (["cat", "~/data"], ["cat", "data"], ["ls", "-a"]):
+                        result = await selected.execute(call("run_command", argv=argv))
+                        self.assertEqual(
+                            result.value.get("error", {}).get("code"), "permission_denied"
+                        )
+                approved = bound(workspace, approval=approve)
+                literal = await approved.execute(call("run_command", argv=["cat", "--", "-data"]))
                 self.assertTrue(literal.value["ok"], literal.value)
                 self.assertEqual(literal.value["stdout"], "literal")
-                listing = await tools.execute(call("run_command", argv=["ls", "-a"]))
+                listing = await approved.execute(call("run_command", argv=["ls", "-a"]))
                 self.assertTrue(listing.value["ok"], listing.value)
                 self.assertIn("-data", listing.value["stdout"])
                 full = tools.select(["run_command"], mode=ApprovalMode.FULL)
                 for argv in (["cat", "../outside/data"], ["cat", "data", "-n"]):
                     result = await full.execute(call("run_command", argv=argv))
                     self.assertEqual(result.value["error"]["code"], "permission_denied")
+                for argv in (["pwd"], ["uname", "-s"], ["echo", "正常文本"]):
+                    result = await full.execute(call("run_command", argv=argv))
+                    self.assertTrue(result.value["ok"], result.value)
+                for argv in (["pwd", "-P"], ["uname", "--help"], ["echo", "-e", r"\n"]):
+                    result = await full.execute(call("run_command", argv=argv))
+                    self.assertEqual(result.value["error"]["code"], "permission_denied")
+                for arg in ("$(cat /outside/secret)", "`cat /outside/secret`", "|", ">"):
+                    result = await full.execute(call("run_command", argv=["echo", arg]))
+                    self.assertEqual(result.value["error"]["code"], "command_blocked")
+
+            async def replace_target(request):
+                (workspace / "data").unlink()
+                (workspace / "data").symlink_to(outside / "data")
+                return ApprovalDecision.ALLOW_ONCE
+
+            reader = bound(workspace, approval=replace_target).select(["read_file"], mode=ApprovalMode.ASK)
+            result = await reader.execute(call("read_file", path="data"))
+            self.assertEqual(result.value["error"]["code"], "target_changed")
 
     @unittest.skipUnless(os.name == "posix", "Process-group test requires POSIX")
     async def test_shell_timeout_and_cancel_terminate_child_group(self):

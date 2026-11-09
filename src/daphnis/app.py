@@ -14,7 +14,13 @@ from saturnus import ChatClient
 from .agent import Agent, TurnResult, TurnStatus
 from .context import Context
 from .events import EventBus
-from .history import History
+from .history import (
+    History,
+    SessionBusyError,
+    SessionConflictError,
+    SessionLease,
+    finish_io,
+)
 from .mcp import TOOL_PREFIX, MCPConnection
 from .models import (
     MODELS,
@@ -78,7 +84,7 @@ class Application:
         self._pending_approval: ApprovalRequest | None = None
         self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
-        self._mcp_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
         self._mcp_pending: set[MCPConnection] = set()
         self._tools = self._mcp_catalog()
         self._use_saved_tool_preferences = False
@@ -133,8 +139,8 @@ class Application:
         self._ensure_open()
         if self._running:
             raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
-        if self._mcp_lock.locked():
-            raise RuntimeError("请等待 MCP 连接操作完成。")
+        if self._state_lock.locked():
+            raise RuntimeError("请等待会话或 MCP 更新完成。")
 
     @property
     def _all_tools(self) -> tuple[str, ...]:
@@ -176,7 +182,7 @@ class Application:
 
     async def _connect_mcp(self, connection: MCPConnection) -> None:
         self._ensure_idle()
-        async with self._mcp_lock:
+        async with self._state_lock:
             previous = self._mcp.get(connection.name)
             if previous and previous.state == "Connected":
                 raise ValueError(f"MCP Server {connection.name!r} 已连接。")
@@ -205,14 +211,19 @@ class Application:
                                 self._session,
                                 enabled_tools=(*self._session.enabled_tools, *discovered),
                             )
-                            self._save_session(session)
-                            self._session = session
+                            await finish_io(self._save_and_publish_session(session))
+                    except (SessionBusyError, SessionConflictError, asyncio.CancelledError):
+                        connection.tools = previous_tools
+                        await finish_io(connection.aclose())
+                        raise
                     except (OSError, TypeError, ValueError):
                         error = "无法保存 MCP 工具启用偏好。"
                     else:
-                        connection.state = "Connected"
-                        self._tools = tools
-                        return
+                        if not self._closed and connection._can_publish():
+                            connection.state = "Connected"
+                            self._tools = tools
+                            return
+                        error = connection.error or "MCP 连接在发布前已中断。"
                 else:
                     error = connection.error or "MCP 连接在发布前已中断。"
             connection.tools = previous_tools
@@ -224,7 +235,7 @@ class Application:
 
     async def _disconnect_mcp(self, name: str) -> None:
         self._ensure_idle()
-        async with self._mcp_lock:
+        async with self._state_lock:
             connection = self._mcp[name]
             self._revoke_mcp_trust(name)
             await connection.aclose()
@@ -232,7 +243,7 @@ class Application:
 
     async def _refresh_mcp(self, name: str) -> None:
         self._ensure_idle()
-        async with self._mcp_lock:
+        async with self._state_lock:
             connection = self._mcp.get(name)
             if connection is None or not connection.available:
                 raise ValueError(f"MCP Server {name!r} 未连接。")
@@ -267,7 +278,7 @@ class Application:
         self._mcp_pending.add(connection)
         try:
             while not self._closed and connection in self._mcp_pending:
-                async with self._mcp_lock:
+                async with self._state_lock:
                     active = self._task if self._running else None
                     if active is None:
                         await self._refresh_pending_mcp()
@@ -318,13 +329,10 @@ class Application:
             self._approval = None
 
     def _resolve_approval(
-        self, turn_id: str, tool_call_id: str, decision: ApprovalDecision
+        self, request_id: str, decision: ApprovalDecision
     ) -> bool:
         pending = self._pending_approval
-        if pending is None or (pending.turn_id, pending.tool_call_id) != (
-            turn_id,
-            tool_call_id,
-        ):
+        if self._closed or pending is None or pending.request_id != request_id:
             return False
         if self._approval is None or self._approval.done():
             return False
@@ -334,7 +342,7 @@ class Application:
     async def _run_turn(self, prompt: str, *, stream: bool = True) -> TurnResult:
         self._ensure_idle()
         if self._mcp_pending:
-            async with self._mcp_lock:
+            async with self._state_lock:
                 await self._refresh_pending_mcp()
                 self._ensure_open()
         session = self._session
@@ -362,27 +370,28 @@ class Application:
         )
 
         async def run():
-            try:
-                result = await agent.run(
-                    session=session,
-                    prompt=prompt,
-                    stream=stream,
-                    thinking_mode=thinking,
-                )
-            except asyncio.CancelledError:
-                # Token use remains a fact even when working messages roll back.
+            async with self._history.lease(session) as lease:
                 try:
-                    if self._has_usage_to_save():
-                        self._save_session(session)
-                except Exception:
-                    logger.exception("本轮已取消，已报告的用量未能保存。")
-                raise
-            if result.status == TurnStatus.COMPLETED or self._has_usage_to_save():
-                try:
-                    self._save_session(session)
-                except Exception as exc:
-                    raise SessionSaveError(result, exc) from exc
-            return result
+                    result = await agent.run(
+                        session=session,
+                        prompt=prompt,
+                        stream=stream,
+                        thinking_mode=thinking,
+                    )
+                except asyncio.CancelledError:
+                    # Token use remains a fact even when working messages roll back.
+                    try:
+                        if self._has_usage_to_save():
+                            await self._save_session(session, lease=lease)
+                    except Exception:
+                        logger.exception("本轮已取消，已报告的用量未能保存。")
+                    raise
+                if result.status == TurnStatus.COMPLETED or self._has_usage_to_save():
+                    try:
+                        await self._save_session(session, lease=lease)
+                    except Exception as exc:
+                        raise SessionSaveError(result, exc) from exc
+                return result
 
         task = asyncio.create_task(run())
         self._task = task
@@ -392,9 +401,17 @@ class Application:
             if self._task is task:
                 self._task = None
 
-    def _save_session(self, session: Session) -> None:
+    async def _save_session(self, session: Session, *, lease: SessionLease | None = None) -> None:
         session.usage = self._usage.session
-        self._history.save(session)
+        await self._history.save_async(session, lease=lease)
+
+    async def _save_and_publish_session(self, session: Session) -> None:
+        await self._save_session(session)
+        self._session = session
+
+    async def _update_session(self, session: Session) -> None:
+        async with self._state_lock:
+            await finish_io(self._save_and_publish_session(session))
 
     def _has_usage_to_save(self) -> bool:
         return self._usage.session != self._session.usage and (
@@ -425,7 +442,7 @@ class Application:
                 self.events.clear()
                 await self.events.drain(timeout=_EVENT_DRAIN_TIMEOUT)
             finally:
-                async with self._mcp_lock:
+                async with self._state_lock:
                     for connection in self._mcp.values():
                         stack.push_async_callback(connection.aclose)
                     if self._mcp:

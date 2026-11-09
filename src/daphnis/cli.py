@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -12,22 +13,43 @@ from .agent import TurnStatus, assistant_text
 from .app import Application
 from .config import environment_connections, load_mcp_config
 from .operations import Operations
-from .terminal_commands import safe_error, terminal_command
+from .terminal_commands import safe_error, sanitize_terminal, terminal_command
 
 
 async def execute(ops: Operations, prompt: str) -> int:
     if prompt.lstrip().startswith("/"):
-        print((await terminal_command(ops, prompt)).text)
+        print(sanitize_terminal((await terminal_command(ops, prompt)).text))
         return 0
     result = await ops.send(prompt, stream=False)
     if result.status == TurnStatus.COMPLETED:
-        print(assistant_text(result.message))
+        print(sanitize_terminal(assistant_text(result.message)))
         return 0
-    print(safe_error(result.error or result.status), file=sys.stderr)
+    print(sanitize_terminal(safe_error(result.error or result.status)), file=sys.stderr)
     return 1
 
 
+class _TerminalLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return sanitize_terminal(super().format(record))
+
+
 def main() -> int:
+    # Configure the terminal handler here so library log records stay unchanged.
+    logger = logging.getLogger("daphnis")
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(_TerminalLogFormatter())
+    propagate = logger.propagate
+    logger.addHandler(handler)
+    logger.propagate = False
+    try:
+        return _main()
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = propagate
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(description="Daphnis terminal Coding Agent")
     parser.add_argument("-p", "--prompt", help="执行一次任务，输出最终答案后退出")
     parser.add_argument("--workspace", type=Path, help="新会话的工作目录，默认当前目录")
@@ -50,7 +72,7 @@ def main() -> int:
             interactive=args.prompt is None,
         )
     except (OSError, SaturnusError, TypeError, ValueError) as exc:
-        print(safe_error(exc), file=sys.stderr)
+        print(sanitize_terminal(safe_error(exc)), file=sys.stderr)
         return 2
 
     ops = Operations(application)
@@ -64,9 +86,9 @@ def main() -> int:
                     try:
                         await ops.connect_mcp(name, **options)
                     except (ValueError, TypeError, RuntimeError) as exc:
-                        print(f"MCP {name}: {safe_error(exc)}", file=sys.stderr)
+                        print(sanitize_terminal(f"MCP {name}: {safe_error(exc)}"), file=sys.stderr)
             if args.thinking:
-                ops.set_thinking(
+                await ops.set_thinking(
                     None if args.thinking == "default" else args.thinking
                 )
             if args.prompt is not None:
@@ -84,5 +106,5 @@ def main() -> int:
         print("已取消。", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 - Final CLI boundary for unexpected failures.
-        print(safe_error(exc), file=sys.stderr)
+        print(sanitize_terminal(safe_error(exc)), file=sys.stderr)
         return 1

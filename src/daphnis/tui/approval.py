@@ -10,8 +10,17 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Static
 
+from ..terminal_commands import sanitize_terminal
 from ..tools import ApprovalDecision, ApprovalRequest
 from .theme import BACKGROUND
+
+_JSON_CONTROL_ESCAPES = {code: f"\\u{code:04x}" for code in range(0x7F, 0xA0)}
+
+
+def _approval_json(value: object, *, indent: int | None = None) -> str:
+    # Keep the displayed arguments exact. Escape C1 and DEL in addition to
+    # the C0 characters that JSON escapes by default.
+    return json.dumps(value, ensure_ascii=False, indent=indent).translate(_JSON_CONTROL_ESCAPES)
 
 
 class ApprovalScreen(ModalScreen[ApprovalDecision]):
@@ -50,17 +59,17 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
             tool = f"{server} / {details.pop('tool')!r}"
         with Vertical(id="approval-box"):
             yield Static(
-                f"工具执行确认  /  {tool}",
+                sanitize_terminal(f"工具执行确认  /  {tool}"),
                 markup=False,
                 id="approval-title",
             )
-            yield Static(self.request.reason, markup=False, id="approval-reason")
+            yield Static(sanitize_terminal(self.request.reason), markup=False, id="approval-reason")
             patch = details.pop("patch", None)
             lines = []
             if server is not None:
                 arguments = details.pop("arguments")
                 lines.append(
-                    "参数：\n" + json.dumps(arguments, ensure_ascii=False, indent=2)
+                    "参数：\n" + _approval_json(arguments, indent=2)
                 )
                 if details.get("targets") == []:
                     del details["targets"]
@@ -70,17 +79,17 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
                     action = change["action"]
                     lines.append(f"{actions.get(action, action)}  {change['path']}")
             if details:
-                lines.append(json.dumps(details, ensure_ascii=False))
+                lines.append(_approval_json(details))
             with VerticalScroll(id="approval-body"):
                 yield Static(
-                    "\n".join(lines),
+                    sanitize_terminal("\n".join(lines)),
                     markup=False,
                     id="approval-details",
                 )
                 if isinstance(patch, str):
                     yield Static(
                         Syntax(
-                            patch,
+                            sanitize_terminal(patch),
                             "diff",
                             theme="monokai",
                             word_wrap=True,

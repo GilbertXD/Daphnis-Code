@@ -61,7 +61,7 @@ async def main():
     ops = Operations(app)
     try:
         if "high" in (ops.model.thinking_modes or ()):
-            ops.set_thinking("high")
+            await ops.set_thinking("high")
         result = await ops.send("分析当前项目", stream=False)
         if result.status == TurnStatus.COMPLETED:
             print(result.message)
@@ -76,9 +76,9 @@ asyncio.run(main())
 
 | 用途 | Operations 接口 |
 | --- | --- |
-| 模型与工具 | `list_models()`（按厂商分组）、`configured(provider)`、`set_model(provider, model_id)`、`set_thinking(mode)`、`set_tools(names)` |
-| 会话 | `list_sessions()`、`new_session()`、`restore_session(session_id)`、`message_snapshot()` |
-| 运行与审批 | `await send(prompt, stream=True)`、`await cancel()`、`set_approval_mode(mode)`、`resolve_approval(turn_id, tool_call_id, decision)`、`await close()` |
+| 模型与工具 | `list_models()`（按厂商分组）、`configured(provider)`、`await set_model(provider, model_id)`、`await set_thinking(mode)`、`await set_tools(names)` |
+| 会话 | `list_sessions()`、`await new_session()`、`restore_session(session_id)`、`message_snapshot()` |
+| 运行与审批 | `await send(prompt, stream=True)`、`await cancel()`、`set_approval_mode(mode)`、`resolve_approval(request_id, decision)`、`await close()` |
 | 只读查询 | `session`（ID、工作区和模型身份）、`model`（能力）、`thinking`、`all_tools`、`enabled_tools`、`effective_tools`、`approval_mode`、`running`、`pending_approval`、`session_usage`、`turn_usage` |
 
 `set_thinking(None)` 使用服务端默认设置。消息和待审批详情以独立快照返回。
@@ -89,13 +89,17 @@ asyncio.run(main())
 
 Thinking 和工具选择随会话保存。新会话沿用当前的模型和设置，消息与用量从零开始；
 恢复会话会使用它自己的设置。历史读取要求 V2 格式；恢复时 MCP 工具可以暂时离线。
-历史保存以内容修订检查旧快照，并用每会话的 POSIX 锁协调 Daphnis 进程。
-写入冲突时保留磁盘上已提交的历史，重新加载会话后才能继续保存。
+历史保存和整轮执行共用每会话的 POSIX 锁，包含等待人工审批的时间。
+同一会话忙时立即返回 `SessionBusyError`；旧快照在请求模型前返回
+`SessionConflictError`，重新加载后才能继续。保存与设置写入在线程中执行，
+取消会等待已开始的写入结束再释放租约。不同会话可并行。
+该机制只协调遵守同一锁的 Daphnis 进程。
 
 增量输出、工具事件和用量更新由 `app.events` 提供。客户端可以在发送前订阅，
 并在离开时取消订阅；Application 关闭时也会清理订阅。
 并发关闭调用共享同一次资源清理。关闭时给异步订阅者最多 0.5 秒处理已发出的事件，
 超时后取消订阅任务。监听器应及时响应取消，避免阻塞事件循环。
+CLI 和 TUI 在显示时移除终端控制序列，事件、工具结果和历史仍保留原文。
 
 ```python
 unsubscribe = app.events.on("model.delta", lambda event: print(event.data))
@@ -123,15 +127,18 @@ MCP 信任适用于单个工具，后续调用可使用不同参数。`apply_pat
 MCP 服务断线、重连或工具定义变化也会撤销相关信任。
 
 需要审批的调用在非交互模式下会被拒绝。交互客户端可用 `interactive=True`，
-通过 `ops.resolve_approval(..., decision)` 返回 `deny`、`allow_once` 或
+通过 `ops.resolve_approval(request.request_id, decision)` 返回 `deny`、`allow_once` 或
 `trust_session`（可从 `daphnis.tools` 导入 `ApprovalDecision` 和 `ApprovalMode`）。
+每个审批请求有独立的 `request_id`，可从待审批请求或 `tool.approval_requested` 事件读取。
 
 内置文件工具阻止读取常见凭据路径，例如 `.env`、`.env.local`、私钥和
 已知的凭据配置，仍可列出文件名或读取 `.env.example` 模板。规则检查解析后的路径，
 不会识别放在普通文件中的所有秘密。普通命令进程会过滤已知凭据环境变量。
 
-`run_command` 只对受信任的系统只读命令及可明确解析的参数自动放行。
-`cat`、`ls`、`head`、`tail`、`wc` 的已识别路径以检查后的绝对路径执行。
+`run_command` 使用 argv。只有通过完整参数检查的受信任系统命令
+`pwd`、`uname`、`echo` 可自动放行。`cat`、`ls`、`head`、`tail`、`wc`
+及其他可能访问文件的命令在 AUTO 和 FULL 下均需确认。审批显示实际执行的 argv。
+读取工作区文件时优先使用 `read_file`、`list_directory` 和 `search`。
 外部命令仍会在启动时解析这些路径，不能防止不受信任的并发进程替换路径。
 该工具不提供操作系统沙箱。获准运行的脚本拥有当前用户的文件与进程权限。
 超时或取消时会尝试终止原进程组并回收直接子进程。`terminated` 表示该清理步骤完成，

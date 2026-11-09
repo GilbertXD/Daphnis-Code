@@ -23,6 +23,7 @@ from ..terminal_commands import (
     APPROVAL_MODE_TEXT,
     CommandResult,
     safe_error,
+    sanitize_terminal,
     terminal_command,
 )
 from ..tools import ApprovalDecision, ApprovalMode
@@ -82,7 +83,7 @@ class ChoiceScreen(ModalScreen[Any]):
                         for number, (label, value, disabled) in enumerate(options):
                             key = f"{index}-{number}"
                             self.values[key] = value
-                            entries.append(Option(label, id=key, disabled=disabled))
+                            entries.append(Option(sanitize_terminal(label), id=key, disabled=disabled))
                         yield OptionList(*entries, id=f"choices-{index}", markup=False)
             yield Static(
                 "↑↓ 选择   Tab 切换分列   Enter 确认   Esc 返回",
@@ -131,8 +132,8 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
                 id="tools-note",
             )
             yield SelectionList(
-                *((name, name, name in enabled) for name in available),
-                *((f"离线 · {name}", name, True) for name in offline),
+                *((sanitize_terminal(name), name, name in enabled) for name in available),
+                *((f"离线 · {sanitize_terminal(name)}", name, True) for name in offline),
                 id="tool-selections",
             )
             with Horizontal(id="tools-buttons"):
@@ -258,7 +259,7 @@ class DaphnisApp(App[None]):
         heading.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         heading.add_column(justify="right", no_wrap=True)
         label = Text("♄  daphnis", style=f"bold {ACCENT}")
-        label.append("  /  " + workspace, style=MUTED)
+        label.append("  /  " + sanitize_terminal(workspace), style=MUTED)
         color = WARNING if busy else SUCCESS
         mode = ops.approval_mode
         mode_label, _ = APPROVAL_MODE_TEXT[mode]
@@ -269,7 +270,7 @@ class DaphnisApp(App[None]):
         badge.append("● " + state, style=color)
         heading.add_row(label, badge)
         self.query_one("#heading", Static).update(heading)
-        self.query_one("#heading", Static).tooltip = f"会话 {session.id}"
+        self.query_one("#heading", Static).tooltip = f"会话 {sanitize_terminal(session.id)}"
         self.query_one(UsageView).update_usage(
             ops.turn_usage,
             ops.session_usage,
@@ -285,7 +286,10 @@ class DaphnisApp(App[None]):
             return
         event = message.event
         if event.name == "mcp.error":
-            self.notify(f"MCP {event.data['server']} · {event.data['error']}", severity="error")
+            self.notify(
+                sanitize_terminal(f"MCP {event.data['server']} · {event.data['error']}"),
+                severity="error",
+            )
             self.update_status()
             return
         if event.name == "mcp.tools_changed":
@@ -294,10 +298,7 @@ class DaphnisApp(App[None]):
         await self.query_one(ChatView).event(event)
         if event.name == "tool.approval_requested":
             request = self.ops.pending_approval
-            if request is not None and (request.turn_id, request.tool_call_id) == (
-                event.turn_id,
-                event.data["tool_call_id"],
-            ):
+            if request is not None and request.request_id == event.data["request_id"]:
                 screen = ApprovalScreen(request)
                 self._approval_screen = screen
 
@@ -306,8 +307,7 @@ class DaphnisApp(App[None]):
                         self._approval_screen = None
                     if not self._shutting_down:
                         self.ops.resolve_approval(
-                            request.turn_id,
-                            request.tool_call_id,
+                            request.request_id,
                             value or ApprovalDecision.DENY,
                         )
 
@@ -440,30 +440,29 @@ class DaphnisApp(App[None]):
             )
 
     async def on_model_picker_selected(self, message: ModelPicker.Selected) -> None:
-        await self._perform_command(
-            lambda: CommandResult(
-                text=self.ops.set_model(message.provider, message.model_id)
-            )
-        )
+        async def select() -> CommandResult:
+            return CommandResult(text=await self.ops.set_model(message.provider, message.model_id))
+
+        await self._perform_command(select)
         self.query_one(PromptInput).focus()
 
     async def _thinking_selected(self, value: str | None) -> None:
         if value is None:
             return
 
-        def select() -> CommandResult:
-            self.ops.set_thinking(None if value == "default" else value)
+        async def select() -> CommandResult:
+            await self.ops.set_thinking(None if value == "default" else value)
             return CommandResult(text=f"Thinking：{self.ops.thinking or '服务端默认'}")
 
         await self._perform_command(select)
 
-    def _tools_selected(self, value) -> None:
+    async def _tools_selected(self, value) -> None:
         if value is not None:
             try:
-                self.ops.set_tools(value)
+                await self.ops.set_tools(value)
                 self.update_status()
             except (OSError, SaturnusError, RuntimeError, TypeError, ValueError) as exc:
-                self.notify(safe_error(exc), severity="error")
+                self.notify(sanitize_terminal(safe_error(exc)), severity="error")
 
     async def _session_selected(self, value: str | None) -> None:
         if value is None:

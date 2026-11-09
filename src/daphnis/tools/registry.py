@@ -240,7 +240,8 @@ class ToolExecutor:
                     can_trust=can_trust,
                 )
                 await binding.events.emit(
-                    "tool.approval_requested", **fields, request=asdict(request)
+                    "tool.approval_requested", **fields,
+                    request_id=request.request_id, request=asdict(request),
                 )
                 decision = ApprovalDecision.DENY
                 if self._approval is not None:
@@ -348,8 +349,9 @@ def create_tools(
         "run_command": (
             (
                 "Execute argv, never a shell string. No pipelines, shell/inline "
-                "interpreters or dangerous commands. Scripts/builds/uncertain writes "
-                "require approval; output is bounded."
+                "interpreters or dangerous commands. File access and unclassified "
+                "arguments require approval. Prefer read_file, list_directory and search "
+                "for workspace inspection. Output is bounded."
             ),
             {
                 "argv": {

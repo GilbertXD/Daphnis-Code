@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
+from .history import finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .session import Session
@@ -110,7 +111,7 @@ class Operations:
             groups[model.provider] = (*groups[model.provider], model)
         return groups
 
-    def set_model(self, provider: str, model_id: str) -> str:
+    async def set_model(self, provider: str, model_id: str) -> str:
         app = self._app
         app._ensure_idle()
         model = app._model_for(provider, model_id)
@@ -130,8 +131,7 @@ class Operations:
             thinking=thinking,
             enabled_tools=enabled_tools,
         )
-        app._save_session(updated)
-        app._session = updated
+        await app._update_session(updated)
         return "\n".join(notices)
 
     @staticmethod
@@ -158,15 +158,14 @@ class Operations:
         if names:
             require_tools(model)
 
-    def set_thinking(self, mode: str | None) -> None:
+    async def set_thinking(self, mode: str | None) -> None:
         app = self._app
         app._ensure_idle()
         self._validate_thinking(self.model, mode)
         updated = replace(app._session, thinking=mode)
-        app._save_session(updated)
-        app._session = updated
+        await app._update_session(updated)
 
-    def set_tools(
+    async def set_tools(
         self, names: Sequence[str], *, keep_unavailable: bool = False
     ) -> None:
         app = self._app
@@ -183,8 +182,7 @@ class Operations:
             )
         self._validate_tools(self.model, selected, retained=self.enabled_tools)
         updated = replace(app._session, enabled_tools=selected)
-        app._save_session(updated)
-        app._session = updated
+        await app._update_session(updated)
 
     async def connect_mcp(
         self,
@@ -243,11 +241,10 @@ class Operations:
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()
 
-    def new_session(self) -> SessionSnapshot:
+    async def new_session(self) -> SessionSnapshot:
         app = self._app
         app._ensure_idle()
         current = app._session
-        app._save_session(current)
         fresh = Session(
             workspace=current.workspace,
             provider=current.provider,
@@ -255,9 +252,14 @@ class Operations:
             thinking=current.thinking,
             enabled_tools=current.enabled_tools,
         )
-        app._history.save(fresh)
-        app._session = fresh
-        app._usage.select_session(fresh.id, fresh.usage)
+        async def save_and_switch() -> None:
+            await app._save_session(current)
+            await app._history.save_async(fresh)
+            app._session = fresh
+            app._usage.select_session(fresh.id, fresh.usage)
+
+        async with app._state_lock:
+            await finish_io(save_and_switch())
         return self.session
 
     def restore_session(self, session_id: str) -> None:
@@ -287,12 +289,9 @@ class Operations:
         await self._app._cancel_turn()
 
     def resolve_approval(
-        self, turn_id: str, tool_call_id: str, decision: ApprovalDecision | str
+        self, request_id: str, decision: ApprovalDecision | str
     ) -> bool:
-        self._app._ensure_open()
-        return self._app._resolve_approval(
-            turn_id, tool_call_id, ApprovalDecision(decision)
-        )
+        return self._app._resolve_approval(request_id, ApprovalDecision(decision))
 
     async def close(self) -> None:
         await self._app.close()

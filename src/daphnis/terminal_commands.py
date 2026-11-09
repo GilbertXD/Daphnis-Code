@@ -1,6 +1,7 @@
 """Translate terminal commands to operations and presentation results."""
 
 import os
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -12,6 +13,21 @@ APPROVAL_MODE_TEXT = {
     ApprovalMode.AUTO: ("安全自动", "自动执行无需额外授权的操作，其余按规则确认。"),
     ApprovalMode.FULL: ("尽可能自动", "跳过常规审批，保留强制审批和硬编码禁止。"),
 }
+
+_TERMINAL_CONTROLS = re.compile(
+    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|\Z)"  # OSC
+    r"|(?:\x1b[PX^_]|[\x90\x98\x9e\x9f]).*?(?:\x1b\\|\x9c|\Z)"  # Control strings
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]?"  # CSI, including incomplete sequences
+    r"|\x1b[ -/]*[0-~]"
+    r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]",
+    re.DOTALL,
+)
+
+
+def sanitize_terminal(text: str) -> str:
+    """Remove terminal commands while preserving printable text, tabs and LF."""
+    return _TERMINAL_CONTROLS.sub("", text)
+
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
@@ -91,7 +107,7 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
             )
         return CommandResult(text=message)
     if name == "/new" and not args:
-        session = ops.new_session()
+        session = await ops.new_session()
         return CommandResult("reload", f"新会话：{session.id}")
     if name == "/model":
         groups = ops.list_models()
@@ -113,15 +129,15 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
                 if index < 0 or index >= len(choices):
                     raise ValueError("模型序号超出范围。")
                 target = choices[index]
-                return CommandResult(text=ops.set_model(target.provider, target.id))
+                return CommandResult(text=await ops.set_model(target.provider, target.id))
             matches = [model for model in choices if model.id == args[0]]
             if len(matches) == 1:
-                return CommandResult(text=ops.set_model(matches[0].provider, args[0]))
+                return CommandResult(text=await ops.set_model(matches[0].provider, args[0]))
             if len(matches) > 1:
                 raise ValueError("模型名属于多个厂商，请使用 /model 厂商 模型ID。")
-            return CommandResult(text=ops.set_model(ops.session.provider, args[0]))
+            return CommandResult(text=await ops.set_model(ops.session.provider, args[0]))
         if len(args) == 2:
-            return CommandResult(text=ops.set_model(args[0], args[1]))
+            return CommandResult(text=await ops.set_model(args[0], args[1]))
     if name == "/thinking":
         if not args:
             modes = ops.model.thinking_modes
@@ -135,7 +151,7 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
                 "thinking", "可用：default（服务端默认）、" + ", ".join(modes)
             )
         if len(args) == 1:
-            ops.set_thinking(None if args[0] == "default" else args[0])
+            await ops.set_thinking(None if args[0] == "default" else args[0])
             return CommandResult(text=f"Thinking：{ops.thinking or '服务端默认'}")
     if name == "/tools":
         if not args:
@@ -154,9 +170,9 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
                 ),
             )
         if args == ["all"]:
-            ops.set_tools(ops.all_tools, keep_unavailable=True)
+            await ops.set_tools(ops.all_tools, keep_unavailable=True)
         elif args == ["none"]:
-            ops.set_tools(())
+            await ops.set_tools(())
         elif len(args) > 1 and args[0] in ("on", "off"):
             known = (
                 ops.all_tools
@@ -166,9 +182,9 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
             if any(name not in known for name in args[1:]):
                 raise ValueError("包含未知工具。")
             if args[0] == "on":
-                ops.set_tools(tuple(dict.fromkeys((*ops.enabled_tools, *args[1:]))))
+                await ops.set_tools(tuple(dict.fromkeys((*ops.enabled_tools, *args[1:]))))
             else:
-                ops.set_tools(
+                await ops.set_tools(
                     tuple(tool for tool in ops.enabled_tools if tool not in args[1:])
                 )
         else:

@@ -131,7 +131,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(event.data["tool_call_id"], call_id)
                 self.assertEqual(pending.details["server"], server)
                 self.assertTrue(
-                    ops.resolve_approval(pending.turn_id, call_id, decision)
+                    ops.resolve_approval(pending.request_id, decision)
                 )
                 return pending.details
 
@@ -145,7 +145,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertRegex(special, r"^mcp__demo____[0-9a-f]{32}$")
                 self.assertTrue({add, special}.issubset(ops.enabled_tools))
                 self.assertEqual(ops.list_mcp_servers(), ("demo",))
-                ops.set_tools(("list_directory", add, special))
+                await ops.set_tools(("list_directory", add, special))
                 saved = ops.session.id
                 calls[:] = [
                     tool_call("list_directory", "builtin"),
@@ -184,7 +184,28 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     ["add 12 30", "add 1 2", "math.add -2 0", "add -3 0", "add -4 0"],
                 )
 
-                ops.new_session()
+                ops.set_approval_mode("ask")
+                calls[:] = [
+                    tool_call(add, "ask-first", a=1, b=1),
+                    tool_call(add, "ask-again", a=1, b=2),
+                ]
+                send = asyncio.create_task(ops.send("ask twice", stream=False))
+                await approve("ask-first")
+                await approve("ask-again")
+                self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
+                ops.set_approval_mode("auto")
+                calls[:] = [tool_call(add, "trust-cleared", a=3, b=4)]
+                send = asyncio.create_task(ops.send("return to auto", stream=False))
+                await approve("trust-cleared", ApprovalDecision.TRUST_SESSION)
+                self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
+                ops.set_approval_mode("full")
+                calls[:] = [tool_call(special, "full", a=3, b=4)]
+                self.assertEqual((await ops.send("full", stream=False)).status, TurnStatus.COMPLETED)
+                self.assertEqual(outcomes[-1]["structured_content"], {"sum": 7})
+                self.assertTrue(requests.empty())
+                ops.set_approval_mode("auto")
+
+                await ops.new_session()
                 calls[:] = [tool_call(add, "slow", a=-1, b=0)]
                 with patch("daphnis.mcp._CALL_TIMEOUT", 0.1):
                     send = asyncio.create_task(ops.send("timeout", stream=False))
@@ -193,6 +214,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                         (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
                     )
                 self.assertEqual(outcomes[-1]["error"]["code"], "mcp_timeout")
+                self.assertIsNone(ops.pending_approval)
 
                 calls[:] = [tool_call(add, "cancel", a=-1, b=1)]
                 send = asyncio.create_task(ops.send("cancel", stream=False))
@@ -205,8 +227,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 await ops.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await send
+                self.assertIsNone(ops.pending_approval)
                 pid = int((root / "pid").read_text())
-                ops.set_tools(("list_directory", add))
+                await ops.set_tools(("list_directory", add))
                 snapshot = app._tools.select([add]).bind(
                     session=app._session, events=app.events, turn_id="old-turn"
                 )
@@ -241,7 +264,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 await ops.refresh_mcp("demo")
                 calls[:] = [tool_call(add, "definition-changed", a=4, b=5)]
                 send = asyncio.create_task(ops.send("changed", stream=False))
-                await approve("definition-changed")
+                await approve("definition-changed", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual(
                     (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
                 )
@@ -254,7 +277,11 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 backup = "mcp__backup__add"
                 backup_pid = int((backup_dir / "pid").read_text())
                 self.assertNotIn(backup, ops.enabled_tools)
-                ops.set_tools((*ops.enabled_tools, backup))
+                await ops.set_tools((*ops.enabled_tools, backup))
+                calls[:] = [tool_call(backup, "separate-server", a=2, b=4)]
+                send = asyncio.create_task(ops.send("other server", stream=False))
+                await approve("separate-server", server="backup")
+                self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
                 with self.assertRaisesRegex(RuntimeError, "MCP_MISSING_TEST_KEY"):
                     await ops.connect_mcp(
                         "broken", sys.executable, env={"KEY": "MCP_MISSING_TEST_KEY"}
@@ -268,7 +295,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(add, ops.enabled_tools)
                     self.assertNotIn(add, ops.effective_tools)
 
-                ops.new_session()
+                await ops.new_session()
                 advertised.clear()
                 calls[:] = [tool_call(backup, "backup", a=4, b=7)]
                 send = asyncio.create_task(ops.send("backup", stream=False))
@@ -281,6 +308,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(add, advertised)
                     await ops.reconnect_mcp("demo")
                     self.assertIn(add, ops.effective_tools)
+                    self.assertNotIn((saved, add), app._trusted_tools)
                     pid = int((root / "pid").read_text())
                 (root / "changed").touch()
                 await ops.refresh_mcp("demo")
@@ -421,7 +449,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 pending = ops.pending_approval
                 self.assertEqual(pending.details["server"], "remote")
                 ops.resolve_approval(
-                    pending.turn_id, pending.tool_call_id, ApprovalDecision.ALLOW_ONCE
+                    pending.request_id, ApprovalDecision.ALLOW_ONCE
                 )
 
             app.events.on("tool.approval_requested", approve)
@@ -465,7 +493,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                         auth=bearer,
                     )
                 self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
-                ops.set_tools(("mcp__remote__add",))
+                await ops.set_tools(("mcp__remote__add",))
                 await asyncio.wait_for(subscribed.wait(), 5)
                 send = asyncio.create_task(ops.send("add", stream=False))
                 async with asyncio.timeout(5):
@@ -486,7 +514,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                         await asyncio.sleep(0.01)
                 self.assertEqual(ops.enabled_tools, ("mcp__remote__add",))
                 self.assertEqual(ops.effective_tools, ())
-                ops.set_tools((target,), keep_unavailable=True)
+                await ops.set_tools((target,), keep_unavailable=True)
                 advertised.clear()
                 self.assertEqual(
                     (

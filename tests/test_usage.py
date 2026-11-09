@@ -145,9 +145,9 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ops.turn_usage, UsageTotals(requests=1))
                 totals = UsageTotals(350, 35, 385, 4, 3)
                 old = ops.session.id
-                ops.set_model("mimo", "b")
+                await ops.set_model("mimo", "b")
                 self.assertEqual(ops.session_usage, totals)
-                ops.new_session()
+                await ops.new_session()
                 self.assertIsNone(ops.turn_usage)
                 self.assertEqual(ops.session_usage, UsageTotals())
                 ops.restore_session(old)

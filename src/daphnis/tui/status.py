@@ -4,6 +4,7 @@ from rich.text import Text
 from textual.events import Resize
 from textual.widgets import Static
 
+from ..terminal_commands import sanitize_terminal
 from ..usage import UsageTotals
 from .theme import ACCENT, BLUE, MUTED, TEXT, WARNING
 
@@ -75,10 +76,10 @@ class UsageView(Static):
 
     def _redraw(self) -> None:
         separator = Text("  │  ", style=MUTED)
-        meta = Text(self._model_id, style=BLUE)
+        meta = Text(sanitize_terminal(self._model_id), style=BLUE)
         meta.append(separator)
         meta.append("思考 ", style=MUTED)
-        meta.append(self._thinking or "default", style=ACCENT)
+        meta.append(sanitize_terminal(self._thinking or "default"), style=ACCENT)
         meta.append(separator)
         meta.append(f"{self._tools} tools", style=MUTED)
         hint = Text("Enter 发送 · Esc 中断", style=MUTED)

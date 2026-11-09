@@ -3,8 +3,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
+from rich.markdown import Markdown
+from rich.syntax import Syntax
 from textual.widgets import Button, Checkbox, OptionList, SelectionList, Static
 
 from daphnis import Event, History, Operations, Session
@@ -77,6 +80,53 @@ async def submit(ui, pilot, text):
 
 
 class TUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_controls_are_removed_after_streaming_and_before_render(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = controller(Path(temporary), lambda request: self.fail("Unexpected model call"))
+            ui = DaphnisApp(Operations(app), app.events)
+            async with ui.run_test(size=(100, 36)):
+                chat = ui.query_one(ChatView)
+                fragments = ("中文\x1b", "]52;c;PAY", "LOAD\x07**OK**\n\tfin")
+                for fragment in fragments:
+                    await chat.event(Event("model.delta", "session", "turn", {
+                        "request_number": 1, "chunk": {"choices": [{
+                            "index": 0, "delta": {"content": fragment},
+                        }]},
+                    }))
+                row = chat.assistants["turn", 1]
+                with patch("daphnis.tui.chat.Markdown", wraps=Markdown) as markdown:
+                    row.redraw()
+                    markdown.assert_called_once_with("中文**OK**\n\tfin", code_theme="monokai")
+                self.assertEqual(row.text, "".join(fragments))
+
+                result = "data\x90control\x9c\x1b[31m\x00\x7f!"
+                await chat.event(Event("tool.finished", "session", "turn", {
+                    "tool_call_id": "mcp", "request_number": 1,
+                    "name": "mcp__demo__read", "status": "COMPLETED", "content": result,
+                }))
+                self.assertEqual(chat.tools["turn", 1, "mcp"].output, "data!")
+
+                request = ApprovalRequest(
+                    session_id="session", turn_id="turn", tool_call_id="patch",
+                    tool_name="apply_patch", workspace=temporary,
+                    reason="reason\x1b]52;c;PAYLOAD\x07",
+                    details={
+                        "patch": "+中文\x9b31m\x7f\n",
+                        "arg": "中文\x9d52;c;PAYLOAD",
+                        "other": "still visible",
+                    },
+                )
+                screen = ApprovalScreen(request)
+                with patch("daphnis.tui.approval.Syntax", wraps=Syntax) as syntax:
+                    await ui.push_screen(screen)
+                    self.assertEqual(syntax.call_args.args[0], "+中文\n")
+                self.assertEqual(str(screen.query_one("#approval-reason", Static).content), "reason")
+                details = str(screen.query_one("#approval-details", Static).content)
+                self.assertIn("中文", details)
+                self.assertIn("still visible", details)
+                self.assertNotIn("\x9d", details)
+                self.assertEqual(request.details["patch"], "+中文\x9b31m\x7f\n")
+
     async def test_input_stream_clear_new_and_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -303,7 +353,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 root, lambda request: sse({"role": "assistant", "content": "hello"})
             )
             ops = Operations(app)
-            ops.set_thinking("high")
+            await ops.set_thinking("high")
             ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(100, 36)) as pilot:
                 await submit(ui, pilot, "/model")

@@ -1,11 +1,15 @@
 """Explicit, versioned, atomic local Session persistence."""
 
+import asyncio
 import json
 import os
+from collections.abc import AsyncIterator, Awaitable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Self, TypeVar
 
 from saturnus import Messages
 
@@ -18,6 +22,61 @@ if os.name == "posix":
 
 class SessionConflictError(RuntimeError):
     """A different writer changed the persisted Session."""
+
+
+class SessionBusyError(RuntimeError):
+    """Another operation holds the Session lease."""
+
+
+class SessionLease:
+    """Own the stable sidecar lock until the operation and its I/O finish."""
+
+    def __init__(self, destination: Path) -> None:
+        self.destination = destination
+        self.fd: int | None = None
+
+    def __enter__(self) -> Self:
+        if self.fd is not None:
+            raise RuntimeError("The Session lease is already held.")
+        if os.name != "posix":
+            raise OSError("Session writes require POSIX file locking.")
+        self.destination.parent.mkdir(parents=True, exist_ok=True)
+        path = self.destination.with_suffix(".lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise SessionBusyError(f"Session is busy: {self.destination.stem}") from exc
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+_T = TypeVar("_T")
+
+
+async def finish_io(operation: Awaitable[_T]) -> _T:
+    """Finish started I/O before propagating cancellation to the lease owner."""
+    task = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.wait((task,))
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 @dataclass(frozen=True)
@@ -73,8 +132,46 @@ class History:
             raise ValueError("session_id must be a non-empty filename component.")
         return self.directory / f"{session_id}.json"
 
-    def save(self, session: Session) -> None:
+    @staticmethod
+    def _check_revision(session: Session, destination: Path) -> None:
+        try:
+            revision = (session.id, sha256(destination.read_bytes()).hexdigest())
+        except FileNotFoundError:
+            revision = None
+        expected = session._saved_revision
+        if expected is not None and expected[0] != session.id:
+            expected = None
+        if revision != expected:
+            raise SessionConflictError(
+                f"Session write conflict for {session.id}; reload before saving."
+            )
+
+    @asynccontextmanager
+    async def lease(self, session: Session) -> AsyncIterator[SessionLease]:
+        lease = SessionLease(self._path(session.id))
+
+        def acquire() -> None:
+            lease.__enter__()
+            self._check_revision(session, lease.destination)
+
+        try:
+            await finish_io(asyncio.to_thread(acquire))
+            yield lease
+        finally:
+            lease.__exit__()
+
+    async def save_async(self, session: Session, *, lease: SessionLease | None = None) -> None:
+        await finish_io(asyncio.to_thread(self.save, session, lease=lease))
+
+    def save(self, session: Session, *, lease: SessionLease | None = None) -> None:
         destination = self._path(session.id)
+        if lease is None:
+            with SessionLease(destination) as acquired:
+                self.save(session, lease=acquired)
+            return
+        if lease.destination != destination or lease.fd is None:
+            raise ValueError("An active lease for the same Session is required.")
+        self._check_revision(session, destination)
         validated = Session(
             id=session.id,
             workspace=session.workspace,
@@ -97,26 +194,8 @@ class History:
             "usage": asdict(validated.usage),
         }
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
-        if os.name != "posix":
-            raise OSError("Session writes require POSIX file locking.")
-        self.directory.mkdir(parents=True, exist_ok=True)
-        # Lock the stable sidecar, not the inode replaced by the commit.
-        lock_path = destination.with_suffix(".lock")
-        with os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW, 0o600)) as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                revision = (session.id, sha256(destination.read_bytes()).hexdigest())
-            except FileNotFoundError:
-                revision = None
-            expected = session._saved_revision
-            if expected is not None and expected[0] != session.id:
-                expected = None
-            if revision != expected:
-                raise SessionConflictError(
-                    f"Session write conflict for {session.id}; reload before saving."
-                )
-            self._replace(destination, serialized)
-            session._saved_revision = (session.id, sha256(serialized).hexdigest())
+        self._replace(destination, serialized)
+        session._saved_revision = (session.id, sha256(serialized).hexdigest())
 
     def _replace(self, destination: Path, serialized: bytes) -> None:
         temporary: Path | None = None

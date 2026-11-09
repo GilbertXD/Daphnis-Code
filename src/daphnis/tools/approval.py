@@ -6,10 +6,11 @@ import shutil
 import stat
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 class Decision(StrEnum):
@@ -183,6 +184,7 @@ class ApprovalRequest:
     reason: str
     details: dict[str, Any]
     can_trust: bool = False
+    request_id: str = field(default_factory=lambda: uuid4().hex, init=False)
 
 
 ApprovalCallback = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
@@ -438,7 +440,7 @@ def blocked_reason(program: str, arguments: list[str], workspace: Path) -> str |
 
 
 def trusted_read_program(path: Path) -> bool:
-    """Automatic reads are restricted to root-owned, non-writable system binaries."""
+    """Automatic execution requires a root-owned system binary and path."""
     if path.parent not in (Path("/bin"), Path("/usr/bin")):
         return False
     for component in (path, *path.parents):
@@ -451,9 +453,9 @@ def trusted_read_program(path: Path) -> bool:
 def read_arguments(
     program: str, arguments: list[str]
 ) -> tuple[list[str], list[str]] | None:
-    """Recognize portable options before literal operands for system reads."""
+    """Recognize file operands for preflight and the approval display."""
     if program in ("echo", "pwd", "uname"):
-        return arguments, []
+        return None
     allowed_flags = {"cat": "benstuv", "ls": "aAlhndpF1", "wc": "clmw"}
     index = 0
     while index < len(arguments) and arguments[index].startswith("-"):
