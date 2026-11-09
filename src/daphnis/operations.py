@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .mcp import MCPConnection
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .session import Session
 
@@ -142,6 +143,29 @@ class Operations:
         updated = replace(app._session, enabled_tools=selected)
         app._save_session(updated)
         app._session = updated
+
+    async def connect_mcp(
+        self, name: str, command: str, args: Sequence[str] = ()
+    ) -> None:
+        """Start an explicitly configured stdio server. Tools remain disabled."""
+        await self._app._connect_mcp(MCPConnection(name, command, args))
+
+    async def disconnect_mcp(self, name: str) -> None:
+        app = self._app
+        app._ensure_idle()
+        if name not in app._mcp:
+            raise ValueError(f"MCP Server {name!r} 未连接。")
+        available = app._mcp[name].tools
+        enabled = tuple(tool for tool in self.enabled_tools if tool not in available)
+        if enabled != self.enabled_tools:
+            self.set_tools(enabled)
+        await app._disconnect_mcp(name)
+
+    def list_mcp_servers(self) -> tuple[str, ...]:
+        return tuple(self._app._mcp)
+
+    def list_mcp_tools(self) -> tuple[str, ...]:
+        return tuple(tool for server in self._app._mcp.values() for tool in server.tools)
 
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()

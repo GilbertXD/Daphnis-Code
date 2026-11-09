@@ -1,6 +1,8 @@
 """Read environment variables into Application connection options."""
 
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 
@@ -26,3 +28,14 @@ def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:
     if not provider or not model_id or provider not in connections:
         raise ValueError("请在 .env 配置 LLM_PROVIDER、LLM_MODEL 和对应的 Base URL。")
     return provider, model_id, connections
+
+
+def load_mcp_config(path: Path) -> tuple[str, str, list[str]]:
+    """Read one explicitly selected local stdio server configuration."""
+    with path.open(encoding="utf-8") as source:
+        config = json.load(source)
+    if not isinstance(config, dict) or not {"name", "command"} <= config.keys():
+        raise ValueError("MCP 配置需要 name 和 command。")
+    if config.keys() - {"name", "command", "args"}:
+        raise ValueError("MCP 配置仅支持 name、command 和 args。")
+    return config["name"], config["command"], config.get("args", [])

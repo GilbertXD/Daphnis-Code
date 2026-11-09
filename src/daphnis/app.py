@@ -14,6 +14,7 @@ from .agent import Agent, TurnResult, TurnStatus
 from .context import Context
 from .events import EventBus
 from .history import History
+from .mcp import MCPConnection
 from .models import (
     MODELS,
     ModelInfo,
@@ -65,10 +66,9 @@ class Application:
         self._task: asyncio.Task[TurnResult] | None = None
         self._approval: asyncio.Future[bool] | None = None
         self._pending_approval: ApprovalRequest | None = None
+        self._mcp: dict[str, MCPConnection] = {}
+        self._mcp_lock = asyncio.Lock()
         self._tools = create_tools(approval=self._request_approval)
-        self._all_tools = tuple(
-            item["function"]["name"] for item in self._tools.definitions()
-        )
         model = self._model_for(provider, model_id)
         self._session = Session(
             workspace=workspace,
@@ -120,6 +120,39 @@ class Application:
         self._ensure_open()
         if self._running:
             raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
+        if self._mcp_lock.locked():
+            raise RuntimeError("请等待 MCP 连接操作完成。")
+
+    @property
+    def _all_tools(self) -> tuple[str, ...]:
+        return tuple(item["function"]["name"] for item in self._tools.definitions())
+
+    async def _connect_mcp(self, connection: MCPConnection) -> None:
+        self._ensure_idle()
+        async with self._mcp_lock:
+            if connection.name in self._mcp:
+                raise ValueError(f"MCP Server {connection.name!r} 已连接。")
+            await connection.start()
+            try:
+                self._ensure_open()
+                tools = create_tools(
+                    approval=self._request_approval,
+                    connections=(*self._mcp.values(), connection),
+                )
+            except BaseException:
+                await connection.aclose()
+                raise
+            self._mcp[connection.name] = connection
+            self._tools = tools
+
+    async def _disconnect_mcp(self, name: str) -> None:
+        self._ensure_idle()
+        async with self._mcp_lock:
+            connection = self._mcp.pop(name)
+            self._tools = create_tools(
+                approval=self._request_approval, connections=self._mcp.values()
+            )
+            await connection.aclose()
 
     async def _request_approval(self, request: ApprovalRequest) -> bool:
         if not self._interactive:
@@ -234,5 +267,11 @@ class Application:
                 await self._cancel_turn()
                 await self.events.drain()
             finally:
+                async with self._mcp_lock:
+                    for connection in self._mcp.values():
+                        stack.push_async_callback(connection.aclose)
+                    if self._mcp:
+                        self._mcp.clear()
+                        self._tools = create_tools(approval=self._request_approval)
                 self._usage.close()
                 self.events.clear()

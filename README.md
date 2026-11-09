@@ -79,3 +79,29 @@ finally:
 
 默认情况下，需要审批的工具操作会被拒绝。只有客户端能展示审批请求并调用
 `ops.resolve_approval(...)` 时，才应以 `interactive=True` 构造 Application。
+
+### 本地 MCP 工具
+
+用 `--mcp-config` 指定一个本地 stdio Server 的 JSON 文件。只配置你信任的程序，
+因为它会以当前用户的权限启动。
+
+```json
+{
+  "name": "demo",
+  "command": "/absolute/path/to/python",
+  "args": ["/absolute/path/to/server.py"]
+}
+```
+
+```sh
+uv run daphnis --mcp-config ./mcp.json
+```
+
+连接后，`/tools` 会列出 `mcp__demo__add` 等工具。勾选后才能提供给模型，每次调用
+仍需确认。恢复启用了 MCP 工具的会话时，使用同一配置启动，保留 Server 名称。
+工具结果支持文本和结构化数据。
+
+Python 客户端可用 `await ops.connect_mcp(name, command, args)` 连接，通过
+`ops.list_mcp_servers()` 和 `ops.list_mcp_tools()` 查看发现结果，再用
+`ops.set_tools(...)` 启用。显式断开会保存当前会话更新后的工具选择。关闭
+Application 时会释放 Server 进程。

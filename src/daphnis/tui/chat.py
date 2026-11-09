@@ -14,6 +14,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Collapsible, Static
 
 from ..events import Event
+from ..mcp import TOOL_PREFIX
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -99,6 +100,9 @@ class ChatRow(Static):
 
 
 def tool_summary(data: dict[str, Any]) -> str:
+    name = data.get("name", "")
+    if name.startswith(TOOL_PREFIX):
+        return f"{name} {data.get('arguments', '{}')}"[:300]
     try:
         arguments = json.loads(data.get("arguments", "{}"))
         if "path" in arguments:
@@ -269,6 +273,8 @@ class ChatView(VerticalScroll):
                 row.edits = patch_counts(function.get("arguments", "{}"))
                 if function.get("name") == "run_command":
                     row.output = command_output(message.get("content"))
+                elif function.get("name", "").startswith(TOOL_PREFIX):
+                    row.output = (message.get("content") or "")[:2000]
                 try:
                     result = json.loads(message.get("content") or "{}")
                     if isinstance(result, dict) and "ok" in result:
@@ -375,6 +381,8 @@ class ChatView(VerticalScroll):
                     pass
                 if data["name"] == "run_command":
                     row.output = command_output(data.get("content"))
+                elif data["name"].startswith(TOOL_PREFIX):
+                    row.output = (data.get("content") or "")[:2000]
             row.dirty = True
             if row.output or row.outcome.startswith(("ERROR", "FAILED", "等待审批")):
                 row.tool_group.reveal()

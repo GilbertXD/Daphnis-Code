@@ -1,6 +1,7 @@
-"""Select and authorize built-in tools before delegating execution to Saturnus."""
+"""Select and authorize tools before delegating execution to Saturnus."""
 
 import json
+from collections.abc import Iterable
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -10,6 +11,7 @@ from typing import Any
 from saturnus import ToolRegistry, ToolResult
 
 from ..events import EventBus
+from ..mcp import MCPConnection
 from ..session import Session
 from .approval import (
     ApprovalCallback,
@@ -89,17 +91,22 @@ class ToolExecutor:
         *,
         approval: ApprovalCallback | None = None,
         binding: _Binding | None = None,
+        mcp_tools: dict[str, tuple[MCPConnection, str]] | None = None,
     ) -> None:
         self._registry = registry
         self._approval = approval
         self._binding = binding
+        self._mcp_tools = mcp_tools if mcp_tools is not None else {}
 
     def definitions(self) -> list[dict[str, Any]]:
         return self._registry.definitions()
 
     def select(self, names: list[str]) -> "ToolExecutor":
         return ToolExecutor(
-            self._registry.select(names), approval=self._approval, binding=self._binding
+            self._registry.select(names),
+            approval=self._approval,
+            binding=self._binding,
+            mcp_tools=self._mcp_tools,
         )
 
     def bind(
@@ -114,6 +121,7 @@ class ToolExecutor:
             self._registry,
             approval=self._approval,
             binding=_Binding(workspace, session.id, turn_id, events),
+            mcp_tools=self._mcp_tools,
         )
 
     async def execute(self, call: dict[str, Any]) -> ToolResult:
@@ -143,7 +151,25 @@ class ToolExecutor:
             "name": name,
         }
         try:
-            operation = _PREPARERS[name](arguments, binding.workspace.path)
+            if name in self._mcp_tools:
+                connection, original_name = self._mcp_tools[name]
+
+                async def run():
+                    return await connection.call(original_name, arguments)
+
+                operation = Operation(
+                    decision=Decision.ASK,
+                    reason=f"调用 MCP Server {connection.name} 的工具需要审批。",
+                    targets=(),
+                    details={
+                        "server": connection.name,
+                        "tool": original_name,
+                        "arguments": arguments,
+                    },
+                    run=run,
+                )
+            else:
+                operation = _PREPARERS[name](arguments, binding.workspace.path)
             if operation.decision == Decision.ASK:
                 request = ApprovalRequest(
                     session_id=binding.session_id,
@@ -210,8 +236,12 @@ class ToolExecutor:
             return result(failure("invalid_operation", str(exc)))
 
 
-def create_tools(*, approval: ApprovalCallback | None = None) -> ToolExecutor:
-    """Build the five tools; use select() to choose the current enabled subset."""
+def create_tools(
+    *,
+    approval: ApprovalCallback | None = None,
+    connections: Iterable[MCPConnection] = (),
+) -> ToolExecutor:
+    """Build the tool catalogue; use select() to choose the enabled subset."""
     registry = ToolRegistry()
     text_path = {"type": "string", "minLength": 1}
     definitions = {
@@ -290,4 +320,14 @@ def create_tools(*, approval: ApprovalCallback | None = None) -> ToolExecutor:
             },
             handler=_guarded_handler(name),
         )
-    return ToolExecutor(registry, approval=approval)
+    mcp_tools = {}
+    for connection in connections:
+        for name, tool in connection.tools.items():
+            registry.register(
+                name=name,
+                description=tool.description or "",
+                parameters=tool.input_schema,
+                handler=_guarded_handler(name),
+            )
+            mcp_tools[name] = connection, tool.name
+    return ToolExecutor(registry, approval=approval, mcp_tools=mcp_tools)

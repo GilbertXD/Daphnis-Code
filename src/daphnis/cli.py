@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from .agent import TurnStatus
 from .app import Application
-from .config import environment_connections
+from .config import environment_connections, load_mcp_config
 from .operations import Operations
 from .terminal_commands import safe_error, terminal_command
 
@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, help="新会话的工作目录，默认当前目录")
     parser.add_argument("--session", help="恢复已有会话 ID，使用其保存的工作区")
     parser.add_argument("--thinking", help="思考档位；default 为服务端默认")
+    parser.add_argument("--mcp-config", type=Path, help="显式加载一个本地 MCP stdio Server")
     args = parser.parse_args()
     if args.session and args.workspace:
         parser.error("--session 使用已保存工作区，请勿同时指定 --workspace。")
@@ -55,6 +56,8 @@ def main() -> int:
 
     async def run():
         try:
+            if args.mcp_config:
+                await ops.connect_mcp(*load_mcp_config(args.mcp_config))
             if args.session:
                 ops.restore_session(args.session)
             if args.thinking:
