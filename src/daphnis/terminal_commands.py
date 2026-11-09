@@ -9,6 +9,7 @@ from .operations import Operations
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
 /tools [all|none|on 工具名...|off 工具名...]  查看或选择工具
+/mcp [reconnect|disconnect|refresh Server名]  查看 MCP 状态或管理连接
 /session [会话ID]  列出或恢复会话
 /new  新建会话，保留旧会话
 /clear  仅清理屏幕，保留历史
@@ -37,13 +38,33 @@ def safe_error(error: object) -> str:
     return text
 
 
-def terminal_command(ops: Operations, text: str) -> CommandResult:
+async def terminal_command(ops: Operations, text: str) -> CommandResult:
     words = shlex.split(text)
     name, *args = words or [""]
     if name == "/help" and not args:
         return CommandResult(text=HELP)
     if name == "/clear" and not args:
         return CommandResult("clear", "已清理屏幕；会话历史保留。")
+    if name == "/mcp":
+        if not args:
+            return CommandResult(
+                text="\n".join(
+                    f"{server.name}  {server.state}  {server.tool_count} 个工具"
+                    + (f" · {server.error}" if server.error else "")
+                    for server in ops.mcp_status()
+                )
+                or "尚未配置 MCP Server。"
+            )
+        if len(args) == 2 and args[0] == "reconnect":
+            await ops.reconnect_mcp(args[1])
+            return CommandResult(text=f"MCP {args[1]} 已连接。")
+        if len(args) == 2 and args[0] == "disconnect":
+            await ops.disconnect_mcp(args[1])
+            return CommandResult(text=f"MCP {args[1]} 已断开。")
+        if len(args) == 2 and args[0] == "refresh":
+            await ops.refresh_mcp(args[1])
+            return CommandResult(text=f"MCP {args[1]} 工具目录已刷新。")
+        raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
     if ops.running:
         raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
     if name == "/new" and not args:
@@ -103,18 +124,23 @@ def terminal_command(ops: Operations, text: str) -> CommandResult:
                 ),
             )
         if args == ["all"]:
-            ops.set_tools(ops.all_tools)
+            ops.set_tools(ops.all_tools, keep_unavailable=True)
         elif args == ["none"]:
             ops.set_tools(())
         elif len(args) > 1 and args[0] in ("on", "off"):
-            if any(name not in ops.all_tools for name in args[1:]):
+            known = (
+                ops.all_tools
+                if args[0] == "on"
+                else (*ops.all_tools, *ops.enabled_tools)
+            )
+            if any(name not in known for name in args[1:]):
                 raise ValueError("包含未知工具。")
-            chosen = set(ops.enabled_tools)
             if args[0] == "on":
-                chosen.update(args[1:])
+                ops.set_tools(tuple(dict.fromkeys((*ops.enabled_tools, *args[1:]))))
             else:
-                chosen.difference_update(args[1:])
-            ops.set_tools(tuple(name for name in ops.all_tools if name in chosen))
+                ops.set_tools(
+                    tuple(tool for tool in ops.enabled_tools if tool not in args[1:])
+                )
         else:
             raise ValueError("用法：/tools all|none|on 工具名...|off 工具名...")
         return CommandResult(

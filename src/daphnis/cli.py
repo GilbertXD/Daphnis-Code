@@ -16,7 +16,7 @@ from .terminal_commands import safe_error, terminal_command
 
 async def execute(ops: Operations, prompt: str) -> int:
     if prompt.lstrip().startswith("/"):
-        print(terminal_command(ops, prompt).text)
+        print((await terminal_command(ops, prompt)).text)
         return 0
     result = await ops.send(prompt, stream=False)
     if result.status == TurnStatus.COMPLETED:
@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, help="新会话的工作目录，默认当前目录")
     parser.add_argument("--session", help="恢复已有会话 ID，使用其保存的工作区")
     parser.add_argument("--thinking", help="思考档位；default 为服务端默认")
-    parser.add_argument("--mcp-config", type=Path, help="显式加载一个本地 MCP stdio Server")
+    parser.add_argument("--mcp-config", type=Path, help="加载显式配置的 MCP Server")
     args = parser.parse_args()
     if args.session and args.workspace:
         parser.error("--session 使用已保存工作区，请勿同时指定 --workspace。")
@@ -57,7 +57,11 @@ def main() -> int:
     async def run():
         try:
             if args.mcp_config:
-                await ops.connect_mcp(*load_mcp_config(args.mcp_config))
+                for name, options in load_mcp_config(args.mcp_config).items():
+                    try:
+                        await ops.connect_mcp(name, **options)
+                    except (ValueError, TypeError, RuntimeError) as exc:
+                        print(f"MCP {name}: {safe_error(exc)}", file=sys.stderr)
             if args.session:
                 ops.restore_session(args.session)
             if args.thinking:

@@ -23,7 +23,7 @@ from .models import (
 )
 from .models.models import validate_catalog
 from .session import Session
-from .tools import ApprovalRequest, create_tools
+from .tools import ApprovalRequest, ToolExecutor, create_tools
 from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,7 @@ class Application:
         self._pending_approval: ApprovalRequest | None = None
         self._mcp: dict[str, MCPConnection] = {}
         self._mcp_lock = asyncio.Lock()
+        self._mcp_pending: set[MCPConnection] = set()
         self._tools = create_tools(approval=self._request_approval)
         model = self._model_for(provider, model_id)
         self._session = Session(
@@ -125,34 +126,110 @@ class Application:
 
     @property
     def _all_tools(self) -> tuple[str, ...]:
-        return tuple(item["function"]["name"] for item in self._tools.definitions())
+        offline = tuple(
+            server.prefix for server in self._mcp.values() if server.state != "Connected"
+        )
+        return tuple(
+            name
+            for item in self._tools.definitions()
+            if not (name := item["function"]["name"]).startswith(offline)
+        )
+
+    async def _mcp_error(self, name: str, error: str) -> None:
+        await self.events.emit(
+            "mcp.error", session_id=self._session.id, turn_id="", server=name, error=error
+        )
+
+    def _mcp_catalog(self, connecting: MCPConnection | None = None) -> ToolExecutor:
+        return create_tools(
+            approval=self._request_approval,
+            connections=(
+                server for server in self._mcp.values()
+                if server is connecting or server.state == "Connected"
+            ),
+        )
 
     async def _connect_mcp(self, connection: MCPConnection) -> None:
         self._ensure_idle()
         async with self._mcp_lock:
-            if connection.name in self._mcp:
+            previous = self._mcp.get(connection.name)
+            if previous and previous.state == "Connected":
                 raise ValueError(f"MCP Server {connection.name!r} 已连接。")
-            await connection.start()
+            if previous:
+                await previous.aclose()
+            self._mcp[connection.name] = connection
+            discovered = await connection.start(self._mcp_error, self._mcp_tools_changed)
             try:
                 self._ensure_open()
-                tools = create_tools(
-                    approval=self._request_approval,
-                    connections=(*self._mcp.values(), connection),
-                )
-            except BaseException:
+                connection.tools = discovered
+                tools = self._mcp_catalog(connecting=connection)
+            except Exception:  # noqa: BLE001 - SDK catalogue errors must not disclose server data.
                 await connection.aclose()
-                raise
-            self._mcp[connection.name] = connection
+                if not self._closed:
+                    connection.state = "Error"
+                    connection.error = "无法注册 MCP 工具定义。"
+                raise RuntimeError(connection.error or "Application 已关闭。") from None
+            connection.state = "Connected"
             self._tools = tools
 
     async def _disconnect_mcp(self, name: str) -> None:
         self._ensure_idle()
         async with self._mcp_lock:
-            connection = self._mcp.pop(name)
-            self._tools = create_tools(
-                approval=self._request_approval, connections=self._mcp.values()
-            )
+            connection = self._mcp[name]
             await connection.aclose()
+            self._tools = self._mcp_catalog()
+
+    async def _refresh_mcp(self, name: str) -> None:
+        self._ensure_idle()
+        async with self._mcp_lock:
+            connection = self._mcp.get(name)
+            if connection is None or connection.state != "Connected":
+                raise ValueError(f"MCP Server {name!r} 未连接。")
+            await self._refresh_mcp_catalog(connection)
+
+    async def _refresh_mcp_catalog(self, connection: MCPConnection) -> None:
+        previous = connection.tools
+        try:
+            discovered = await connection.discover()
+            self._ensure_open()
+            if connection.state != "Connected":
+                raise RuntimeError("MCP 连接不可用。")
+            connection.tools = discovered
+            self._tools = self._mcp_catalog()
+        except (Exception, asyncio.CancelledError) as exc:
+            connection.tools = previous
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise RuntimeError("MCP 工具刷新失败，已保留上次目录。") from None
+        await self.events.emit(
+            "mcp.tools_changed", session_id=self._session.id, turn_id="", server=connection.name
+        )
+
+    async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
+        self._mcp_pending.add(connection)
+        try:
+            while not self._closed and connection in self._mcp_pending:
+                async with self._mcp_lock:
+                    active = self._task if self._running else None
+                    if active is None:
+                        await self._refresh_pending_mcp()
+                        return
+                # Wait without adopting cancellation or failure from the Turn.
+                await asyncio.wait((active,))
+        finally:
+            self._mcp_pending.discard(connection)
+
+    async def _refresh_pending_mcp(self) -> None:
+        while self._mcp_pending and not self._closed:
+            connection = self._mcp_pending.pop()
+            if (
+                self._mcp.get(connection.name) is connection
+                and connection.state == "Connected"
+            ):
+                try:
+                    await self._refresh_mcp_catalog(connection)
+                except RuntimeError as exc:
+                    await self._mcp_error(connection.name, str(exc))
 
     async def _request_approval(self, request: ApprovalRequest) -> bool:
         if not self._interactive:
@@ -184,9 +261,14 @@ class Application:
 
     async def _run_turn(self, prompt: str, *, stream: bool = True) -> TurnResult:
         self._ensure_idle()
+        if self._mcp_pending:
+            async with self._mcp_lock:
+                await self._refresh_pending_mcp()
+                self._ensure_open()
         session = self._session
         thinking = session.thinking
-        enabled_tools = session.enabled_tools
+        available = set(self._all_tools)
+        enabled_tools = [name for name in session.enabled_tools if name in available]
         provider = session.provider
         custom_compatibility = (
             self._connection(provider).get("compatibility") is not None
@@ -196,7 +278,7 @@ class Application:
             provider=provider,
             catalog=self._catalog,
             custom_compatibility=custom_compatibility,
-            tools=self._tools.select(list(enabled_tools)),
+            tools=self._tools.select(enabled_tools),
             events=self.events,
             context=Context(
                 system_prompt=(

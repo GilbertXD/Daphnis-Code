@@ -1,17 +1,63 @@
-"""Local MCP tool discovery and calls over the SDK's stdio transport."""
+"""MCP tool discovery and calls over SDK transports."""
 
 import asyncio
+import os
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from hashlib import sha256
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Any
 
-from mcp import Client, StdioServerParameters
-from mcp.types import TextContent, Tool
+import httpx2
+from mcp import Client, StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.subscriptions import ToolsListChanged
+from mcp.types import (
+    EmptyResult,
+    PingRequest,
+    TextContent,
+    Tool,
+    ToolListChangedNotification,
+)
 
 TOOL_PREFIX = "mcp__"
 _CONNECT_TIMEOUT = 15
 _CALL_TIMEOUT = 30
+_HTTP_HEALTH_INTERVAL = 15
+_HTTP_HEALTH_TIMEOUT = 5
+
+
+@dataclass(frozen=True)
+class MCPStatus:
+    name: str
+    state: str
+    tool_count: int
+    error: str | None
+
+
+class _WatchedReadStream:
+    """Notify the owner when the SDK's receive stream reaches EOF."""
+
+    def __init__(self, stream, eof: asyncio.Event) -> None:
+        self._stream, self._eof = stream, eof
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    async def __aenter__(self):
+        await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        return await self._stream.__aexit__(*exc)
+
+    async def __aiter__(self):
+        async for message in self._stream:
+            yield message
+        self._eof.set()
 
 
 def _check_schema_references(value: Any) -> None:
@@ -30,98 +76,345 @@ def _check_schema_references(value: Any) -> None:
             _check_schema_references(item)
 
 
+def _http_url(value: str | None) -> httpx2.URL:
+    if not isinstance(value, str):
+        raise TypeError("MCP URL 必须是字符串。")
+    try:
+        url = httpx2.URL(value)
+    except (httpx2.InvalidURL, ValueError):
+        raise ValueError("MCP URL 无效。") from None
+    if not url.host or url.userinfo or url.fragment:
+        raise ValueError("MCP URL 需要主机名，且不能包含凭据或片段。")
+    if url.scheme == "http":
+        loopback = url.host == "localhost"
+        try:
+            loopback = loopback or ip_address(url.host).is_loopback
+        except ValueError:
+            pass
+        if loopback:
+            return url
+    if url.scheme != "https":
+        raise ValueError("MCP 远程地址需要 HTTPS，本机回环地址允许 HTTP。")
+    return url
+
+
 class MCPConnection:
-    def __init__(self, name: str, command: str, args: Sequence[str]) -> None:
+    def __init__(
+        self,
+        name: str,
+        command: str | None,
+        args: Sequence[str],
+        *,
+        cwd: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        transport: str = "stdio",
+        url: str | None = None,
+        auth: Mapping[str, str] | None = None,
+    ) -> None:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,20}", name):
             raise ValueError("MCP Server 名称须为 1–20 位字母、数字或连字符。")
-        if not isinstance(command, str) or not command.strip() or "\0" in command:
+        if transport not in ("stdio", "streamable_http"):
+            raise ValueError("MCP transport 须为 stdio 或 streamable_http。")
+        if transport == "stdio" and (
+            not isinstance(command, str) or not command.strip() or "\0" in command
+        ):
             raise ValueError("MCP command 必须是非空的可执行程序名。")
+        if transport == "stdio" and (url is not None or auth is not None):
+            raise ValueError("stdio 不使用 URL 或 HTTP 认证。")
+        if transport == "streamable_http" and (
+            command is not None or args or cwd is not None or env is not None
+        ):
+            raise ValueError("Streamable HTTP 不使用 command、args、cwd 或 env。")
         if not isinstance(args, (list, tuple)) or any(
             not isinstance(arg, str) or "\0" in arg for arg in args
         ):
             raise ValueError("MCP args 必须是字符串数组。")
+        if cwd is not None and not isinstance(cwd, (str, Path)):
+            raise TypeError("MCP cwd 必须是目录路径。")
+        if env is not None and (
+            not isinstance(env, Mapping)
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+                for key, value in env.items()
+            )
+        ):
+            raise ValueError("MCP env 必须将子进程变量名映射到本地变量名。")
         self.name = name
-        # The SDK inherits only its default OS allowlist; no application secrets are passed.
-        self._client = Client(StdioServerParameters(command=command, args=list(args)))
+        self.prefix = f"{TOOL_PREFIX}{name}__"
+        self._command, self._args, self._cwd = command, tuple(args), cwd
+        self._env = dict(env or {})
+        self._url = _http_url(url) if transport == "streamable_http" else None
+        if auth is not None and (
+            not isinstance(auth, Mapping)
+            or set(auth) != {"type", "env"}
+            or auth["type"] != "bearer"
+            or not isinstance(auth["env"], str)
+            or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", auth["env"])
+        ):
+            raise ValueError("MCP auth 只支持 bearer，env 须为本地变量名。")
+        self._bearer_env = auth["env"] if auth is not None else None
+        self._http_error: tuple[str, str] | None = None
+        self._client: Client | None = None
         self.tools: dict[str, Tool] = {}
+        self.state = "Disconnected"
+        self.error: str | None = None
         self._stop = asyncio.Event()
+        self._tools_changed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
-    async def start(self) -> None:
+    @property
+    def status(self) -> MCPStatus:
+        return MCPStatus(
+            self.name,
+            self.state,
+            len(self.tools) if self.state == "Connected" else 0,
+            self.error,
+        )
+
+    async def start(
+        self,
+        on_error: Callable[[str, str], Awaitable[None]],
+        on_tools_changed: Callable[["MCPConnection"], Awaitable[None]],
+    ) -> dict[str, Tool]:
+        self.state, self.error = "Connecting", None
+        self._http_error = None
+        self._stop.clear()
+        self._tools_changed.clear()
         ready = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(self._serve(ready), name=f"mcp:{self.name}")
+        task = asyncio.create_task(
+            self._serve(ready, on_error, on_tools_changed), name=f"mcp:{self.name}"
+        )
         self._task = task
-        connected = False
+        started = False
         try:
             async with asyncio.timeout(_CONNECT_TIMEOUT):
                 await asyncio.wait((ready, task), return_when=asyncio.FIRST_COMPLETED)
                 if task.done():
                     await task
-                    raise RuntimeError("MCP connection closed during startup.")
-            connected = True
-        except TimeoutError as exc:
-            raise TimeoutError(
-                f"MCP Server {self.name!r} 连接或发现工具超时。"
-            ) from exc
-        except ExceptionGroup as exc:
-            raise RuntimeError(
-                f"MCP Server {self.name!r} 无法连接或读取工具列表。"
-            ) from exc
+                    raise RuntimeError("MCP 连接在启动时关闭。")
+            started = True
+            return ready.result()
+        except asyncio.CancelledError:
+            self.state = "Disconnected"
+            raise
+        except TimeoutError:
+            self.error = "连接或发现工具超时。"
+        except Exception as exc:  # noqa: BLE001 - keep SDK and subprocess details out of errors.
+            self.error = (
+                str(exc)
+                if isinstance(exc, _MCPConfigError)
+                else "无法连接或读取工具列表。"
+            )
         finally:
-            if not connected:
+            if not started:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        if self._http_error:
+            self.error = self._http_error[1]
+        self.state = "Error"
+        raise RuntimeError(self.error)
 
-    async def _serve(self, ready: asyncio.Future[None]) -> None:
-        # The SDK enters and exits AnyIO cancel scopes in this same task.
-        async with self._client as client:
-            cursor = None
-            seen_cursors = set()
-            original_names = set()
-            prefix = f"{TOOL_PREFIX}{self.name}__"
-            while True:
-                page = await client.list_tools(cursor=cursor)
-                for tool in page.tools:
-                    _check_schema_references(tool.input_schema)
-                    alias = prefix + tool.name
-                    if (
-                        len(alias) > 64
-                        or tool.name.startswith("__")
-                        or not re.fullmatch(r"[A-Za-z0-9_-]+", tool.name)
-                    ):
-                        digest = sha256(tool.name.encode()).hexdigest()[:32]
-                        alias = prefix + "__" + digest
-                    if alias in self.tools or tool.name in original_names:
-                        raise ValueError(
-                            f"MCP Server {self.name!r} 返回了重复的工具名称。"
-                        )
-                    self.tools[alias] = tool
-                    original_names.add(tool.name)
-                cursor = page.next_cursor
-                if cursor is None:
-                    break
-                if cursor in seen_cursors:
-                    raise ValueError(f"MCP Server {self.name!r} 返回了重复的分页游标。")
-                seen_cursors.add(cursor)
-            ready.set_result(None)
+    def _stdio_parameters(self) -> StdioServerParameters:
+        if self._cwd is not None and not Path(self._cwd).is_dir():
+            raise _MCPConfigError("MCP 工作目录不存在。")
+        env = {}
+        for target, source in self._env.items():
+            value = os.getenv(source)
+            if not value:
+                raise _MCPConfigError(f"缺少 MCP 环境变量 {source}。")
+            env[target] = value
+        return StdioServerParameters(
+            command=self._command, args=list(self._args), cwd=self._cwd, env=env
+        )
+
+    @asynccontextmanager
+    async def _transport(self):
+        if self._url is None:
+            async with stdio_client(self._stdio_parameters()) as (read, write):
+                yield _WatchedReadStream(read, self._stop), write
+            return
+
+        token = None
+        if self._bearer_env is not None:
+            token = os.getenv(self._bearer_env)
+            if not token:
+                raise _MCPConfigError(f"缺少 MCP 环境变量 {self._bearer_env}。")
+            if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", token):
+                raise _MCPConfigError("MCP Bearer Token 格式无效。")
+
+        origin = (self._url.scheme, self._url.host, self._url.port)
+
+        async def authorize(request):
+            if (request.url.scheme, request.url.host, request.url.port) != origin:
+                raise httpx2.RequestError("MCP 跨来源请求已拦截。")
+            request.headers.pop("Authorization", None)
+            if token is not None:
+                request.headers["Authorization"] = f"Bearer {token}"
+
+        async def check_response(response):
+            status = response.status_code
+            if status in (401, 403):
+                self._http_error = (
+                    "mcp_auth_failed",
+                    f"MCP 认证失败（HTTP {status}）。",
+                )
+            elif response.is_redirect:
+                self._http_error = (
+                    "mcp_redirect",
+                    "MCP 地址发生重定向，请配置最终地址。",
+                )
+            else:
+                return
+            # Stop before the SDK can follow or log a server-controlled Location.
+            raise httpx2.RequestError(self._http_error[1])
+
+        async with (
+            httpx2.AsyncClient(
+                timeout=httpx2.Timeout(8, read=300),
+                trust_env=False,
+                event_hooks={"request": [authorize], "response": [check_response]},
+            ) as http,
+            streamable_http_client(str(self._url), http_client=http) as (read, write),
+        ):
+            yield _WatchedReadStream(read, self._stop), write
+
+    async def _wait_for_stop(self, client: Client) -> None:
+        if self._url is None:
             await self._stop.wait()
+            return
+        # Stateless HTTP has no persistent channel to report EOF while idle.
+        while not self._stop.is_set():
+            try:
+                async with asyncio.timeout(_HTTP_HEALTH_INTERVAL):
+                    await self._stop.wait()
+            except TimeoutError:
+                async with asyncio.timeout(_HTTP_HEALTH_TIMEOUT):
+                    if client.session.discover_result is not None:
+                        await client.session.send_discover(client.protocol_version)
+                    else:
+                        await client.session.send_request(PingRequest(), EmptyResult)
+
+    async def discover(self) -> dict[str, Tool]:
+        client = self._client
+        if client is None:
+            raise RuntimeError("MCP 连接不可用。")
+        async with asyncio.timeout(_CONNECT_TIMEOUT):
+            return await self._discover(client)
+
+    async def _discover(self, client: Client) -> dict[str, Tool]:
+        tools = {}
+        cursor = None
+        seen_cursors = set()
+        original_names = set()
+        while True:
+            page = await client.list_tools(cursor=cursor, cache_mode="bypass")
+            for tool in page.tools:
+                _check_schema_references(tool.input_schema)
+                alias = self.prefix + tool.name
+                if (
+                    len(alias) > 64
+                    or tool.name.startswith("__")
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+", tool.name)
+                ):
+                    alias = (
+                        self.prefix + "__" + sha256(tool.name.encode()).hexdigest()[:32]
+                    )
+                if alias in tools or tool.name in original_names:
+                    raise ValueError("MCP Server 返回了重复的工具名称。")
+                tools[alias] = tool
+                original_names.add(tool.name)
+            cursor = page.next_cursor
+            if cursor is None:
+                return tools
+            if cursor in seen_cursors:
+                raise ValueError("MCP Server 返回了重复的分页游标。")
+            seen_cursors.add(cursor)
+
+    async def _serve(
+        self,
+        ready: asyncio.Future[dict[str, Tool]],
+        on_error: Callable[[str, str], Awaitable[None]],
+        on_tools_changed: Callable[["MCPConnection"], Awaitable[None]],
+    ) -> None:
+        # The SDK enters and exits its cancel scopes in this same task.
+        try:
+            async with Client(
+                self._transport(), message_handler=self._on_message
+            ) as client:
+                self._client = client
+                ready.set_result(await self._discover(client))
+                watcher = asyncio.create_task(
+                    self._watch_tools(client, on_tools_changed)
+                )
+                try:
+                    await self._wait_for_stop(client)
+                finally:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+                if self.state != "Disconnected":
+                    raise ConnectionError("MCP transport closed.")
+        except Exception:
+            if not ready.done():
+                raise
+            if self.state != "Disconnected":
+                self.state = "Error"
+                self.error = (
+                    self._http_error[1]
+                    if self._http_error
+                    else "连接意外中断或无响应。"
+                )
+                await on_error(self.name, self.error)
+        finally:
+            self._client = None
+
+    async def _on_message(self, message) -> None:
+        if isinstance(message, ToolListChangedNotification):
+            self._tools_changed.set()
+
+    async def _watch_tools(
+        self, client: Client, on_changed: Callable[["MCPConnection"], Awaitable[None]]
+    ) -> None:
+        if client.session.discover_result is not None:
+            # Unsupported or interrupted subscriptions leave manual refresh available.
+            try:
+                async with asyncio.timeout(_CONNECT_TIMEOUT) as ack:
+                    async with client.listen(tools_list_changed=True) as subscription:
+                        ack.reschedule(None)
+                        if subscription.honored.tools_list_changed:
+                            async for event in subscription:
+                                if isinstance(event, ToolsListChanged):
+                                    await on_changed(self)
+            except Exception:  # noqa: BLE001 - subscriptions are optional SDK capabilities.
+                return
+        elif (tools := client.server_capabilities.tools) and tools.list_changed:
+            while True:
+                await self._tools_changed.wait()
+                self._tools_changed.clear()
+                await on_changed(self)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
+            client = self._client
+            if client is None:
+                raise RuntimeError("MCP connection is unavailable.")
             async with asyncio.timeout(_CALL_TIMEOUT):
-                result = await self._client.call_tool(name, arguments)
+                result = await client.session.call_tool(name, arguments)
         except TimeoutError:
             return {
                 "ok": False,
                 "error": {"code": "mcp_timeout", "message": "MCP 工具调用超时。"},
             }
         except Exception as exc:  # noqa: BLE001 - SDK protocol and transport failures are tool results.
+            code, message = self._http_error or (
+                "mcp_call_failed",
+                f"MCP 工具调用失败（{type(exc).__name__}）。",
+            )
             return {
                 "ok": False,
-                "error": {
-                    "code": "mcp_call_failed",
-                    "message": f"MCP 工具调用失败（{type(exc).__name__}）。",
-                },
+                "error": {"code": code, "message": message},
             }
         value: dict[str, Any] = {"ok": not result.is_error}
         text = [
@@ -141,10 +434,16 @@ class MCPConnection:
         return value
 
     async def aclose(self) -> None:
+        self.state, self.error = "Disconnected", None
         if self._task is not None:
             self._stop.set()
+            settled = asyncio.gather(self._task, return_exceptions=True)
             try:
-                await asyncio.shield(self._task)
+                await asyncio.shield(settled)
             except asyncio.CancelledError:
-                await asyncio.gather(asyncio.shield(self._task), return_exceptions=True)
+                await asyncio.shield(settled)
                 raise
+
+
+class _MCPConfigError(ValueError):
+    """Safe configuration diagnostics, with variable names but no values."""

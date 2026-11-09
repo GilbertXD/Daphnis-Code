@@ -30,12 +30,53 @@ def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:
     return provider, model_id, connections
 
 
-def load_mcp_config(path: Path) -> tuple[str, str, list[str]]:
-    """Read one explicitly selected local stdio server configuration."""
-    with path.open(encoding="utf-8") as source:
-        config = json.load(source)
-    if not isinstance(config, dict) or not {"name", "command"} <= config.keys():
-        raise ValueError("MCP 配置需要 name 和 command。")
-    if config.keys() - {"name", "command", "args"}:
-        raise ValueError("MCP 配置仅支持 name、command 和 args。")
-    return config["name"], config["command"], config.get("args", [])
+def _unique_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("MCP 配置包含重复的键。")
+        result[key] = value
+    return result
+
+
+def load_mcp_config(path: Path) -> dict[str, dict[str, Any]]:
+    """Read explicit server options. Relative cwd is based on the config file."""
+    try:
+        with path.open(encoding="utf-8") as source:
+            config = json.load(source, object_pairs_hook=_unique_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"MCP 配置不是有效 JSON（第 {exc.lineno} 行）。") from None
+    if not isinstance(config, dict) or config.keys() != {"servers"}:
+        raise ValueError("MCP 配置需要一个 servers 对象。")
+    servers = config["servers"]
+    if not isinstance(servers, dict):
+        raise TypeError("MCP servers 必须是以名称为键的对象。")
+    for name, options in servers.items():
+        if not isinstance(options, dict):
+            raise TypeError(f"MCP Server {name!r} 的配置必须是对象。")
+        match options.get("transport"):
+            case "stdio":
+                if "command" not in options or options.keys() - {
+                    "transport",
+                    "command",
+                    "args",
+                    "cwd",
+                    "env",
+                }:
+                    raise ValueError(f"MCP Server {name!r} 需要有效的 stdio 配置。")
+                if isinstance(options.get("cwd"), str) and options["cwd"]:
+                    options["cwd"] = path.resolve().parent / options["cwd"]
+            case "streamable_http":
+                if "url" not in options or options.keys() - {
+                    "transport",
+                    "url",
+                    "auth",
+                }:
+                    raise ValueError(
+                        f"MCP Server {name!r} 需要有效的 Streamable HTTP 配置。"
+                    )
+            case _:
+                raise ValueError(
+                    f"MCP Server {name!r} 的 transport 须为 stdio 或 streamable_http。"
+                )
+    return servers

@@ -1,7 +1,7 @@
 """Textual terminal presentation over Operations and EventBus."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +207,8 @@ class DaphnisApp(App[None]):
             "tool.finished",
             "tool.approval_requested",
             "tool.blocked",
+            "mcp.error",
+            "mcp.tools_changed",
         ):
             self._subscriptions.append(self.events.on(name, self._forward))
         messages = self.ops.message_snapshot()
@@ -254,7 +256,7 @@ class DaphnisApp(App[None]):
             ops.session_usage,
             model_id=session.model_id,
             thinking=ops.thinking,
-            tools=len(ops.enabled_tools),
+            tools=len(ops.effective_tools),
         )
         for picker in self.query(ModelPicker):
             picker.disabled = busy
@@ -263,6 +265,13 @@ class DaphnisApp(App[None]):
         if self._shutting_down:
             return
         event = message.event
+        if event.name == "mcp.error":
+            self.notify(f"MCP {event.data['server']} · {event.data['error']}", severity="error")
+            self.update_status()
+            return
+        if event.name == "mcp.tools_changed":
+            self.update_status()
+            return
         await self.query_one(ChatView).event(event)
         if event.name == "tool.approval_requested":
             request = self.ops.pending_approval
@@ -346,9 +355,13 @@ class DaphnisApp(App[None]):
     async def _command(self, text: str) -> None:
         await self._perform_command(lambda: terminal_command(self.ops, text))
 
-    async def _perform_command(self, action: Callable[[], CommandResult]) -> None:
+    async def _perform_command(
+        self, action: Callable[[], CommandResult | Awaitable[CommandResult]]
+    ) -> None:
         try:
             result = action()
+            if not isinstance(result, CommandResult):
+                result = await result
             chat = self.query_one(ChatView)
             show_text = True
             if result.action == "clear":
@@ -424,7 +437,7 @@ class DaphnisApp(App[None]):
     def _tools_selected(self, value) -> None:
         if value is not None:
             try:
-                self.ops.set_tools(value)
+                self.ops.set_tools(value, keep_unavailable=True)
                 self.update_status()
             except Exception as exc:
                 self.notify(safe_error(exc), severity="error")

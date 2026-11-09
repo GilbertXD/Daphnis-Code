@@ -18,11 +18,15 @@ schema = {
 }
 tools = {
     name: Tool(name=name, description="Add two integers.", input_schema=schema)
-    for name in ("add", "math.add")
+    for name in ("add", "math.add", "sum")
 }
 
 
 async def list_tools(ctx, params):
+    if (root / "invalid").exists():
+        return ListToolsResult(tools=[tools["add"]], next_cursor="invalid")
+    if (root / "changed").exists():
+        return ListToolsResult(tools=[tools["sum"]])
     if params and params.cursor == "second":
         return ListToolsResult(tools=[tools["math.add"]])
     return ListToolsResult(tools=[tools["add"]], next_cursor="second")

@@ -1,12 +1,14 @@
 """Public business operations and read-only views of an Application."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .mcp import MCPConnection
+from saturnus import ValidationError
+
+from .mcp import MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .session import Session
 
@@ -58,6 +60,11 @@ class Operations:
     @property
     def enabled_tools(self) -> tuple[str, ...]:
         return self._app._session.enabled_tools
+
+    @property
+    def effective_tools(self) -> tuple[str, ...]:
+        available = set(self.all_tools)
+        return tuple(name for name in self.enabled_tools if name in available)
 
     @property
     def running(self) -> bool:
@@ -120,8 +127,22 @@ class Operations:
         if mode is not None and mode not in (model.thinking_modes or ()):
             raise CapabilityError(f"该模型不支持思考档位 {mode!r}，或能力尚未确认。")
 
-    def _validate_tools(self, model: ModelInfo, names: tuple[str, ...]) -> None:
-        self._app._tools.select(list(names))  # Saturnus validates names and duplicates.
+    def _validate_tools(
+        self,
+        model: ModelInfo,
+        names: tuple[str, ...],
+        *,
+        retained: tuple[str, ...] = (),
+    ) -> None:
+        available = set(self.all_tools)
+        for name in names:
+            if not isinstance(name, str) or (
+                name not in available and name not in retained
+            ):
+                raise ValidationError(
+                    f"Tool {name!r} is not registered or currently available."
+                )
+        self._app._tools.select([name for name in names if name in available])
         if names:
             require_tools(model)
 
@@ -133,30 +154,70 @@ class Operations:
         app._save_session(updated)
         app._session = updated
 
-    def set_tools(self, names: Sequence[str]) -> None:
+    def set_tools(
+        self, names: Sequence[str], *, keep_unavailable: bool = False
+    ) -> None:
         app = self._app
         app._ensure_idle()
         if isinstance(names, (str, bytes)):
             raise TypeError("names must be a sequence of tool names.")
         selected = tuple(names)
-        self._validate_tools(self.model, selected)
+        if keep_unavailable:
+            available = set(self.all_tools)
+            selected += tuple(
+                name
+                for name in self.enabled_tools
+                if name not in available and name not in selected
+            )
+        self._validate_tools(self.model, selected, retained=self.enabled_tools)
         updated = replace(app._session, enabled_tools=selected)
         app._save_session(updated)
         app._session = updated
 
     async def connect_mcp(
-        self, name: str, command: str, args: Sequence[str] = ()
+        self,
+        name: str,
+        command: str | None = None,
+        args: Sequence[str] = (),
+        *,
+        cwd: str | Path | None = None,
+        env: Mapping[str, str] | None = None,
+        transport: str = "stdio",
+        url: str | None = None,
+        auth: Mapping[str, str] | None = None,
     ) -> None:
-        """Start an explicitly configured stdio server. Tools remain disabled."""
-        await self._app._connect_mcp(MCPConnection(name, command, args))
+        """Connect an explicitly configured server. New tools remain disabled."""
+        await self._app._connect_mcp(
+            MCPConnection(
+                name,
+                command,
+                args,
+                cwd=cwd,
+                env=env,
+                transport=transport,
+                url=url,
+                auth=auth,
+            )
+        )
+
+    async def reconnect_mcp(self, name: str) -> None:
+        connection = self._app._mcp.get(name)
+        if connection is None:
+            raise ValueError(f"未知 MCP Server {name!r}。")
+        await self._app._connect_mcp(connection)
+
+    async def refresh_mcp(self, name: str) -> None:
+        await self._app._refresh_mcp(name)
 
     async def disconnect_mcp(self, name: str) -> None:
         app = self._app
         app._ensure_idle()
         if name not in app._mcp:
             raise ValueError(f"MCP Server {name!r} 未连接。")
-        available = app._mcp[name].tools
-        enabled = tuple(tool for tool in self.enabled_tools if tool not in available)
+        prefix = app._mcp[name].prefix
+        enabled = tuple(
+            tool for tool in self.enabled_tools if not tool.startswith(prefix)
+        )
         if enabled != self.enabled_tools:
             self.set_tools(enabled)
         await app._disconnect_mcp(name)
@@ -164,8 +225,16 @@ class Operations:
     def list_mcp_servers(self) -> tuple[str, ...]:
         return tuple(self._app._mcp)
 
+    def mcp_status(self) -> tuple[MCPStatus, ...]:
+        return tuple(server.status for server in self._app._mcp.values())
+
     def list_mcp_tools(self) -> tuple[str, ...]:
-        return tuple(tool for server in self._app._mcp.values() for tool in server.tools)
+        return tuple(
+            tool
+            for server in self._app._mcp.values()
+            if server.state == "Connected"
+            for tool in server.tools
+        )
 
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()

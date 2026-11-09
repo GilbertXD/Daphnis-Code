@@ -80,16 +80,28 @@ finally:
 默认情况下，需要审批的工具操作会被拒绝。只有客户端能展示审批请求并调用
 `ops.resolve_approval(...)` 时，才应以 `interactive=True` 构造 Application。
 
-### 本地 MCP 工具
+### MCP 工具
 
-用 `--mcp-config` 指定一个本地 stdio Server 的 JSON 文件。只配置你信任的程序，
-因为它会以当前用户的权限启动。
+用 `--mcp-config` 显式指定要连接的服务。只配置你信任的 stdio 程序，它们会以
+当前用户的权限启动。配置示例中的 `env` 将子进程变量名映射到本地变量名，
+相对 `cwd` 以配置文件所在目录为准。
 
 ```json
 {
-  "name": "demo",
-  "command": "/absolute/path/to/python",
-  "args": ["/absolute/path/to/server.py"]
+  "servers": {
+    "demo": {
+      "transport": "stdio",
+      "command": "python",
+      "args": ["server.py"],
+      "cwd": "./examples",
+      "env": {"SERVICE_API_KEY": "LOCAL_SERVICE_KEY"}
+    },
+    "remote": {
+      "transport": "streamable_http",
+      "url": "https://example.com/mcp",
+      "auth": {"type": "bearer", "env": "REMOTE_MCP_TOKEN"}
+    }
+  }
 }
 ```
 
@@ -97,11 +109,18 @@ finally:
 uv run daphnis --mcp-config ./mcp.json
 ```
 
-连接后，`/tools` 会列出 `mcp__demo__add` 等工具。勾选后才能提供给模型，每次调用
-仍需确认。恢复启用了 MCP 工具的会话时，使用同一配置启动，保留 Server 名称。
-工具结果支持文本和结构化数据。
+HTTP 服务使用最终端点地址，远程连接要求 HTTPS，本机回环地址可用 HTTP。
+`auth` 可省略，需要认证时使用从指定环境变量读取的 Bearer Token。
 
-Python 客户端可用 `await ops.connect_mcp(name, command, args)` 连接，通过
-`ops.list_mcp_servers()` 和 `ops.list_mcp_tools()` 查看发现结果，再用
-`ops.set_tools(...)` 启用。显式断开会保存当前会话更新后的工具选择。关闭
-Application 时会释放 Server 进程。
+`/mcp` 显示服务状态、可用工具数和错误信息。用 `/mcp reconnect <名称>` 手动重连，
+`/mcp disconnect <名称>` 主动断开，`/mcp refresh <名称>` 刷新工具目录。
+服务支持工具变更通知时，目录会自动刷新，运行中的 Turn 继续使用开始时的快照。
+
+用 `/tools` 启用工具，每次 MCP 调用仍需审批。掉线和目录变化会保留会话偏好，
+新 Turn 只提供已启用且当前可用的工具。主动断开会清除当前会话中该服务的工具选择。
+恢复使用 MCP 工具的会话前，先连接对应的服务。工具结果支持文本和结构化数据。
+
+Python 客户端可调用 `ops.connect_mcp(...)`、`ops.mcp_status()`、
+`ops.reconnect_mcp(name)`、`ops.disconnect_mcp(name)` 和 `ops.refresh_mcp(name)`。
+`ops.all_tools`、`ops.enabled_tools` 和 `ops.effective_tools` 分别表示可用工具、
+会话启用偏好，以及当前可提供给下一轮的工具。
