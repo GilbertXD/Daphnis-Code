@@ -9,11 +9,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from saturnus import ValidationError
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
 from daphnis.mcp import MCPConnection
+from daphnis.tools import ApprovalDecision
 
 DEMO = Path(__file__).with_name("mcp_demo_server.py").resolve()
 
@@ -117,14 +117,16 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             ops = Operations(app)
             log = root / "calls"
 
-            async def approve(call_id, approved=True, *, server="demo"):
+            async def approve(
+                call_id, decision=ApprovalDecision.ALLOW_ONCE, *, server="demo"
+            ):
                 async with asyncio.timeout(5):
                     event = await requests.get()
                 pending = ops.pending_approval
                 self.assertEqual(event.data["tool_call_id"], call_id)
                 self.assertEqual(pending.details["server"], server)
                 self.assertTrue(
-                    ops.resolve_approval(pending.turn_id, call_id, approved)
+                    ops.resolve_approval(pending.turn_id, call_id, decision)
                 )
                 return pending.details
 
@@ -136,20 +138,21 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 add, special = ops.list_mcp_tools()
                 self.assertEqual(add, "mcp__demo__add")
                 self.assertRegex(special, r"^mcp__demo____[0-9a-f]{32}$")
-                self.assertNotIn(add, ops.enabled_tools)
+                self.assertTrue({add, special}.issubset(ops.enabled_tools))
                 self.assertEqual(ops.list_mcp_servers(), ("demo",))
                 ops.set_tools(("list_directory", add, special))
                 saved = ops.session.id
                 calls[:] = [
                     tool_call("list_directory", "builtin"),
                     tool_call(add, "approved", a=12, b=30),
+                    tool_call(add, "trusted", a=1, b=2),
                     tool_call(special, "denied", a=5, b=9),
                     tool_call(special, "error", a=-2, b=0),
                 ]
                 send = asyncio.create_task(ops.send("exercise", stream=False))
-                details = await approve("approved")
+                details = await approve("approved", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual(details["arguments"], {"a": 12, "b": 30})
-                await approve("denied", False)
+                await approve("denied", ApprovalDecision.DENY)
                 details = await approve("error")
                 self.assertEqual(details["tool"], "math.add")
                 self.assertEqual(
@@ -159,10 +162,12 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(outcomes[0]["ok"])
                 self.assertEqual(outcomes[1]["structured_content"], {"sum": 42})
                 self.assertEqual(outcomes[1]["text"], "42")
-                self.assertEqual(outcomes[2]["error"]["code"], "permission_denied")
-                self.assertEqual(outcomes[3]["error"]["code"], "mcp_tool_error")
+                self.assertEqual(outcomes[2]["structured_content"], {"sum": 3})
+                self.assertEqual(outcomes[3]["error"]["code"], "permission_denied")
+                self.assertEqual(outcomes[4]["error"]["code"], "mcp_tool_error")
                 self.assertEqual(
-                    log.read_text().splitlines(), ["add 12 30", "math.add -2 0"]
+                    log.read_text().splitlines(),
+                    ["add 12 30", "add 1 2", "math.add -2 0"],
                 )
 
                 ops.new_session()
@@ -187,18 +192,45 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await send
                 pid = int((root / "pid").read_text())
+                ops.set_tools(("list_directory", add))
+                snapshot = app._tools.select([add]).bind(
+                    session=app._session, events=app.events, turn_id="old-turn"
+                )
                 await ops.disconnect_mcp("demo")
                 self.assertNotIn(add, ops.all_tools)
-                self.assertEqual(ops.enabled_tools, ("list_directory",))
-                with self.assertRaisesRegex(ValidationError, "not registered"):
-                    ops.restore_session(saved)
+                self.assertIn(add, ops.enabled_tools)
+                self.assertEqual(ops.effective_tools, ("list_directory",))
+                offline = await snapshot.execute(tool_call(add, "offline", a=1, b=2))
+                self.assertEqual(offline.value["error"]["code"], "mcp_unavailable")
                 if os.name == "posix":
                     with self.assertRaises(ProcessLookupError):
                         os.kill(pid, 0)
 
                 await ops.reconnect_mcp("demo")
+                self.assertIn(add, ops.effective_tools)
+                self.assertNotIn(special, ops.effective_tools)
+                await ops.disconnect_mcp("demo")
                 ops.restore_session(saved)
                 self.assertIn(add, ops.enabled_tools)
+                self.assertNotIn(add, ops.effective_tools)
+                await ops.reconnect_mcp("demo")
+                calls[:] = [tool_call(add, "reconnected", a=2, b=3)]
+                send = asyncio.create_task(ops.send("reconnected", stream=False))
+                await approve("reconnected", ApprovalDecision.TRUST_SESSION)
+                self.assertEqual(
+                    (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
+                )
+                self.assertEqual(outcomes[-1]["structured_content"], {"sum": 5})
+                (root / "changed").touch()
+                await ops.refresh_mcp("demo")
+                (root / "changed").unlink()
+                await ops.refresh_mcp("demo")
+                calls[:] = [tool_call(add, "definition-changed", a=4, b=5)]
+                send = asyncio.create_task(ops.send("changed", stream=False))
+                await approve("definition-changed")
+                self.assertEqual(
+                    (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
+                )
                 pid = int((root / "pid").read_text())
                 backup_dir = root / "backup"
                 backup_dir.mkdir()
@@ -207,6 +239,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 )
                 backup = "mcp__backup__add"
                 backup_pid = int((backup_dir / "pid").read_text())
+                self.assertNotIn(backup, ops.enabled_tools)
                 ops.set_tools((*ops.enabled_tools, backup))
                 with self.assertRaisesRegex(RuntimeError, "MCP_MISSING_TEST_KEY"):
                     await ops.connect_mcp(
@@ -373,7 +406,9 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             async def approve(event):
                 pending = ops.pending_approval
                 self.assertEqual(pending.details["server"], "remote")
-                ops.resolve_approval(pending.turn_id, pending.tool_call_id, True)
+                ops.resolve_approval(
+                    pending.turn_id, pending.tool_call_id, ApprovalDecision.ALLOW_ONCE
+                )
 
             app.events.on("tool.approval_requested", approve)
             address = f"http://127.0.0.1:{port}"

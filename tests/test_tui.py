@@ -196,8 +196,12 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await until(pilot, lambda: not ui._sending)
                 self.assertEqual(target.read_text(), "new\n")
                 committed = ops.message_snapshot()
+                await submit(ui, pilot, "/approval ask")
+                await until(pilot, lambda: ops.approval_mode == "ask")
                 await submit(ui, pilot, "wait then cancel")
                 await until(pilot, lambda: isinstance(ui.screen, ApprovalScreen))
+                self.assertFalse(ops.pending_approval.can_trust)
+                self.assertFalse(ui.screen.query("#approval-trust"))
                 await pilot.press("ctrl+c")
                 await until(
                     pilot,

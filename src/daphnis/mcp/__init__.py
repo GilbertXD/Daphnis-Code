@@ -170,18 +170,25 @@ class MCPConnection:
         return MCPStatus(
             self.name,
             self.state,
-            len(self.tools) if self.state == "Connected" else 0,
+            len(self.tools) if self.available else 0,
             self.error,
         )
 
-    def _can_publish(self) -> bool:
+    @property
+    def _live(self) -> bool:
         return (
-            self.state == "Connecting"
-            and self._task is not None
+            self._task is not None
             and not self._task.done()
             and self._client is not None
             and not self._stop.is_set()
         )
+
+    @property
+    def available(self) -> bool:
+        return self.state == "Connected" and self._live
+
+    def _can_publish(self) -> bool:
+        return self.state == "Connecting" and self._live
 
     async def start(
         self,
@@ -361,6 +368,7 @@ class MCPConnection:
                 try:
                     await self._wait_for_stop(client)
                 finally:
+                    self._stop.set()
                     watcher.cancel()
                     await asyncio.gather(watcher, return_exceptions=True)
                 if self.state != "Disconnected":
@@ -405,10 +413,13 @@ class MCPConnection:
                 await on_changed(self)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        client = self._client
+        if not self.available or client is None:
+            return {
+                "ok": False,
+                "error": {"code": "mcp_unavailable", "message": "MCP 连接不可用。"},
+            }
         try:
-            client = self._client
-            if client is None:
-                raise RuntimeError("MCP connection is unavailable.")
             async with asyncio.timeout(_CALL_TIMEOUT):
                 result = await client.session.call_tool(name, arguments)
         except TimeoutError:

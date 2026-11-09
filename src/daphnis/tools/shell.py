@@ -174,7 +174,7 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
                 "command_blocked",
                 "Executable identity is not supported; manual handling is required.",
             )
-    targets = [cwd, executable]
+    targets = [cwd]
     if INTERPRETER.fullmatch(program):
         index = 1
         while index < len(argv):
@@ -192,13 +192,14 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
     if paths is not None:
         targets.extend(Target.capture(path, cwd.path) for path in paths)
     decision = Decision.ASK
-    if paths is not None and trusted_read_program(executable.path):
+    inspected_read = paths is not None and trusted_read_program(executable.path)
+    if inspected_read:
         # The system executable itself is expected outside the workspace.
-        decision = path_decision(workspace, (cwd, *targets[2:]))
+        decision = path_decision(workspace, tuple(targets))
     invocation = (str(executable.path), *argv[1:])
 
     async def run():
-        for target in targets:
+        for target in (executable, *targets):
             target.verify()
         return await _run(
             invocation,
@@ -210,6 +211,7 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
     return Operation(
         decision,
         "Execute inspected argv; scripts/builds/uncertain effects need approval.",
+        # The executable is verified in run(), but isn't a data access target.
         tuple(targets),
         {
             "argv": list(invocation),
@@ -217,4 +219,6 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
             "timeout": arguments.get("timeout", 30.0),
         },
         run,
+        # Uninspected commands can read or write outside cwd via args or code.
+        force_approval=not inspected_read,
     )

@@ -5,6 +5,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from .agent import Agent, TurnResult, TurnStatus
 from .context import Context
 from .events import EventBus
 from .history import History
-from .mcp import MCPConnection
+from .mcp import TOOL_PREFIX, MCPConnection
 from .models import (
     MODELS,
     ModelInfo,
@@ -23,7 +24,13 @@ from .models import (
 )
 from .models.models import validate_catalog
 from .session import Session
-from .tools import ApprovalRequest, ToolExecutor, create_tools
+from .tools import (
+    ApprovalDecision,
+    ApprovalMode,
+    ApprovalRequest,
+    ToolExecutor,
+    create_tools,
+)
 from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -64,12 +71,15 @@ class Application:
         self._history = history if history is not None else History()
         self._interactive = interactive
         self._task: asyncio.Task[TurnResult] | None = None
-        self._approval: asyncio.Future[bool] | None = None
+        self._approval_mode = ApprovalMode.AUTO
+        self._approval: asyncio.Future[ApprovalDecision] | None = None
         self._pending_approval: ApprovalRequest | None = None
+        self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
         self._mcp_lock = asyncio.Lock()
         self._mcp_pending: set[MCPConnection] = set()
-        self._tools = create_tools(approval=self._request_approval)
+        self._tools = self._mcp_catalog()
+        self._use_saved_tool_preferences = False
         model = self._model_for(provider, model_id)
         self._session = Session(
             workspace=workspace,
@@ -127,7 +137,7 @@ class Application:
     @property
     def _all_tools(self) -> tuple[str, ...]:
         offline = tuple(
-            server.prefix for server in self._mcp.values() if server.state != "Connected"
+            server.prefix for server in self._mcp.values() if not server.available
         )
         return tuple(
             name
@@ -136,6 +146,7 @@ class Application:
         )
 
     async def _mcp_error(self, name: str, error: str) -> None:
+        self._revoke_mcp_trust(name)
         await self.events.emit(
             "mcp.error", session_id=self._session.id, turn_id="", server=name, error=error
         )
@@ -143,10 +154,22 @@ class Application:
     def _mcp_catalog(self, connecting: MCPConnection | None = None) -> ToolExecutor:
         return create_tools(
             approval=self._request_approval,
+            trusted=self._trusted_tools,
             connections=(
-                server for server in self._mcp.values()
-                if server is connecting or server.state == "Connected"
+                server
+                for server in self._mcp.values()
+                if server is connecting or server.available
             ),
+        )
+
+    def _revoke_mcp_trust(self, server: str, changed: set[str] | None = None) -> None:
+        prefix = f"{TOOL_PREFIX}{server}__"
+        self._trusted_tools.difference_update(
+            {
+                key
+                for key in self._trusted_tools
+                if key[1].startswith(prefix) and (changed is None or key[1] in changed)
+            }
         )
 
     async def _connect_mcp(self, connection: MCPConnection) -> None:
@@ -155,6 +178,7 @@ class Application:
             previous = self._mcp.get(connection.name)
             if previous and previous.state == "Connected":
                 raise ValueError(f"MCP Server {connection.name!r} 已连接。")
+            self._revoke_mcp_trust(connection.name)
             if previous:
                 await previous.aclose()
             self._mcp[connection.name] = connection
@@ -168,10 +192,27 @@ class Application:
                 error = "无法注册 MCP 工具定义。"
             else:
                 if connection._can_publish():
-                    connection.state = "Connected"
-                    self._tools = tools
-                    return
-                error = connection.error or "MCP 连接在发布前已中断。"
+                    try:
+                        if (
+                            previous is None
+                            and discovered
+                            and not self._use_saved_tool_preferences
+                            and self._model.supports_tools is True
+                        ):
+                            session = replace(
+                                self._session,
+                                enabled_tools=(*self._session.enabled_tools, *discovered),
+                            )
+                            self._save_session(session)
+                            self._session = session
+                    except (OSError, TypeError, ValueError):
+                        error = "无法保存 MCP 工具启用偏好。"
+                    else:
+                        connection.state = "Connected"
+                        self._tools = tools
+                        return
+                else:
+                    error = connection.error or "MCP 连接在发布前已中断。"
             connection.tools = previous_tools
             await connection.aclose()
             if self._closed:
@@ -183,6 +224,7 @@ class Application:
         self._ensure_idle()
         async with self._mcp_lock:
             connection = self._mcp[name]
+            self._revoke_mcp_trust(name)
             await connection.aclose()
             self._tools = self._mcp_catalog()
 
@@ -190,7 +232,7 @@ class Application:
         self._ensure_idle()
         async with self._mcp_lock:
             connection = self._mcp.get(name)
-            if connection is None or connection.state != "Connected":
+            if connection is None or not connection.available:
                 raise ValueError(f"MCP Server {name!r} 未连接。")
             await self._refresh_mcp_catalog(connection)
 
@@ -199,7 +241,7 @@ class Application:
         try:
             discovered = await connection.discover()
             self._ensure_open()
-            if connection.state != "Connected":
+            if not connection.available:
                 raise RuntimeError("MCP 连接不可用。")
             connection.tools = discovered
             self._tools = self._mcp_catalog()
@@ -207,12 +249,19 @@ class Application:
             connection.tools = previous
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            self._revoke_mcp_trust(connection.name)
             raise RuntimeError("MCP 工具刷新失败，已保留上次目录。") from None
+        self._revoke_mcp_trust(
+            connection.name,
+            {name for name in previous if previous[name] != discovered.get(name)},
+        )
         await self.events.emit(
             "mcp.tools_changed", session_id=self._session.id, turn_id="", server=connection.name
         )
 
     async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
+        # The active Turn keeps its definitions, but not its automatic authorization.
+        self._revoke_mcp_trust(connection.name)
         self._mcp_pending.add(connection)
         try:
             while not self._closed and connection in self._mcp_pending:
@@ -231,30 +280,44 @@ class Application:
             connection = self._mcp_pending.pop()
             if (
                 self._mcp.get(connection.name) is connection
-                and connection.state == "Connected"
+                and connection.available
             ):
                 try:
                     await self._refresh_mcp_catalog(connection)
                 except RuntimeError as exc:
                     await self._mcp_error(connection.name, str(exc))
 
-    async def _request_approval(self, request: ApprovalRequest) -> bool:
+    async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
-            return False
+            return ApprovalDecision.DENY
         if self._approval is not None:
             raise RuntimeError("已有待处理审批。")
         future = asyncio.get_running_loop().create_future()
         self._approval = future
         self._pending_approval = deepcopy(request)
         try:
-            return await future
+            decision = await future
+            if decision is ApprovalDecision.TRUST_SESSION:
+                if not request.can_trust:
+                    return ApprovalDecision.DENY
+                server = request.details.get("server")
+                connection = self._mcp.get(server)
+                if server is None or (
+                    connection is not None
+                    and connection.available
+                    and connection not in self._mcp_pending
+                ):
+                    self._trusted_tools.add((request.session_id, request.tool_name))
+            return decision
         finally:
             if not future.done():
                 future.cancel()
             self._pending_approval = None
             self._approval = None
 
-    def _resolve_approval(self, turn_id: str, tool_call_id: str, approved: bool) -> bool:
+    def _resolve_approval(
+        self, turn_id: str, tool_call_id: str, decision: ApprovalDecision
+    ) -> bool:
         pending = self._pending_approval
         if pending is None or (pending.turn_id, pending.tool_call_id) != (
             turn_id,
@@ -263,7 +326,7 @@ class Application:
             return False
         if self._approval is None or self._approval.done():
             return False
-        self._approval.set_result(approved is True)
+        self._approval.set_result(decision)
         return True
 
     async def _run_turn(self, prompt: str, *, stream: bool = True) -> TurnResult:
@@ -285,7 +348,7 @@ class Application:
             provider=provider,
             catalog=self._catalog,
             custom_compatibility=custom_compatibility,
-            tools=self._tools.select(enabled_tools),
+            tools=self._tools.select(enabled_tools, mode=self._approval_mode),
             events=self.events,
             context=Context(
                 system_prompt=(
@@ -361,6 +424,7 @@ class Application:
                         stack.push_async_callback(connection.aclose)
                     if self._mcp:
                         self._mcp.clear()
-                        self._tools = create_tools(approval=self._request_approval)
+                        self._tools = self._mcp_catalog()
+                self._trusted_tools.clear()
                 self._usage.close()
                 self.events.clear()

@@ -15,6 +15,8 @@ from ..mcp import MCPConnection
 from ..session import Session
 from .approval import (
     ApprovalCallback,
+    ApprovalDecision,
+    ApprovalMode,
     ApprovalRequest,
     CleanupError,
     Decision,
@@ -92,21 +94,29 @@ class ToolExecutor:
         approval: ApprovalCallback | None = None,
         binding: _Binding | None = None,
         mcp_tools: dict[str, tuple[MCPConnection, str]] | None = None,
+        mode: ApprovalMode = ApprovalMode.AUTO,
+        trusted: set[tuple[str, str]] | None = None,
     ) -> None:
         self._registry = registry
         self._approval = approval
         self._binding = binding
         self._mcp_tools = mcp_tools if mcp_tools is not None else {}
+        self._mode = mode
+        self._trusted = trusted if trusted is not None else set()
 
     def definitions(self) -> list[dict[str, Any]]:
         return self._registry.definitions()
 
-    def select(self, names: list[str]) -> "ToolExecutor":
+    def select(
+        self, names: list[str], *, mode: ApprovalMode | None = None
+    ) -> "ToolExecutor":
         return ToolExecutor(
             self._registry.select(names),
             approval=self._approval,
             binding=self._binding,
             mcp_tools=self._mcp_tools,
+            mode=self._mode if mode is None else mode,
+            trusted=self._trusted,
         )
 
     def bind(
@@ -122,6 +132,8 @@ class ToolExecutor:
             approval=self._approval,
             binding=_Binding(workspace, session.id, turn_id, events),
             mcp_tools=self._mcp_tools,
+            mode=self._mode,
+            trusted=self._trusted,
         )
 
     async def execute(self, call: dict[str, Any]) -> ToolResult:
@@ -153,6 +165,8 @@ class ToolExecutor:
         try:
             if name in self._mcp_tools:
                 connection, original_name = self._mcp_tools[name]
+                if not connection.available:
+                    raise ToolError("mcp_unavailable", "MCP 连接不可用。")
 
                 async def run():
                     return await connection.call(original_name, arguments)
@@ -170,7 +184,22 @@ class ToolExecutor:
                 )
             else:
                 operation = _PREPARERS[name](arguments, binding.workspace.path)
-            if operation.decision == Decision.ASK:
+            if operation.decision == Decision.DENY:
+                raise ToolError("command_blocked", operation.reason)
+            forced = operation.force_approval or any(
+                not target.path.is_relative_to(binding.workspace.path)
+                for target in operation.targets
+            )
+            can_trust = self._mode == ApprovalMode.AUTO and not forced
+            if (
+                forced
+                or self._mode == ApprovalMode.ASK
+                or (
+                    can_trust
+                    and operation.decision == Decision.ASK
+                    and (binding.session_id, name) not in self._trusted
+                )
+            ):
                 request = ApprovalRequest(
                     session_id=binding.session_id,
                     turn_id=binding.turn_id,
@@ -182,26 +211,27 @@ class ToolExecutor:
                         **operation.details,
                         "targets": [str(t.path) for t in operation.targets],
                     },
+                    can_trust=can_trust,
                 )
                 await binding.events.emit(
                     "tool.approval_requested", **fields, request=asdict(request)
                 )
-                approved = False
+                decision = ApprovalDecision.DENY
                 if self._approval is not None:
                     try:
-                        approved = await self._approval(deepcopy(request)) is True
+                        decision = await self._approval(deepcopy(request))
                     except Exception as exc:
                         raise ToolError(
                             "permission_denied",
                             f"Approval callback failed: {type(exc).__name__}",
                         ) from exc
-                if not approved:
+                if decision is not ApprovalDecision.ALLOW_ONCE and not (
+                    can_trust and decision is ApprovalDecision.TRUST_SESSION
+                ):
                     raise ToolError(
                         "permission_denied",
                         "Approval was refused or no approval callback is available.",
                     )
-            elif operation.decision == Decision.DENY:
-                raise ToolError("command_blocked", operation.reason)
             # The workspace may gain files, but must not be replaced or retargeted.
             current = Target.capture(
                 binding.workspace.requested, binding.workspace.path
@@ -240,6 +270,7 @@ def create_tools(
     *,
     approval: ApprovalCallback | None = None,
     connections: Iterable[MCPConnection] = (),
+    trusted: set[tuple[str, str]] | None = None,
 ) -> ToolExecutor:
     """Build the tool catalogue; use select() to choose the enabled subset."""
     registry = ToolRegistry()
@@ -330,4 +361,4 @@ def create_tools(
                 handler=_guarded_handler(name),
             )
             mcp_tools[name] = connection, tool.name
-    return ToolExecutor(registry, approval=approval, mcp_tools=mcp_tools)
+    return ToolExecutor(registry, approval=approval, mcp_tools=mcp_tools, trusted=trusted)

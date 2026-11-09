@@ -18,6 +18,18 @@ class Decision(StrEnum):
     DENY = "DENY"
 
 
+class ApprovalMode(StrEnum):
+    ASK = "ask"
+    AUTO = "auto"
+    FULL = "full"
+
+
+class ApprovalDecision(StrEnum):
+    DENY = "deny"
+    ALLOW_ONCE = "allow_once"
+    TRUST_SESSION = "trust_session"
+
+
 class ToolError(Exception):
     def __init__(self, code: str, message: str, **details: Any) -> None:
         super().__init__(message)
@@ -142,6 +154,7 @@ class Operation:
     targets: tuple[Target, ...]
     details: dict[str, Any]
     run: Callable[[], Awaitable[dict[str, Any]]]
+    force_approval: bool = False
 
     def verify(self) -> None:
         for target in self.targets:
@@ -157,9 +170,10 @@ class ApprovalRequest:
     workspace: str
     reason: str
     details: dict[str, Any]
+    can_trust: bool = False
 
 
-ApprovalCallback = Callable[[ApprovalRequest], Awaitable[bool]]
+ApprovalCallback = Callable[[ApprovalRequest], Awaitable[ApprovalDecision]]
 
 
 def path_decision(

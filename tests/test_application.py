@@ -387,10 +387,10 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                         pending.details.clear()
                         self.assertIn("targets", ops.pending_approval.details)
                         self.assertFalse(
-                            ops.resolve_approval("stale", pending.tool_call_id, True)
+                            ops.resolve_approval("stale", pending.tool_call_id, "allow_once")
                         )
                         self.assertFalse(
-                            ops.resolve_approval(pending.turn_id, "stale", True)
+                            ops.resolve_approval(pending.turn_id, "stale", "allow_once")
                         )
                         for change, args in (
                             (ops.new_session, ()),
@@ -398,6 +398,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                             (ops.set_model, ("deepseek", "plain")),
                             (ops.set_thinking, ("high",)),
                             (ops.set_tools, ((),)),
+                            (ops.set_approval_mode, ("full",)),
                         ):
                             with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
                                 change(*args)

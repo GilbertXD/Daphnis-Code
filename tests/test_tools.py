@@ -14,7 +14,7 @@ from saturnus import ChatClient, ToolCallValidationError
 
 from daphnis import Agent, EventBus, Session, TurnStatus
 from daphnis.models import ModelInfo
-from daphnis.tools import create_tools
+from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools
 
 
 def call(name, **arguments):
@@ -48,7 +48,7 @@ def bound(workspace, *, approval=None, names=None, events=None):
 
 
 async def approve(request):
-    return True
+    return ApprovalDecision.ALLOW_ONCE
 
 
 class ToolsTests(unittest.IsolatedAsyncioTestCase):
@@ -87,12 +87,24 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
 
             async def inspect(request):
                 requests.append(request)
-                return True
+                return ApprovalDecision.ALLOW_ONCE
 
             allowed = bound(workspace, approval=inspect)
             result = await allowed.execute(call("read_file", path="link.txt"))
             self.assertEqual(result.value["content"], "external")
             self.assertIn(str(external), requests[0].details["targets"])
+            read = call("read_file", path="hello.txt")
+            ask = tools.select(["read_file"], mode=ApprovalMode.ASK)
+            self.assertEqual(
+                (await ask.execute(read)).value["error"]["code"], "permission_denied"
+            )
+            full = allowed.select(["read_file"], mode=ApprovalMode.FULL)
+            self.assertTrue((await full.execute(read)).value["ok"])
+            self.assertEqual(len(requests), 1)
+            result = await full.execute(call("read_file", path="link.txt"))
+            self.assertTrue(result.value["ok"])
+            self.assertEqual(len(requests), 2)
+            self.assertFalse(requests[-1].can_trust)
             # Resolve symlink/.. in filesystem order, not by lexical abspath first.
             (base / "external-dir").mkdir()
             (workspace / "jump").symlink_to(
@@ -151,7 +163,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
 
             async def race(request):
                 a.write_text("someone else's change\n")
-                return True
+                return ApprovalDecision.ALLOW_ONCE
 
             result = await bound(workspace, approval=race).execute(
                 call("apply_patch", patch=valid)
@@ -201,8 +213,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             workspace = Path(temporary).resolve()
             alias = workspace / "innocent-name"
             alias.symlink_to(shutil.which("rm"))
-            callback = AsyncMock(return_value=True)
-            tools = bound(workspace, approval=callback)
+            callback = AsyncMock(return_value=ApprovalDecision.ALLOW_ONCE)
+            tools = bound(workspace, approval=callback).select(
+                ["run_command"], mode=ApprovalMode.FULL
+            )
             vectors = [
                 ["rm", "-rf", "."],
                 ["rm", "-fr", "."],
@@ -328,7 +342,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 approvals.append(request)
                 self.assertEqual(request.tool_name, "apply_patch")
                 self.assertEqual((workspace / "result.txt").read_text(), "created\n")
-                return True
+                return ApprovalDecision.ALLOW_ONCE
 
             steps = [
                 call("read_file", path="input.txt"),

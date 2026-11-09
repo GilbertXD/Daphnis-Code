@@ -53,18 +53,17 @@ asyncio.run(main())
 | --- | --- |
 | 模型与工具 | `list_models()`（按厂商分组）、`configured(provider)`、`set_model(provider, model_id)`、`set_thinking(mode)`、`set_tools(names)` |
 | 会话 | `list_sessions()`、`new_session()`、`restore_session(session_id)`、`message_snapshot()` |
-| 运行与审批 | `await send(prompt, stream=True)`、`await cancel()`、`resolve_approval(turn_id, tool_call_id, approved)`、`await close()` |
-| 只读查询 | `session`（ID、工作区和模型身份）、`model`（能力）、`thinking`、`all_tools`、`enabled_tools`、`running`、`pending_approval`、`session_usage`、`turn_usage` |
+| 运行与审批 | `await send(prompt, stream=True)`、`await cancel()`、`set_approval_mode(mode)`、`resolve_approval(turn_id, tool_call_id, decision)`、`await close()` |
+| 只读查询 | `session`（ID、工作区和模型身份）、`model`（能力）、`thinking`、`all_tools`、`enabled_tools`、`effective_tools`、`approval_mode`、`running`、`pending_approval`、`session_usage`、`turn_usage` |
 
 `set_thinking(None)` 使用服务端默认设置。消息和待审批详情以独立快照返回。
-活跃 Turn 期间不能切换模型、工具、思考档位或会话。`await ops.cancel()` 会
+活跃 Turn 期间不能切换模型、工具、思考档位、权限模式或会话。`await ops.cancel()` 会
 停止当前 Turn，等待该轮的 `send()` 会收到 `asyncio.CancelledError`。
 `await ops.close()` 会关闭共享的 Application；关闭后仍可读取状态，但不能再
 发送或修改设置。
 
 Thinking 和工具选择随会话保存。新会话沿用当前的模型和设置，消息与用量从零开始；
-恢复会话会使用它自己的设置。历史读取要求 V2 格式。如果模型或工具配置已不受支持，
-恢复会报错并保留当前会话。
+恢复会话会使用它自己的设置。历史读取要求 V2 格式；恢复时 MCP 工具可以暂时离线。
 
 增量输出、工具事件和用量更新由 `app.events` 提供。客户端可以在发送前订阅，
 并在离开时取消订阅；Application 关闭时也会清理订阅。
@@ -77,8 +76,23 @@ finally:
     unsubscribe()
 ```
 
-默认情况下，需要审批的工具操作会被拒绝。只有客户端能展示审批请求并调用
-`ops.resolve_approval(...)` 时，才应以 `interactive=True` 构造 Application。
+### 工具权限
+
+在 TUI 中用 `/approval ask|auto|full` 切换模式，当前模式显示在界面顶部：
+
+- `ask`：逐次审批，包括普通只读工具。
+- `auto`（默认）：按固定规则批准普通操作，MCP 调用默认询问。审批时按 Y 仅允许本次，
+  按 N 或 Esc 拒绝，按 T 信任当前会话中的这一工具（仅在可授予信任时显示）。
+- `full`：跳过一般审批，包括 MCP 调用。MCP Server 可能读写文件或访问网络，
+  Daphnis 无法约束其内部的所有行为。
+
+硬编码禁止始终有效；工作区外访问、无法检查访问范围的命令仍需逐次确认。
+模式和信任均只存于本次运行的内存。新会话不会继承信任，切到 `ask` 会清除信任；
+MCP 服务断线、重连或工具定义变化也会撤销相关信任。
+
+需要审批的调用在非交互模式下会被拒绝。交互客户端可用 `interactive=True`，
+通过 `ops.resolve_approval(..., decision)` 返回 `deny`、`allow_once` 或
+`trust_session`（可从 `daphnis.tools` 导入 `ApprovalDecision` 和 `ApprovalMode`）。
 
 ### MCP 工具
 
@@ -116,9 +130,10 @@ HTTP 服务使用最终端点地址，远程连接要求 HTTPS，本机回环地
 `/mcp disconnect <名称>` 主动断开，`/mcp refresh <名称>` 刷新工具目录。
 服务支持工具变更通知时，目录会自动刷新，运行中的 Turn 继续使用开始时的快照。
 
-用 `/tools` 启用工具，每次 MCP 调用仍需审批。掉线和目录变化会保留会话偏好，
-新 Turn 只提供已启用且当前可用的工具。主动断开会清除当前会话中该服务的工具选择。
-恢复使用 MCP 工具的会话前，先连接对应的服务。工具结果支持文本和结构化数据。
+在支持工具的模型下，首次显式连接新服务会默认启用发现的工具；从历史恢复的会话
+及由它新建的会话优先使用保存的选择。可用 `/tools` 手动调整，启用后仍按当前权限模式审批。
+掉线、主动断开、重连和目录变化都会保留会话偏好。新 Turn 只提供已启用且在线的工具，
+目录新增的工具可手动启用。恢复会话不会自动连接服务。工具结果支持文本和结构化数据。
 
 Python 客户端可调用 `ops.connect_mcp(...)`、`ops.mcp_status()`、
 `ops.reconnect_mcp(name)`、`ops.disconnect_mcp(name)` 和 `ops.refresh_mcp(name)`。

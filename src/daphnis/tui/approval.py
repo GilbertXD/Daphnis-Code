@@ -9,13 +9,14 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
-from ..tools import ApprovalRequest
+from ..tools import ApprovalDecision, ApprovalRequest
 from .theme import BACKGROUND
 
 
-class ApprovalScreen(ModalScreen[bool]):
+class ApprovalScreen(ModalScreen[ApprovalDecision]):
     BINDINGS = [
         Binding("y", "approve", "同意"),
+        Binding("t", "trust", "本会话信任"),
         Binding("n,escape", "deny", "拒绝"),
     ]
     DEFAULT_CSS = """
@@ -31,7 +32,7 @@ class ApprovalScreen(ModalScreen[bool]):
     #approval-patch { background: $background; padding: 0 1; }
     #approval-hint { height: 1; color: $text-muted; text-overflow: ellipsis; }
     #approval-buttons { height: 3; align: right middle; }
-    #approval-buttons Button { margin-left: 1; }
+    #approval-buttons Button { margin-left: 1; min-width: 10; }
     """
 
     def __init__(self, request: ApprovalRequest) -> None:
@@ -74,22 +75,33 @@ class ApprovalScreen(ModalScreen[bool]):
                         id="approval-patch",
                     )
             yield Static(
-                "Y 同意本次操作   N / Esc 拒绝   Ctrl+C 取消本轮",
+                "Y 同意本次   N / Esc 拒绝   Ctrl+C 取消本轮",
                 markup=False,
                 id="approval-hint",
             )
             with Horizontal(id="approval-buttons"):
                 yield Button("拒绝 N", id="approval-no", variant="default")
-                yield Button("同意 Y", id="approval-yes", variant="warning")
+                yield Button("允许本次 Y", id="approval-yes", variant="warning")
+                if self.request.can_trust:
+                    yield Button("本会话信任 T", id="approval-trust")
 
     def on_mount(self) -> None:
         self.query_one("#approval-no", Button).focus()
 
     def action_approve(self) -> None:
-        self.dismiss(True)
+        self.dismiss(ApprovalDecision.ALLOW_ONCE)
+
+    def action_trust(self) -> None:
+        if self.request.can_trust:
+            self.dismiss(ApprovalDecision.TRUST_SESSION)
 
     def action_deny(self) -> None:
-        self.dismiss(False)
+        self.dismiss(ApprovalDecision.DENY)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "approval-yes")
+        if event.button.id == "approval-yes":
+            self.action_approve()
+        elif event.button.id == "approval-trust":
+            self.action_trust()
+        else:
+            self.action_deny()

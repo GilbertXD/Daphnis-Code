@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
-from .mcp import MCPConnection, MCPStatus
+from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .session import Session
+from .tools import ApprovalDecision, ApprovalMode
 
 if TYPE_CHECKING:
     from .agent import TurnResult
@@ -69,6 +70,17 @@ class Operations:
     @property
     def running(self) -> bool:
         return self._app._running
+
+    @property
+    def approval_mode(self) -> ApprovalMode:
+        return self._app._approval_mode
+
+    def set_approval_mode(self, mode: ApprovalMode | str) -> None:
+        app = self._app
+        app._ensure_idle()
+        app._approval_mode = ApprovalMode(mode)
+        if app._approval_mode is ApprovalMode.ASK:
+            app._trusted_tools.clear()
 
     @property
     def pending_approval(self) -> "ApprovalRequest | None":
@@ -186,7 +198,7 @@ class Operations:
         url: str | None = None,
         auth: Mapping[str, str] | None = None,
     ) -> None:
-        """Connect an explicitly configured server. New tools remain disabled."""
+        """Connect an explicitly configured server."""
         await self._app._connect_mcp(
             MCPConnection(
                 name,
@@ -210,17 +222,9 @@ class Operations:
         await self._app._refresh_mcp(name)
 
     async def disconnect_mcp(self, name: str) -> None:
-        app = self._app
-        app._ensure_idle()
-        if name not in app._mcp:
+        if name not in self._app._mcp:
             raise ValueError(f"MCP Server {name!r} 未连接。")
-        prefix = app._mcp[name].prefix
-        enabled = tuple(
-            tool for tool in self.enabled_tools if not tool.startswith(prefix)
-        )
-        if enabled != self.enabled_tools:
-            self.set_tools(enabled)
-        await app._disconnect_mcp(name)
+        await self._app._disconnect_mcp(name)
 
     def list_mcp_servers(self) -> tuple[str, ...]:
         return tuple(self._app._mcp)
@@ -232,7 +236,7 @@ class Operations:
         return tuple(
             tool
             for server in self._app._mcp.values()
-            if server.state == "Connected"
+            if server.available
             for tool in server.tools
         )
 
@@ -264,8 +268,15 @@ class Operations:
             raise ValueError("该会话原工作区已不存在。")
         model = app._model_for(restored.provider, restored.model_id)
         self._validate_thinking(model, restored.thinking)
-        self._validate_tools(model, restored.enabled_tools)
+        self._validate_tools(
+            model,
+            restored.enabled_tools,
+            retained=tuple(
+                name for name in restored.enabled_tools if name.startswith(TOOL_PREFIX)
+            ),
+        )
         app._session = restored
+        app._use_saved_tool_preferences = True
         app._usage.select_session(restored.id, restored.usage)
 
     async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
@@ -275,9 +286,13 @@ class Operations:
         self._app._ensure_open()
         await self._app._cancel_turn()
 
-    def resolve_approval(self, turn_id: str, tool_call_id: str, approved: bool) -> bool:
+    def resolve_approval(
+        self, turn_id: str, tool_call_id: str, decision: ApprovalDecision | str
+    ) -> bool:
         self._app._ensure_open()
-        return self._app._resolve_approval(turn_id, tool_call_id, approved)
+        return self._app._resolve_approval(
+            turn_id, tool_call_id, ApprovalDecision(decision)
+        )
 
     async def close(self) -> None:
         await self._app.close()

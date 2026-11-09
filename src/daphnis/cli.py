@@ -56,14 +56,14 @@ def main() -> int:
 
     async def run():
         try:
+            if args.session:
+                ops.restore_session(args.session)
             if args.mcp_config:
                 for name, options in load_mcp_config(args.mcp_config).items():
                     try:
                         await ops.connect_mcp(name, **options)
                     except (ValueError, TypeError, RuntimeError) as exc:
                         print(f"MCP {name}: {safe_error(exc)}", file=sys.stderr)
-            if args.session:
-                ops.restore_session(args.session)
             if args.thinking:
                 ops.set_thinking(
                     None if args.thinking == "default" else args.thinking

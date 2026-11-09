@@ -19,6 +19,7 @@ from ..app import SessionSaveError
 from ..events import Event, EventBus
 from ..operations import Operations
 from ..terminal_commands import CommandResult, safe_error, terminal_command
+from ..tools import ApprovalDecision, ApprovalMode
 from .approval import ApprovalScreen
 from .chat import ChatView
 from .input import PromptInput
@@ -111,8 +112,12 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="tools-box"):
             yield Static("可用工具", markup=False, id="tools-title")
+            offline = len(self.ops.enabled_tools) - len(self.ops.effective_tools)
+            note = f"Space 勾选 · 审批模式：{self.ops.approval_mode}"
+            if offline:
+                note += f" · 保留 {offline} 个离线工具的启用偏好"
             yield Static(
-                "Space 勾选 · 具体操作仍按原有规则逐次审批。",
+                note,
                 markup=False,
                 id="tools-note",
             )
@@ -248,7 +253,13 @@ class DaphnisApp(App[None]):
         label = Text("♄  daphnis", style=f"bold {ACCENT}")
         label.append("  /  " + workspace, style=MUTED)
         color = WARNING if busy else SUCCESS
-        heading.add_row(label, Text("● " + state, style=color))
+        mode = ops.approval_mode
+        badge = Text(
+            f"{mode.upper()}  ·  ",
+            style=WARNING if mode is ApprovalMode.FULL else MUTED,
+        )
+        badge.append("● " + state, style=color)
+        heading.add_row(label, badge)
         self.query_one("#heading", Static).update(heading)
         self.query_one("#heading", Static).tooltip = f"会话 {session.id}"
         self.query_one(UsageView).update_usage(
@@ -287,12 +298,14 @@ class DaphnisApp(App[None]):
                         self._approval_screen = None
                     if not self._shutting_down:
                         self.ops.resolve_approval(
-                            request.turn_id, request.tool_call_id, value is True
+                            request.turn_id,
+                            request.tool_call_id,
+                            value or ApprovalDecision.DENY,
                         )
 
                 self.push_screen(screen, answered)
         elif event.name == "turn.finished" and self._approval_screen is not None:
-            self._approval_screen.dismiss(False)
+            self._approval_screen.dismiss(ApprovalDecision.DENY)
             self._approval_screen = None
         self.update_status()
 
@@ -456,7 +469,7 @@ class DaphnisApp(App[None]):
         if self._sending or self.ops.running:
             await self.ops.cancel()
             if self._approval_screen is not None:
-                self._approval_screen.dismiss(False)
+                self._approval_screen.dismiss(ApprovalDecision.DENY)
                 self._approval_screen = None
         else:
             await self.action_quit_safely()

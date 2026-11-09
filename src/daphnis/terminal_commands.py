@@ -5,10 +5,12 @@ import shlex
 from dataclasses import dataclass
 
 from .operations import Operations
+from .tools import ApprovalMode
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
 /tools [all|none|on 工具名...|off 工具名...]  查看或选择工具
+/approval [ask|auto|full]  查看或切换工具审批模式
 /mcp [reconnect|disconnect|refresh Server名]  查看 MCP 状态或管理连接
 /session [会话ID]  列出或恢复会话
 /new  新建会话，保留旧会话
@@ -67,6 +69,18 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
         raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
     if ops.running:
         raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
+    if name == "/approval":
+        if args:
+            if len(args) != 1 or args[0] not in tuple(ApprovalMode):
+                raise ValueError("用法：/approval [ask|auto|full]")
+            ops.set_approval_mode(args[0])
+        message = f"工具审批：{ops.approval_mode}"
+        if ops.approval_mode is ApprovalMode.FULL:
+            message += (
+                "\nFULL 会跳过一般工具审批。MCP Server 可能写入文件或访问网络，"
+                "Daphnis 无法约束其内部的所有行为。仅本次运行有效。"
+            )
+        return CommandResult(text=message)
     if name == "/new" and not args:
         session = ops.new_session()
         return CommandResult("reload", f"新会话：{session.id}")
@@ -116,11 +130,18 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
             return CommandResult(text=f"Thinking：{ops.thinking or '服务端默认'}")
     if name == "/tools":
         if not args:
+            available = ops.all_tools
             return CommandResult(
                 "tools",
                 "\n".join(
-                    ("[启用] " if item in ops.enabled_tools else "[停用] ") + item
-                    for item in ops.all_tools
+                    [
+                        ("[启用] " if item in ops.enabled_tools else "[停用] ") + item
+                        for item in available
+                    ]
+                    + [
+                        "[离线，保留启用偏好] " + item
+                        for item in ops.enabled_tools if item not in available
+                    ]
                 ),
             )
         if args == ["all"]:
@@ -144,7 +165,8 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
         else:
             raise ValueError("用法：/tools all|none|on 工具名...|off 工具名...")
         return CommandResult(
-            text=f"启用工具：{len(ops.enabled_tools)} 个（逐次审批仍生效）。"
+            text=f"工具：{len(ops.effective_tools)} 个可用，"
+            f"已保存 {len(ops.enabled_tools)} 个启用偏好。"
         )
     if name == "/session":
         if not args:
