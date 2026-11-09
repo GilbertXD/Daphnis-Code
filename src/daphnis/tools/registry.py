@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,26 @@ _PREPARERS = {
     "apply_patch": prepare_patch,
     "run_command": prepare_command,
 }
+
+
+class _ExecutionDecision(Enum):
+    DENY = auto()
+    EXECUTE = auto()
+    PROMPT = auto()
+
+
+def _execution_decision(
+    operation: Operation, mode: ApprovalMode, *, trusted: bool, forced: bool
+) -> _ExecutionDecision:
+    if operation.decision is Decision.DENY:
+        return _ExecutionDecision.DENY
+    if forced or mode is ApprovalMode.ASK:
+        return _ExecutionDecision.PROMPT
+    if mode is ApprovalMode.FULL or operation.decision is Decision.ALLOW:
+        return _ExecutionDecision.EXECUTE
+    if operation.allow_session_trust and trusted:
+        return _ExecutionDecision.EXECUTE
+    return _ExecutionDecision.PROMPT
 
 
 def _guarded_handler(name):
@@ -184,22 +205,24 @@ class ToolExecutor:
                 )
             else:
                 operation = _PREPARERS[name](arguments, binding.workspace.path)
-            if operation.decision == Decision.DENY:
-                raise ToolError("command_blocked", operation.reason)
             forced = operation.force_approval or any(
                 not target.path.is_relative_to(binding.workspace.path)
                 for target in operation.targets
             )
-            can_trust = self._mode == ApprovalMode.AUTO and not forced
-            if (
-                forced
-                or self._mode == ApprovalMode.ASK
-                or (
-                    can_trust
-                    and operation.decision == Decision.ASK
-                    and (binding.session_id, name) not in self._trusted
+            policy = _execution_decision(
+                operation,
+                self._mode,
+                trusted=(binding.session_id, name) in self._trusted,
+                forced=forced,
+            )
+            if policy is _ExecutionDecision.DENY:
+                raise ToolError("command_blocked", operation.reason)
+            if policy is _ExecutionDecision.PROMPT:
+                can_trust = (
+                    self._mode is ApprovalMode.AUTO
+                    and not forced
+                    and operation.allow_session_trust
                 )
-            ):
                 request = ApprovalRequest(
                     session_id=binding.session_id,
                     turn_id=binding.turn_id,

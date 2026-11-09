@@ -155,6 +155,7 @@ class Operation:
     details: dict[str, Any]
     run: Callable[[], Awaitable[dict[str, Any]]]
     force_approval: bool = False
+    allow_session_trust: bool = True
 
     def verify(self) -> None:
         for target in self.targets:

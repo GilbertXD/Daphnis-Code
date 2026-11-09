@@ -18,7 +18,12 @@ from textual.widgets.option_list import Option
 from ..app import SessionSaveError
 from ..events import Event, EventBus
 from ..operations import Operations
-from ..terminal_commands import CommandResult, safe_error, terminal_command
+from ..terminal_commands import (
+    APPROVAL_MODE_TEXT,
+    CommandResult,
+    safe_error,
+    terminal_command,
+)
 from ..tools import ApprovalDecision, ApprovalMode
 from .approval import ApprovalScreen
 from .chat import ChatView
@@ -111,21 +116,22 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tools-box"):
-            yield Static("可用工具", markup=False, id="tools-title")
-            offline = len(self.ops.enabled_tools) - len(self.ops.effective_tools)
-            note = f"Space 勾选 · 审批模式：{self.ops.approval_mode}"
+            yield Static("工具选择", markup=False, id="tools-title")
+            available = self.ops.all_tools
+            enabled = self.ops.enabled_tools
+            offline = [name for name in enabled if name not in available]
+            label, _ = APPROVAL_MODE_TEXT[self.ops.approval_mode]
+            note = f"Space 勾选 · 审批模式：{label}"
             if offline:
-                note += f" · 保留 {offline} 个离线工具的启用偏好"
+                note += " · 可取消离线工具的启用偏好"
             yield Static(
                 note,
                 markup=False,
                 id="tools-note",
             )
             yield SelectionList(
-                *[
-                    (name, name, name in self.ops.enabled_tools)
-                    for name in self.ops.all_tools
-                ],
+                *((name, name, name in enabled) for name in available),
+                *((f"离线 · {name}", name, True) for name in offline),
                 id="tool-selections",
             )
             with Horizontal(id="tools-buttons"):
@@ -254,8 +260,9 @@ class DaphnisApp(App[None]):
         label.append("  /  " + workspace, style=MUTED)
         color = WARNING if busy else SUCCESS
         mode = ops.approval_mode
+        mode_label, _ = APPROVAL_MODE_TEXT[mode]
         badge = Text(
-            f"{mode.upper()}  ·  ",
+            f"{mode_label}  ·  ",
             style=WARNING if mode is ApprovalMode.FULL else MUTED,
         )
         badge.append("● " + state, style=color)
@@ -450,7 +457,7 @@ class DaphnisApp(App[None]):
     def _tools_selected(self, value) -> None:
         if value is not None:
             try:
-                self.ops.set_tools(value, keep_unavailable=True)
+                self.ops.set_tools(value)
                 self.update_status()
             except Exception as exc:
                 self.notify(safe_error(exc), severity="error")

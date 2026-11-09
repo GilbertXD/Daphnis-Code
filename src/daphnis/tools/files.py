@@ -354,4 +354,5 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
             ],
         },
         run,
+        allow_session_trust=False,
     )

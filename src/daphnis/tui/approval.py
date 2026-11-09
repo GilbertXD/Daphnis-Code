@@ -7,7 +7,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Static
+from textual.widgets import Button, Checkbox, Static
 
 from ..tools import ApprovalDecision, ApprovalRequest
 from .theme import BACKGROUND
@@ -15,8 +15,8 @@ from .theme import BACKGROUND
 
 class ApprovalScreen(ModalScreen[ApprovalDecision]):
     BINDINGS = [
-        Binding("y", "approve", "同意"),
-        Binding("t", "trust", "本会话信任"),
+        Binding("y", "approve", "允许"),
+        Binding("t", "toggle_trust", "切换会话信任"),
         Binding("n,escape", "deny", "拒绝"),
     ]
     DEFAULT_CSS = """
@@ -30,6 +30,8 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
     #approval-body Static { height: auto; margin-bottom: 1; }
     #approval-details { padding: 0 1; color: $text-muted; }
     #approval-patch { background: $background; padding: 0 1; }
+    #approval-trust { height: auto; }
+    #approval-trust-note { height: auto; color: $text-muted; }
     #approval-hint { height: 1; color: $text-muted; text-overflow: ellipsis; }
     #approval-buttons { height: 3; align: right middle; }
     #approval-buttons Button { margin-left: 1; min-width: 10; }
@@ -40,16 +42,27 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
         self.request = request
 
     def compose(self) -> ComposeResult:
+        details = dict(self.request.details)
+        server = details.pop("server", None)
+        tool = self.request.tool_name
+        if server is not None:
+            tool = f"{server} / {details.pop('tool')!r}"
         with Vertical(id="approval-box"):
             yield Static(
-                f"需要你的确认  /  {self.request.tool_name}",
+                f"工具执行确认  /  {tool}",
                 markup=False,
                 id="approval-title",
             )
             yield Static(self.request.reason, markup=False, id="approval-reason")
-            details = dict(self.request.details)
             patch = details.pop("patch", None)
             lines = []
+            if server is not None:
+                arguments = details.pop("arguments")
+                lines.append(
+                    "参数：\n" + json.dumps(arguments, ensure_ascii=False, indent=2)
+                )
+                if details.get("targets") == []:
+                    del details["targets"]
             if isinstance(details.get("changes"), list):
                 actions = {"create": "新建", "modify": "修改", "delete": "删除"}
                 for change in details.pop("changes"):
@@ -74,26 +87,37 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
                         ),
                         id="approval-patch",
                     )
+            if self.request.can_trust:
+                yield Checkbox("本会话不再询问此工具（T）", id="approval-trust")
+                if server is not None:
+                    yield Static(
+                        "授权适用于此工具，后续调用可能使用不同的参数。",
+                        markup=False,
+                        id="approval-trust-note",
+                    )
             yield Static(
-                "Y 同意本次   N / Esc 拒绝   Ctrl+C 取消本轮",
+                "Y 允许   N / Esc 拒绝   Ctrl+C 取消本轮",
                 markup=False,
                 id="approval-hint",
             )
             with Horizontal(id="approval-buttons"):
                 yield Button("拒绝 N", id="approval-no", variant="default")
-                yield Button("允许本次 Y", id="approval-yes", variant="warning")
-                if self.request.can_trust:
-                    yield Button("本会话信任 T", id="approval-trust")
+                yield Button("允许 Y", id="approval-yes", variant="warning")
 
     def on_mount(self) -> None:
         self.query_one("#approval-no", Button).focus()
 
     def action_approve(self) -> None:
-        self.dismiss(ApprovalDecision.ALLOW_ONCE)
+        trust = (
+            self.request.can_trust and self.query_one("#approval-trust", Checkbox).value
+        )
+        self.dismiss(
+            ApprovalDecision.TRUST_SESSION if trust else ApprovalDecision.ALLOW_ONCE
+        )
 
-    def action_trust(self) -> None:
+    def action_toggle_trust(self) -> None:
         if self.request.can_trust:
-            self.dismiss(ApprovalDecision.TRUST_SESSION)
+            self.query_one("#approval-trust", Checkbox).toggle()
 
     def action_deny(self) -> None:
         self.dismiss(ApprovalDecision.DENY)
@@ -101,7 +125,5 @@ class ApprovalScreen(ModalScreen[ApprovalDecision]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "approval-yes":
             self.action_approve()
-        elif event.button.id == "approval-trust":
-            self.action_trust()
         else:
             self.action_deny()

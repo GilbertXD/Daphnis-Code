@@ -5,11 +5,12 @@ import unittest
 from pathlib import Path
 
 import httpx
-from textual.widgets import OptionList, SelectionList
+from textual.widgets import Button, Checkbox, OptionList, SelectionList, Static
 
-from daphnis import Event, History, Operations
+from daphnis import Event, History, Operations, Session
 from daphnis.app import Application
 from daphnis.models import ModelInfo
+from daphnis.tools import ApprovalDecision, ApprovalRequest
 from daphnis.tui.app import ChoiceScreen, DaphnisApp, ToolsScreen
 from daphnis.tui.approval import ApprovalScreen
 from daphnis.tui.chat import ChatRow, ChatView, ToolGroup, patch_counts
@@ -187,6 +188,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await submit(ui, pilot, "edit")
                 await until(pilot, lambda: isinstance(ui.screen, ApprovalScreen))
                 self.assertEqual(ui.focused.id, "approval-no")
+                self.assertFalse(ui.screen.query("#approval-trust"))
                 await pilot.press("n")
                 await until(pilot, lambda: not ui._sending)
                 self.assertEqual(target.read_text(), "old\n")
@@ -212,6 +214,87 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(ops.pending_approval)
                 self.assertEqual(ops.message_snapshot(), committed)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
+
+    async def test_approval_trust_checkbox_requires_allow(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = controller(root, lambda request: self.fail("No model call"))
+            ui = DaphnisApp(Operations(app), app.events)
+            request = ApprovalRequest(
+                session_id="session",
+                turn_id="turn",
+                tool_call_id="call",
+                tool_name="mcp__demo__read",
+                workspace=temporary,
+                reason="MCP 工具执行确认",
+                details={
+                    "server": "demo",
+                    "tool": "read",
+                    "arguments": {"repoName": "example/project"},
+                },
+                can_trust=True,
+            )
+            decisions = []
+            async with ui.run_test(size=(100, 36)) as pilot:
+                for keys, expected in (
+                    (("y",), ApprovalDecision.ALLOW_ONCE),
+                    (("t", "t", "y"), ApprovalDecision.ALLOW_ONCE),
+                    (("t", "y"), ApprovalDecision.TRUST_SESSION),
+                    (("t", "n"), ApprovalDecision.DENY),
+                    (("t", "escape"), ApprovalDecision.DENY),
+                ):
+                    with self.subTest(keys=keys):
+                        screen = ApprovalScreen(request)
+                        await ui.push_screen(screen, decisions.append)
+                        checkbox = screen.query_one("#approval-trust", Checkbox)
+                        self.assertFalse(checkbox.value)
+                        self.assertEqual(len(screen.query(Button)), 2)
+                        note = screen.query_one("#approval-trust-note", Static)
+                        self.assertIn("不同的参数", str(note.render()))
+                        for key in keys[:-1]:
+                            previous = checkbox.value
+                            await pilot.press(key)
+                            self.assertIs(ui.screen, screen)
+                            self.assertNotEqual(checkbox.value, previous)
+                        await pilot.press(keys[-1])
+                        await until(pilot, lambda screen=screen: ui.screen is not screen)
+                        self.assertIs(decisions[-1], expected)
+
+    async def test_tools_selection_can_remove_offline_preferences(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = controller(root, lambda request: self.fail("No model call"))
+            ops = Operations(app)
+            remove, keep = "mcp__demo__read", "mcp__demo__search"
+            session = Session(
+                workspace=root,
+                provider="deepseek",
+                model_id="a",
+                enabled_tools=("read_file", remove, keep),
+            )
+            app._history.save(session)
+            ops.restore_session(session.id)
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "/tools")
+                await until(pilot, lambda: isinstance(ui.screen, ToolsScreen))
+                choices = ui.screen.query_one(SelectionList)
+                self.assertEqual(set(choices.selected), set(session.enabled_tools))
+                choices.focus()
+                choices.highlighted = len(ops.all_tools)
+                option = choices.get_option_at_index(choices.highlighted)
+                self.assertIn("离线", str(option.prompt))
+                await pilot.press("space")
+                await pilot.click("#tools-apply")
+                await until(pilot, lambda: ops.enabled_tools == ("read_file", keep))
+                self.assertEqual(ops.effective_tools, ("read_file",))
+                self.assertEqual(
+                    app._history.load(session.id).enabled_tools, ops.enabled_tools
+                )
+                await submit(ui, pilot, "/tools")
+                await until(pilot, lambda: isinstance(ui.screen, ToolsScreen))
+                choices = ui.screen.query_one(SelectionList)
+                self.assertEqual(choices.option_count, len(ops.all_tools) + 1)
 
     async def test_provider_columns_thinking_and_tool_selection(self):
         with tempfile.TemporaryDirectory() as temporary:

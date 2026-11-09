@@ -105,6 +105,11 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.value["ok"])
             self.assertEqual(len(requests), 2)
             self.assertFalse(requests[-1].can_trust)
+            allowed._trusted.add((allowed._binding.session_id, "read_file"))
+            result = await allowed.execute(call("read_file", path="link.txt"))
+            self.assertTrue(result.value["ok"])
+            self.assertEqual(len(requests), 3)
+            self.assertFalse(requests[-1].can_trust)
             # Resolve symlink/.. in filesystem order, not by lexical abspath first.
             (base / "external-dir").mkdir()
             (workspace / "jump").symlink_to(
@@ -126,6 +131,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.value["ok"], result.value)
             target = workspace / "sub/new.txt"
             self.assertEqual(target.read_text(), "new\n")
+            tools._trusted.add((tools._binding.session_id, "apply_patch"))
             change = diff("sub/new.txt", "new\n", "changed\n")
             denied = await tools.execute(call("apply_patch", patch=change))
             self.assertEqual(denied.value["error"]["code"], "permission_denied")
@@ -134,7 +140,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             result = await allowed.execute(call("apply_patch", patch=change))
             self.assertTrue(result.value["ok"], result.value)
             deletion = "--- a/sub/new.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-changed\n"
-            result = await allowed.execute(call("apply_patch", patch=deletion))
+            denied = await tools.execute(call("apply_patch", patch=deletion))
+            self.assertEqual(denied.value["error"]["code"], "permission_denied")
+            full = tools.select(["apply_patch"], mode=ApprovalMode.FULL)
+            result = await full.execute(call("apply_patch", patch=deletion))
             self.assertTrue(result.value["ok"], result.value)
             self.assertFalse(target.exists())
             selected = allowed.select(["read_file"])
@@ -341,6 +350,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             async def approve_change(request):
                 approvals.append(request)
                 self.assertEqual(request.tool_name, "apply_patch")
+                self.assertFalse(request.can_trust)
                 self.assertEqual((workspace / "result.txt").read_text(), "created\n")
                 return ApprovalDecision.ALLOW_ONCE
 

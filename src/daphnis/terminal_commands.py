@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from .operations import Operations
 from .tools import ApprovalMode
 
+APPROVAL_MODE_TEXT = {
+    ApprovalMode.ASK: ("每次询问", "所有可执行工具调用都需要确认。"),
+    ApprovalMode.AUTO: ("安全自动", "自动执行无需额外授权的操作，其余按规则确认。"),
+    ApprovalMode.FULL: ("尽可能自动", "跳过常规审批，保留强制审批和硬编码禁止。"),
+}
+
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
 /tools [all|none|on 工具名...|off 工具名...]  查看或选择工具
@@ -74,10 +80,13 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
             if len(args) != 1 or args[0] not in tuple(ApprovalMode):
                 raise ValueError("用法：/approval [ask|auto|full]")
             ops.set_approval_mode(args[0])
-        message = f"工具审批：{ops.approval_mode}"
-        if ops.approval_mode is ApprovalMode.FULL:
+        mode = ops.approval_mode
+        label, description = APPROVAL_MODE_TEXT[mode]
+        default = "，默认" if mode is ApprovalMode.AUTO else ""
+        message = f"工具审批：{label}（{mode}{default}）\n{description}"
+        if mode is ApprovalMode.FULL:
             message += (
-                "\nFULL 会跳过一般工具审批。MCP Server 可能写入文件或访问网络，"
+                "\nMCP Server 可能写入文件或访问网络，"
                 "Daphnis 无法约束其内部的所有行为。仅本次运行有效。"
             )
         return CommandResult(text=message)
