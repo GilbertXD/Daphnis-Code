@@ -13,6 +13,7 @@ from saturnus import ValidationError
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
+from daphnis.mcp import MCPConnection
 
 DEMO = Path(__file__).with_name("mcp_demo_server.py").resolve()
 
@@ -26,6 +27,43 @@ def tool_call(name, call_id, **arguments):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connection_exit_after_discovery_is_not_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            broken = root / "broken"
+            broken.mkdir()
+            app = Application(
+                workspace=root,
+                provider="mimo",
+                model_id="mimo-v2.6-flash",
+                connections={"mimo": {"base_url": "https://model.test"}},
+                history=History(root / "sessions"),
+            )
+            ops = Operations(app)
+            start = MCPConnection.start
+
+            async def exit_after_discovery(connection, *callbacks):
+                tools = await start(connection, *callbacks)
+                connection._stop.set()  # Same wakeup used by transport EOF.
+                await connection._task
+                return tools
+
+            try:
+                await ops.connect_mcp("healthy", sys.executable, [str(DEMO), directory])
+                available = ops.all_tools
+                with (
+                    patch.object(MCPConnection, "start", exit_after_discovery),
+                    self.assertRaisesRegex(RuntimeError, "意外中断"),
+                ):
+                    await ops.connect_mcp("broken", sys.executable, [str(DEMO), str(broken)])
+                statuses = {status.name: status for status in ops.mcp_status()}
+                self.assertEqual(statuses["healthy"].state, "Connected")
+                self.assertEqual(statuses["broken"].state, "Error")
+                self.assertIn("mcp__healthy__add", ops.list_mcp_tools())
+                self.assertEqual(ops.all_tools, available)
+            finally:
+                await ops.close()
+
     async def test_stdio_tools_approval_and_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

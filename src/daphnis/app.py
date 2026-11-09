@@ -159,18 +159,25 @@ class Application:
                 await previous.aclose()
             self._mcp[connection.name] = connection
             discovered = await connection.start(self._mcp_error, self._mcp_tools_changed)
+            previous_tools = connection.tools
             try:
                 self._ensure_open()
                 connection.tools = discovered
                 tools = self._mcp_catalog(connecting=connection)
             except Exception:  # noqa: BLE001 - SDK catalogue errors must not disclose server data.
-                await connection.aclose()
-                if not self._closed:
-                    connection.state = "Error"
-                    connection.error = "无法注册 MCP 工具定义。"
-                raise RuntimeError(connection.error or "Application 已关闭。") from None
-            connection.state = "Connected"
-            self._tools = tools
+                error = "无法注册 MCP 工具定义。"
+            else:
+                if connection._can_publish():
+                    connection.state = "Connected"
+                    self._tools = tools
+                    return
+                error = connection.error or "MCP 连接在发布前已中断。"
+            connection.tools = previous_tools
+            await connection.aclose()
+            if self._closed:
+                raise RuntimeError("Application 已关闭。")
+            connection.state, connection.error = "Error", error
+            raise RuntimeError(error)
 
     async def _disconnect_mcp(self, name: str) -> None:
         self._ensure_idle()

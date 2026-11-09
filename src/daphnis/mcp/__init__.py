@@ -174,6 +174,15 @@ class MCPConnection:
             self.error,
         )
 
+    def _can_publish(self) -> bool:
+        return (
+            self.state == "Connecting"
+            and self._task is not None
+            and not self._task.done()
+            and self._client is not None
+            and not self._stop.is_set()
+        )
+
     async def start(
         self,
         on_error: Callable[[str, str], Awaitable[None]],
