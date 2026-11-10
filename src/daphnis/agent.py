@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -31,6 +31,7 @@ from .models import (
 )
 from .models.models import validate_catalog
 from .session import Session
+from .token_budget import request_budget
 from .tools import ToolExecutor
 
 _ACTIVE_SESSIONS: set[str] = set()
@@ -271,6 +272,11 @@ class Agent:
                     output_limit=output_limit,
                     extra_body=extra_body,
                     custom_compatibility=self._custom_compatibility,
+                )
+                await self.events.emit(
+                    "context.budget",
+                    **request_fields,
+                    **asdict(request_budget(messages, body, model.context_window)),
                 )
                 response = await self._request(
                     model=model_id,
