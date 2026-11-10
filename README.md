@@ -75,6 +75,7 @@ uv run --locked --extra web daphnis-web --workspace .
 
 - [运行架构与事件](docs/architecture.md)
 - [公共 Operations 接口](docs/operations.md)
+- [上下文压缩与历史回查](docs/context_compaction.md)
 - [工具、审批与 MCP](docs/tools.md)
 
 锁文件使用已发布的 `saturnus-llm==0.1.1`。同时开发两个仓库时，可在同步后执行 `uv pip install --no-deps -e ../Saturnus`，再用 `uv run --no-sync daphnis` 使用本地 Saturnus。重新执行 `uv sync --locked` 会恢复发布版。

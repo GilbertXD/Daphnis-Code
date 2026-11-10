@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import OrderedDict, deque
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from uuid import uuid4
 
 from ..operations import Operations
@@ -22,6 +22,13 @@ _MAX_EVENT_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 4 * _MAX_EVENT_BYTES
 _MAX_SESSIONS = 16
 _MAX_LIVE_CHARS = 256_000
+
+
+def _model_view(model):
+    return {
+        field.name: getattr(model, field.name)
+        for field in fields(model) if field.name != "token_counter"
+    }
 
 
 class Journal:
@@ -131,9 +138,9 @@ class Bridge:
             "sessions": [asdict(session) for session in sessions],
             "history_error": history_error,
             "messages": ops.message_snapshot(),
-            "model": asdict(ops.model),
+            "model": _model_view(ops.model),
             "models": [
-                {**asdict(model), "configured": ops.configured(provider)}
+                {**_model_view(model), "configured": ops.configured(provider)}
                 for provider, models in ops.list_models().items() for model in models
             ],
             "thinking": ops.thinking,

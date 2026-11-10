@@ -1,20 +1,37 @@
 """Estimate Chat Completions input size and reserve room for output."""
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 _DEFAULT_RESERVE = 16_384
 
 
-def estimate_tokens(value: Any) -> int:
-    """Approximate serialized text, charging more for non-ASCII text."""
-    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def _estimate_text(text: str) -> int:
     if text.isascii():
         return (len(text) + 2) // 3
     ascii_count = sum(character.isascii() for character in text)
     non_ascii_bytes = len(text.encode("utf-8", errors="surrogatepass")) - ascii_count
     return (ascii_count + 2) // 3 + (non_ascii_bytes + 1) // 2
+
+
+@dataclass(frozen=True)
+class TokenCounter:
+    """Count text locally. Chat framing and server accounting remain estimates."""
+
+    count_text: Callable[[str], int]
+    source: Literal["estimate", "local_tokenizer"] = "estimate"
+
+    def count(self, value: Any) -> int:
+        return self.count_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+DEFAULT_COUNTER = TokenCounter(_estimate_text)
+
+
+def estimate_tokens(value: Any) -> int:
+    return DEFAULT_COUNTER.count(value)
 
 
 @dataclass(frozen=True)
@@ -24,6 +41,14 @@ class TokenBudget:
     output_reserve: int
     compaction_threshold: int | None
     needs_compaction: bool
+    count_source: Literal["estimate", "local_tokenizer"] = "estimate"
+
+    @property
+    def fits(self) -> bool:
+        return (
+            self.context_window is None
+            or self.input_tokens + self.output_reserve <= self.context_window
+        )
 
 
 def request_budget(
@@ -32,12 +57,13 @@ def request_budget(
     context_window: int | None,
     *,
     provider: str | None = None,
+    counter: TokenCounter = DEFAULT_COUNTER,
 ) -> TokenBudget:
     # Only prompt-bearing options are counted as input. Allow for chat framing.
-    input_tokens = estimate_tokens(messages) + 4 * len(messages) + 3
+    input_tokens = counter.count(messages) + 4 * len(messages) + 3
     for field in ("tools", "response_format"):
         if field in body:
-            input_tokens += estimate_tokens(body[field])
+            input_tokens += counter.count(body[field])
     limits = [
         limit
         for field in ("output_limit", "max_tokens", "max_completion_tokens")
@@ -59,5 +85,5 @@ def request_budget(
     )
     return TokenBudget(
         input_tokens, context_window, reserve, threshold,
-        threshold is not None and input_tokens >= threshold,
+        threshold is not None and input_tokens >= threshold, counter.source,
     )

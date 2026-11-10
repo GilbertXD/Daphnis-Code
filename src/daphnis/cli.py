@@ -12,7 +12,7 @@ from saturnus import SaturnusError
 
 from .agent import TurnStatus, assistant_text
 from .app import Application
-from .config import environment_connections, load_mcp_config
+from .config import environment_catalog, environment_connections, load_mcp_config
 from .operations import Operations
 from .terminal_commands import safe_error, sanitize_terminal, terminal_command
 
@@ -75,6 +75,7 @@ def _main() -> int:
             provider=provider,
             model_id=model_id,
             connections=connections,
+            catalog=environment_catalog(),
             interactive=args.prompt is None,
         )
     except (OSError, SaturnusError, TypeError, ValueError) as exc:

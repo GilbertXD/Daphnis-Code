@@ -798,9 +798,7 @@ class CLITests(unittest.TestCase):
             }
 
             def factory(**kwargs):
-                return Application(
-                    **kwargs, history=History(root / "sessions"), catalog=CATALOG
-                )
+                return Application(**kwargs, history=History(root / "sessions"))
 
             history = History(root / "sessions")
             with (
@@ -811,6 +809,7 @@ class CLITests(unittest.TestCase):
                 ),
                 patch.object(cli, "Application", side_effect=factory),
                 patch.object(cli, "load_dotenv"),
+                patch.object(cli, "environment_catalog", return_value=CATALOG),
             ):
 
                 def run(*args, error=None):

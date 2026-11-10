@@ -3,6 +3,8 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from ..token_budget import DEFAULT_COUNTER, TokenCounter
+
 
 @dataclass(frozen=True)
 class ModelInfo:
@@ -11,6 +13,7 @@ class ModelInfo:
     context_window: int | None = None
     supports_tools: bool | None = None
     thinking_modes: tuple[str, ...] | None = None
+    token_counter: TokenCounter = DEFAULT_COUNTER
 
     def __post_init__(self) -> None:
         for name in ("id", "provider"):

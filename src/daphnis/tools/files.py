@@ -33,20 +33,23 @@ _CREDENTIAL_PATHS = frozenset({
 })
 
 
+def is_credential_path(path: Path) -> bool:
+    name = path.name.casefold()
+    location = tuple(part.casefold() for part in path.parts[-2:])
+    return (
+        ((name == ".env" or name.startswith(".env.")) and name != ".env.example")
+        or name in _CREDENTIAL_NAMES
+        or location in _CREDENTIAL_PATHS
+        or path.suffix.casefold() in {".pem", ".key", ".p12", ".pfx", ".ppk"}
+        or (name.startswith("id_") and not name.endswith(".pub")
+            and path.parent.name.casefold() == ".ssh")
+    )
+
+
 def require_readable_path(target: Target) -> None:
     """Protect content, including reads through a resolved symlink."""
-    for path in (target.path, target.requested):
-        name = path.name.casefold()
-        location = tuple(part.casefold() for part in path.parts[-2:])
-        if (
-            (name == ".env" or name.startswith(".env.")) and name != ".env.example"
-            or name in _CREDENTIAL_NAMES
-            or location in _CREDENTIAL_PATHS
-            or path.suffix.casefold() in {".pem", ".key", ".p12", ".pfx", ".ppk"}
-            or (name.startswith("id_") and not name.endswith(".pub")
-                and path.parent.name.casefold() == ".ssh")
-        ):
-            raise ToolError("sensitive_path", "Reading protected credentials is prohibited.")
+    if any(is_credential_path(path) for path in (target.path, target.requested)):
+        raise ToolError("sensitive_path", "Reading protected credentials is prohibited.")
 
 
 def read_bytes(target: Target, limit: int) -> tuple[bytes, bool]:

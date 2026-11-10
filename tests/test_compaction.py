@@ -19,9 +19,15 @@ from test_agent_core import (
 
 from daphnis import Agent, Context, History, Operations, TurnStatus
 from daphnis.app import Application, SessionSaveError
-from daphnis.compaction import CompactionCheckpoint, CompactionError, safe_boundaries
+from daphnis.compaction import (
+    CompactionCheckpoint,
+    CompactionError,
+    Compactor,
+    safe_boundaries,
+)
 from daphnis.models import ModelInfo
 from daphnis.terminal_commands import terminal_command
+from daphnis.token_budget import request_budget
 
 SUMMARY = json.dumps({
     "goals": "Update a file", "progress": "Inspected the workspace",
@@ -30,6 +36,36 @@ SUMMARY = json.dumps({
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_fragments_cover_the_full_tool_result(self):
+        content = "HEAD\n" + "多行 data\n" * 200 + "MIDDLE" + "x" * 4000 + "\nTAIL"
+        raw = [
+            {"role": "user", "content": "Inspect logs."},
+            reply(None, finish="tool_calls", calls=[tool_call()])["choices"][0]["message"],
+            {"role": "tool", "tool_call_id": "call-1", "content": content},
+            {"role": "user", "content": "Continue."},
+        ]
+        fragments = []
+
+        async def summarize(messages, limit):
+            self.assertFalse(request_budget(messages, {"output_limit": limit}, 1200).needs_compaction)
+            fragments.extend(json.loads(line) for line in messages[1]["content"].split(
+                "History records:\n", 1,
+            )[1].splitlines())
+            return SUMMARY
+
+        checkpoint = await Compactor(1200).summarize(raw, None, 3, summarize)
+        checkpoint.validate(raw)
+        parts = [part for part in fragments if part["message_index"] == 2]
+        self.assertGreater(len(parts), 1)
+        offset = 0
+        for part in parts:
+            self.assertEqual(part["tool_call_id"], "call-1")
+            self.assertEqual(part["start"], offset)
+            self.assertEqual(part["content"], content[offset:part["end"]])
+            offset = part["end"]
+        self.assertEqual(offset, len(content))
+        self.assertEqual(raw[2]["content"], content)
+
     async def test_manual_compaction_is_atomic_and_restores_the_effective_context(self):
         bodies = []
         summary_content = SUMMARY
@@ -126,11 +162,47 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         effective = Context().build(raw, checkpoint)
         self.assertEqual(effective[-2:], [raw.get(0), raw.get(4)])
 
+    def test_recent_budget_prefers_whole_user_turns(self):
+        raw = [
+            {"role": role, "content": content}
+            for role, content in (
+                ("user", "large past " * 300), ("assistant", "old answer"),
+                ("user", "previous question"), ("assistant", "previous answer"),
+                ("user", "new question"), ("assistant", "new answer"),
+            )
+        ]
+        compactor = Compactor(1200, recent_tokens=100)
+        self.assertEqual(compactor.cut(raw, None, within_turn=True), 2)
+        self.assertEqual(compactor.cut(raw, None, within_turn=True, available_tokens=60), 4)
+
 
 SMALL_MODEL = ModelInfo("model-a", "compatible", context_window=1200, supports_tools=True)
 
 
 class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_maintenance_exhaustion_keeps_primary_allowance_and_raw_checkpoint(self):
+        state = session()
+        state.messages.add_user("past data " * 1200)
+        state.messages.add_assistant("old answer")
+        original = state.messages.snapshot()
+        seen = []
+
+        def handler(request):
+            seen.append(json.loads(request.content))
+            return httpx.Response(200, json=reply(SUMMARY))
+
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(SMALL_MODEL,),
+                max_primary_requests=2, max_maintenance_requests=1, max_total_requests=3,
+            )
+            outcome = await agent.run(session=state, prompt="continue")
+        self.assertEqual((outcome.primary_requests, outcome.maintenance_requests, outcome.model_requests), (0, 1, 1))
+        self.assertEqual(len(seen), 1)
+        self.assertIn("cannot fit", outcome.error)
+        self.assertEqual(state.messages.snapshot(), original)
+        self.assertIsNone(state.compaction)
+
     async def test_long_tool_loop_trims_then_summarizes_and_commits_raw_history(self):
         state = session()
         tool_output = "tool-data " * 150

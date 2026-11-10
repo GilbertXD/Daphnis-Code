@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .app import Application
-from .config import environment_connections
+from .config import environment_catalog, environment_connections
 from .operations import Operations
 
 
@@ -23,6 +23,7 @@ async def open_operations(
         provider=provider,
         model_id=model_id,
         connections=connections,
+        catalog=environment_catalog(),
         interactive=True,
         observe_model_io=observe_model_io,
     ))

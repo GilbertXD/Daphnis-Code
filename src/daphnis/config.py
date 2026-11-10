@@ -2,8 +2,26 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+from .models import MODELS, ModelInfo
+from .models.tokenizer import verified_tokenizer
+
+_DEEPSEEK_V4_PRO_TOKENIZER_SHA256 = "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+
+
+def environment_catalog() -> tuple[ModelInfo, ...]:
+    path = os.getenv("DEEPSEEK_V4_PRO_TOKENIZER")
+    if not path:
+        return MODELS
+    counter = verified_tokenizer(Path(path).expanduser(), _DEEPSEEK_V4_PRO_TOKENIZER_SHA256)
+    return tuple(
+        replace(model, token_counter=counter)
+        if (model.provider, model.id) == ("deepseek", "deepseek-v4-pro") else model
+        for model in MODELS
+    )
 
 
 def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:
