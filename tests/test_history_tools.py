@@ -12,6 +12,41 @@ from daphnis.tools import create_tools
 
 
 class HistoryToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_operation_index_pages_results_and_never_returns_parameters(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Session(directory, "compatible", "test")
+            secret = "call-synthetic-private"
+            state.messages.add_user("Check the project")
+            calls = [
+                {**call("run_command", argv=["python3", "-m", "unittest"]), "id": "call-test"},
+                {**call("apply_patch", patch="--- a/private/path"), "id": "call-patch"},
+                {**call("run_command", argv=["cat", ".env"]), "id": secret},
+                {**call("mcp_hidden", key="private value"), "id": "call-external"},
+            ]
+            state.messages.add({"role": "assistant", "content": None, "tool_calls": calls})
+            for i in (1, 0, 2, 3):
+                state.messages.add_tool_result(tool_call_id=calls[i]["id"], content='{"result":"private output"}')
+            state.messages.add_assistant("Done")
+            store = History(Path(directory) / "history")
+            store.save(state)
+            restored = store.load(state.id)
+            tools = create_tools(redactor=Redactor([secret])).bind(
+                session=restored, events=EventBus(), turn_id="test",
+            )
+            first = await tools.execute(call("history_operations", limit=2))
+            self.assertEqual(first.value["operations"], [
+                {"message_id": 1, "tool_call_id": "call-patch", "tool_name": "apply_patch", "result_message_id": 2},
+                {"message_id": 1, "tool_call_id": "call-test", "tool_name": "run_command", "result_message_id": 3},
+            ])
+            second = await tools.execute(call("history_operations", start=first.value["next_start"]))
+            self.assertEqual(second.value["operations"], [
+                {"message_id": 1, "tool_call_id": None, "tool_name": "run_command", "result_message_id": 4},
+            ])
+            self.assertIsNone(second.value["next_start"])
+            for sensitive in (secret, ".env", "private/path", "unittest", "private output", "mcp_hidden"):
+                self.assertNotIn(sensitive, first.content + second.content)
+            self.assertEqual(restored.messages.snapshot(), state.messages.snapshot())
+
     async def test_only_bound_visible_history_is_readable_after_reload(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Session(directory, "compatible", "test")

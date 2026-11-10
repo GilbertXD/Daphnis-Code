@@ -8,6 +8,8 @@ Daphnis 将模型请求控制在可用上下文内，同时保留会话原始记
 
 每轮从 Session 的已提交历史创建工作副本，加入本轮用户消息、模型响应和工具结果。Context 使用工作历史与当前检查点构造本次模型请求。检查点记录被压缩前缀的边界 `through`，以及含 `goals`、`progress`、`files`、`next_steps` 的四字段 JSON 摘要。
 
+摘要请求要求返回单个 JSON 对象。解析时允许前后空白和可选的 Markdown 围栏，包括大小写不同的 JSON 标签。四个字段必须齐全、唯一且都是字符串。混杂说明文字、多个对象、额外字段或未完整结束的响应会使本次摘要失败。旧检查点仍可使用，格式错误不会触发额外修复请求。
+
 有效上下文包含原有系统和开发者消息、低权限的历史摘要，以及边界后的消息。当切分点位于用户轮次内部时，投影会按需带回这轮原始用户消息。请求视图中的工具结果可以显示为预览，原始历史仍保留完整内容。
 
 ## Token 预算
@@ -37,15 +39,18 @@ Daphnis 将模型请求控制在可用上下文内，同时保留会话原始记
 
 ## 历史回查
 
-在支持工具的会话中可启用 `history_search` 和 `history_read`。需要为已有会话增加工具时，可用终端命令 `/tools on history_search history_read`。
+在支持工具的会话中可启用 `history_search`、`history_read` 和 `history_operations`。需要为已有会话增加工具时，可用终端命令 `/tools on history_search history_read history_operations`。主模型请求存在压缩检查点，且同时启用了搜索和读取工具时，上下文说明会提示可回查的范围 `[0, through)`。该提示只描述消息范围。
 
 ```text
 history_search({"query":"发布标记","limit":5})
 history_read({"message_id":12,"start":0})
 history_read({"message_id":12,"start":4096,"end":8192})
+history_operations({"start":0,"limit":10})
 ```
 
 `history_search` 对可见文本做不区分大小写的字面匹配，按消息从新到旧返回，每条最多 240 个字符。默认 10 条，上限 20 条。`history_read` 只读当前 Session 已提交的原始记录，每页最多 4096 个字符。使用返回的 `next_start` 翻页，`end` 为可选的排他上界。`message_id` 是从 0 开始的原始消息位置，压缩和会话重载不会改变它。范围按脱敏后的可见文本计算。
+
+`history_operations` 按结果消息的原始顺序返回可核对的内置工具调用。每项包含调用消息 ID、工具名、结果消息 ID 和可公开的工具调用 ID。无法公开的调用 ID 返回 null。使用 `next_start` 继续，默认 10 条，上限 20 条。索引省略参数和结果正文，历史操作不能证明当前工作区仍处于相同状态。
 
 可回查用户和助手的可见文本，以及来源可核对的内置工具结果。系统和开发者消息、私有推理、工具参数、受保护凭据文件的结果、外部工具及历史回查工具自身的结果在可见范围外。回查不访问其他会话，所有返回内容只作历史数据使用。工具执行继续遵循当前审批模式和硬编码权限规则。
 
@@ -64,7 +69,7 @@ Application 将原始消息、检查点和用量一起写入会话文件。自�
 | `context.budget` | 主请求输入、窗口、输出预留、阈值及 `count_source` |
 | `model.started`、`model.usage` | 请求编号与服务端报告用量；摘要请求带 `purpose=compaction` |
 | `turn.finished` | 总模型请求、主请求、维护请求和工具调用计数 |
-| `compaction.started`、`compaction.finished` | 触发原因、尝试结果；自动压缩另有前后输入计数 |
+| `compaction.started`、`compaction.finished` | 触发原因、尝试结果；摘要失败时提供 JSON、字段、响应内容、结束状态或额度等分类，自动压缩另有前后输入计数 |
 | `compaction.committed`、`compaction.discarded` | 自动检查点随轮提交或丢弃 |
 | `context.overflow` | 超限后是否重试以及停止原因 |
 

@@ -18,6 +18,7 @@ MAX_SEARCH_HITS = 20
 _SEARCH_EXCERPT = 240
 _PRIVATE_THOUGHT = re.compile(r"<think\b[^>]*>.*?(?:</think\s*>|\Z)", re.IGNORECASE | re.DOTALL)
 _VISIBLE_TOOL_RESULTS = {"read_file", "list_directory", "search", "apply_patch", "run_command"}
+_SAFE_CALL_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def _contains_protected_path(value: Any) -> bool:
@@ -30,7 +31,9 @@ def _contains_protected_path(value: Any) -> bool:
     return isinstance(value, list) and any(_contains_protected_path(item) for item in value)
 
 
-def _tool_text(messages: Messages, index: int, message: dict[str, Any]) -> str | None:
+def _tool_call(
+    messages: Messages, index: int, message: dict[str, Any],
+) -> tuple[int, dict[str, Any]] | None:
     for i in range(index - 1, -1, -1):
         previous = messages.get(i)
         if previous["role"] == "tool":
@@ -39,18 +42,25 @@ def _tool_text(messages: Messages, index: int, message: dict[str, Any]) -> str |
             return None
         for call in previous.get("tool_calls") or ():
             function = call.get("function") or {}
-            if call.get("id") != message.get("tool_call_id") or function.get("name") not in _VISIBLE_TOOL_RESULTS:
-                continue
-            try:
-                arguments = json.loads(function["arguments"])
-                result = json.loads(message["content"])
-                if not isinstance(result, dict) or _contains_protected_path(arguments) or _contains_protected_path(result):
-                    return None
-            except (KeyError, TypeError, ValueError, RecursionError):
-                return None
-            return message["content"]
+            if call.get("id") == message.get("tool_call_id") and function.get("name") in _VISIBLE_TOOL_RESULTS:
+                return i, function
         return None
     return None
+
+
+def _tool_text(messages: Messages, index: int, message: dict[str, Any]) -> str | None:
+    located = _tool_call(messages, index, message)
+    if located is None:
+        return None
+    _, function = located
+    try:
+        arguments = json.loads(function["arguments"])
+        result = json.loads(message["content"])
+        if not isinstance(result, dict) or _contains_protected_path(arguments) or _contains_protected_path(result):
+            return None
+    except (KeyError, TypeError, ValueError, RecursionError):
+        return None
+    return message["content"]
 
 
 def _visible(messages: Messages, index: int, redactor: Redactor) -> tuple[str, str] | None:
@@ -81,6 +91,35 @@ def prepare_history(
     name: str, arguments: dict[str, Any], messages: Messages, redactor: Redactor,
 ) -> Operation:
     async def run():
+        if name == "history_operations":
+            operations = []
+            next_start = None
+            for index in range(arguments.get("start", 0), len(messages)):
+                if index % 64 == 0:
+                    await asyncio.sleep(0)
+                message = messages.get(index)
+                if message["role"] != "tool" or (located := _tool_call(messages, index, message)) is None:
+                    continue
+                call_index, function = located
+                call_id = message["tool_call_id"]
+                visible_id = (
+                    _SAFE_CALL_ID.fullmatch(call_id)
+                    and not is_credential_path(Path(call_id))
+                    and redactor.text(call_id) == call_id
+                )
+                operations.append({
+                    "message_id": call_index, "tool_call_id": call_id if visible_id else None,
+                    "tool_name": function["name"], "result_message_id": index,
+                })
+                if len(operations) == arguments.get("limit", 10):
+                    if index + 1 < len(messages):
+                        next_start = index + 1
+                    break
+            return {
+                "ok": True, "notice": HISTORY_NOTICE + " Current workspace state may differ.",
+                "operations": operations, "next_start": next_start,
+            }
+
         if name == "history_search":
             query = arguments["query"].strip()
             if not query:

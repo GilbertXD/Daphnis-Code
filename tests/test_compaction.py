@@ -17,17 +17,19 @@ from test_agent_core import (
     tool_call,
 )
 
-from daphnis import Agent, Context, History, Operations, TurnStatus
+from daphnis import Agent, Context, History, Operations, Session, TurnStatus
 from daphnis.app import Application, SessionSaveError
 from daphnis.compaction import (
     CompactionCheckpoint,
     CompactionError,
     Compactor,
+    _summary_text,
     safe_boundaries,
 )
 from daphnis.models import ModelInfo
 from daphnis.terminal_commands import terminal_command
 from daphnis.token_budget import request_budget
+from daphnis.tools import create_tools
 
 SUMMARY = json.dumps({
     "goals": "Update a file", "progress": "Inspected the workspace",
@@ -36,6 +38,64 @@ SUMMARY = json.dumps({
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
+    def test_summary_parser_accepts_one_json_object_with_optional_fence(self):
+        canonical = _summary_text(SUMMARY)
+        for value in (
+            f"  {SUMMARY}\n",
+            f"\n```JSON  \r\n{SUMMARY}\r\n```  ",
+            f"```\n{SUMMARY}\n```",
+            f"~~~JsOn\n{SUMMARY}\n~~~",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(_summary_text(value), canonical)
+
+    def test_summary_parser_rejects_ambiguous_and_invalid_output(self):
+        for value, reason in (
+            (f"Here is the summary: {SUMMARY}", "summary_json"),
+            (f"{SUMMARY}\n{SUMMARY}", "summary_json"),
+            (f"```json\n{SUMMARY}\n```\nadditional text", "summary_json"),
+            ("[]", "summary_schema"),
+            ('{"goals":"partial"}', "summary_schema"),
+            (SUMMARY.replace('"next_steps": "Run checks"', '"next_steps": 1'), "summary_schema"),
+            (SUMMARY[:-1] + ', "goals": "ambiguous"}', "summary_schema"),
+            (SUMMARY[:-1] + ', "extra": "field"}', "summary_schema"),
+        ):
+            with self.subTest(value=value), self.assertRaises(CompactionError) as failure:
+                _summary_text(value)
+            self.assertEqual(failure.exception.reason, reason)
+
+    async def test_history_range_hint_requires_checkpoint_and_both_selected_tools(self):
+        for compacted, names, expected in (
+            (False, ["history_search", "history_read"], False),
+            (True, ["history_search"], False),
+            (True, ["history_search", "history_read"], True),
+        ):
+            with self.subTest(compacted=compacted, names=names), tempfile.TemporaryDirectory() as directory:
+                state = Session(directory, "compatible", "model-a")
+                state.messages.add_user("earlier original text")
+                state.messages.add_assistant("earlier response")
+                state.messages.add_user("recent user turn")
+                if compacted:
+                    state.compaction = CompactionCheckpoint(2, SUMMARY)
+                sent = []
+
+                def handler(request, sent=sent):
+                    sent.extend(json.loads(request.content)["messages"])
+                    return httpx.Response(200, json=reply())
+
+                async with make_client(handler) as client:
+                    agent = Agent(
+                        client=client, provider="compatible", catalog=CATALOG,
+                        tools=create_tools().select(names),
+                    )
+                    result = await agent.run(session=state, prompt="Continue.")
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                self.assertEqual(
+                    any("Compacted message range: [0, 2)." in message["content"] for message in sent),
+                    expected,
+                )
+                self.assertNotIn("Compacted message range", json.dumps(state.messages.snapshot()))
+
     async def test_summary_fragments_cover_the_full_tool_result(self):
         content = "HEAD\n" + "多行 data\n" * 200 + "MIDDLE" + "x" * 4000 + "\nTAIL"
         raw = [
@@ -127,8 +187,12 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             history.save(app._session)
             path = history.directory / f"{state.id}.json"
             summary_content = "Invalid summary"
-            with self.assertRaises(CompactionError):
+            failures = []
+            app.events.on("compaction.finished", failures.append)
+            with self.assertRaises(CompactionError) as invalid_summary:
                 await ops.compact()
+            self.assertEqual(invalid_summary.exception.reason, "summary_json")
+            self.assertEqual(failures[-1].data["reason"], "summary_json")
             self.assertEqual(app._session.compaction, saved.compaction)
             self.assertEqual(history.load(state.id).compaction, saved.compaction)
 

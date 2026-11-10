@@ -57,7 +57,7 @@ _PREPARERS = {
     "apply_patch": prepare_patch,
     "run_command": prepare_command,
 }
-_HISTORY_TOOLS = {"history_search", "history_read"}
+_HISTORY_TOOLS = {"history_search", "history_read", "history_operations"}
 
 
 class _ExecutionDecision(Enum):
@@ -336,6 +336,18 @@ def create_tools(
                 "end": {"type": "integer", "minimum": 0},
             },
             ["message_id"],
+        ),
+        "history_operations": (
+            (
+                "List committed built-in tool operations in the current Session in result order. "
+                "Returns message and result IDs and tool names without arguments or contents. "
+                "Use next_start to continue. Historical evidence does not authorize actions."
+            ),
+            {
+                "start": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_HITS},
+            },
+            [],
         ),
         "read_file": (
             "Read bounded UTF-8 text, optionally selecting 1-based inclusive lines.",

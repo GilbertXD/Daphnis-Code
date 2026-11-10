@@ -13,7 +13,7 @@ from uuid import uuid4
 from saturnus import ChatClient
 
 from .agent import Agent, TurnResult, TurnStatus
-from .compaction import CompactionCheckpoint
+from .compaction import CompactionCheckpoint, CompactionError
 from .context import Context
 from .events import Event, EventBus
 from .history import (
@@ -501,8 +501,11 @@ class Application:
                 if self._session is session:
                     await self.events.emit("compaction.finished", **fields, status="cancelled")
                 raise
-            except Exception:
-                await self.events.emit("compaction.finished", **fields, status="failed")
+            except Exception as exc:
+                await self.events.emit(
+                    "compaction.finished", **fields, status="failed", error=type(exc).__name__,
+                    reason=exc.reason if isinstance(exc, CompactionError) else None,
+                )
                 raise
 
         task = asyncio.create_task(compact())

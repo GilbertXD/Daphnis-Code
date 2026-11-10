@@ -24,7 +24,7 @@ from saturnus import (
 )
 
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, CompactionError, Compactor
-from .context import Context
+from .context import Context, history_range_hint
 from .events import EventBus
 from .model_io import (
     ContextOverflowError,
@@ -207,7 +207,9 @@ class Agent:
         return response
 
     @staticmethod
-    def _parse_response(response: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    def _parse_response(
+        response: dict[str, Any], *, require_visible: bool = True,
+    ) -> tuple[dict[str, Any], str | None]:
         message = get_message(response)
         if len(response["choices"]) != 1:
             raise ValueError("Agent requires exactly one response choice.")
@@ -220,7 +222,7 @@ class Agent:
             raise ValueError("Tool calls must be a list or null.")
         if reason == "stop" and calls:
             raise ValueError("A stop response unexpectedly contains tool calls.")
-        if reason == "stop" and not assistant_text(message):
+        if require_visible and reason == "stop" and not assistant_text(message):
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             if not calls:
@@ -247,11 +249,13 @@ class Agent:
 
     def _model_context(
         self, working: Messages, checkpoint: CompactionCheckpoint | None,
+        *, history_lookup: bool = False,
     ) -> list[dict[str, Any]]:
         if checkpoint is None:
             return self.context.build(working)
         return self.context.build(
             working, checkpoint, summary_reasoning=self._provider == "deepseek",
+            history_lookup=history_lookup,
         )
 
     async def _request_summary(
@@ -279,13 +283,18 @@ class Agent:
             extra_body=body, extra_headers=extra_headers,
         )
         await _checkpoint()
-        message, reason = self._parse_response(response)
+        try:
+            message, reason = self._parse_response(response, require_visible=False)
+        except (TypeError, ValueError, SaturnusError) as exc:
+            raise CompactionError("Invalid history summary response.", reason="summary_response") from exc
         await self.events.emit(
             "model.finished", **fields, finish_reason=reason, response=response,
         )
         content = message.get("content")
-        if reason != "stop" or not isinstance(content, str) or message.get("refusal"):
-            raise CompactionError("The model did not return a complete history summary.")
+        if reason != "stop":
+            raise CompactionError("The history summary did not finish normally.", reason="summary_finish")
+        if not isinstance(content, str) or not content.strip() or message.get("refusal"):
+            raise CompactionError("The history summary has no usable text.", reason="summary_content")
         return content
 
     async def compact(
@@ -308,7 +317,9 @@ class Agent:
         async def summarize(messages: list[dict[str, Any]], output_limit: int) -> str:
             nonlocal number
             if number >= min(self.max_maintenance_requests, self.max_total_requests):
-                raise CompactionError("No maintenance requests available for compaction.")
+                raise CompactionError(
+                    "No maintenance requests available for compaction.", reason="maintenance_limit",
+                )
             number += 1
             return await self._request_summary(model, messages, output_limit, {
                 "session_id": session.id, "turn_id": operation_id,
@@ -343,6 +354,7 @@ class Agent:
         summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]],
         fields: dict[str, Any],
         trigger: str = "pressure",
+        history_lookup: bool = False,
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
         overflow = trigger == "overflow"
@@ -350,6 +362,7 @@ class Agent:
         await self.events.emit("compaction.started", **fields, input_tokens=before)
         status = "skipped"
         error = None
+        failure_reason = None
         try:
             pruned = compactor.prune(messages)
             budget = self._request_budget(pruned, body, compactor)
@@ -364,6 +377,8 @@ class Agent:
                     fixed = self._request_budget(self.context.build(privileged), body, compactor)
                     available -= fixed.input_tokens + compactor.output_limit
                     available -= compactor.counter.count(SUMMARY_POLICY)
+                    if history_lookup:
+                        available -= compactor.counter.count(history_range_hint(len(raw)))
                 through = compactor.cut(
                     raw, checkpoint, within_turn=True, available_tokens=available,
                 )
@@ -372,8 +387,12 @@ class Agent:
                         candidate = await compactor.summarize(raw, checkpoint, through, summarize)
                     except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
                         error = type(exc).__name__
+                        if isinstance(exc, CompactionError):
+                            failure_reason = exc.reason
                     else:
-                        projected = compactor.prune(self._model_context(working, candidate))
+                        projected = compactor.prune(self._model_context(
+                            working, candidate, history_lookup=history_lookup,
+                        ))
                         after = self._request_budget(projected, body, compactor)
                         if after.input_tokens < budget.input_tokens:
                             checkpoint, messages, budget = candidate, projected, after
@@ -393,7 +412,7 @@ class Agent:
                 elif after_tokens < before:
                     status = "trimmed"
             await self.events.emit(
-                "compaction.finished", **fields, status=status, error=error,
+                "compaction.finished", **fields, status=status, error=error, reason=failure_reason,
                 before_tokens=before, after_tokens=after_tokens,
                 through=checkpoint.through if checkpoint else 0,
             )
@@ -449,6 +468,9 @@ class Agent:
             definitions = tools.definitions() if tools is not None else []
             if definitions:
                 require_tools(model)
+            history_lookup = {"history_search", "history_read"}.issubset(
+                item["function"]["name"] for item in definitions
+            )
             compactor = Compactor(
                 model.context_window, counter=model.token_counter, recent_tokens=self.recent_tokens,
             )
@@ -459,7 +481,9 @@ class Agent:
             async def summarize(messages: list[dict[str, Any]], limit: int) -> str:
                 nonlocal requests, maintenance_requests
                 if maintenance_requests >= self.max_maintenance_requests or requests + 1 >= self.max_total_requests:
-                    raise CompactionError("No maintenance requests available for compaction.")
+                    raise CompactionError(
+                        "No maintenance requests available for compaction.", reason="maintenance_limit",
+                    )
                 maintenance_requests += 1
                 requests += 1
                 return await self._request_summary(model, messages, limit, {
@@ -501,12 +525,13 @@ class Agent:
                     extra_body=extra_body,
                     custom_compatibility=self._custom_compatibility,
                 )
-                messages = self._model_context(working, checkpoint)
+                messages = self._model_context(working, checkpoint, history_lookup=history_lookup)
                 budget = self._request_budget(messages, body, compactor)
                 if budget.needs_compaction:
                     checkpoint, messages = await self._compact_request(
                         working=working, checkpoint=checkpoint, messages=messages,
                         body=body, compactor=compactor, summarize=summarize, fields=fields,
+                        history_lookup=history_lookup,
                     )
                     budget = self._request_budget(messages, body, compactor)
                 if not budget.fits:
@@ -530,6 +555,7 @@ class Agent:
                                 working=working, checkpoint=checkpoint, messages=messages,
                                 body=body, compactor=compactor, summarize=summarize,
                                 fields=failure_fields, trigger="overflow",
+                                history_lookup=history_lookup,
                             )
                             budget = self._request_budget(reduced, body, compactor)
                             if not budget.fits:
