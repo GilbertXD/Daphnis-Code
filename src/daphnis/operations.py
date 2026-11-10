@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
+from .compaction import CompactionCheckpoint
 from .events import Callback
 from .history import finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
@@ -327,6 +328,9 @@ class Operations:
 
     async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream)
+
+    async def compact(self) -> CompactionCheckpoint | None:
+        return await self._app._compact_session()
 
     async def cancel(self) -> None:
         self._app._ensure_open()

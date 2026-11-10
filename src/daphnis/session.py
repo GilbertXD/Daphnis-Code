@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from saturnus import Messages
 
+from .compaction import CompactionCheckpoint
 from .usage import UsageTotals
 
 
@@ -21,6 +22,7 @@ class Session:
     enabled_tools: tuple[str, ...] = ()
     _saved_revision: tuple[str, str] | None = field(default=None, repr=False, compare=False)
     title: str | None = None
+    compaction: CompactionCheckpoint | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):
@@ -53,3 +55,7 @@ class Session:
             not isinstance(self.title, str) or not self.title.strip()
         ):
             raise ValueError("title must be a non-empty string or None.")
+        if self.compaction is not None:
+            if not isinstance(self.compaction, CompactionCheckpoint):
+                raise TypeError("compaction must be a CompactionCheckpoint or None.")
+            self.compaction.validate(self.messages.snapshot())

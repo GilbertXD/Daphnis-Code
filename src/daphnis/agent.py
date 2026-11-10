@@ -20,6 +20,7 @@ from saturnus import (
     get_message,
 )
 
+from .compaction import CompactionCheckpoint, CompactionError, Compactor
 from .context import Context
 from .events import EventBus
 from .models import (
@@ -205,6 +206,67 @@ class Agent:
                 ids.add(call_id)
         return message, reason
 
+    async def _request_summary(
+        self,
+        model: ModelInfo,
+        messages: list[dict[str, Any]],
+        output_limit: int,
+        fields: dict[str, Any],
+        extra_headers: dict[str, str] | None = None,
+    ) -> str:
+        can_disable_thinking = "off" in (model.thinking_modes or ()) and (
+            model.provider != "compatible" or self._custom_compatibility
+        )
+        body = prepare_request_options(
+            model=model,
+            thinking_mode="off" if can_disable_thinking else None,
+            output_limit=output_limit,
+            custom_compatibility=self._custom_compatibility,
+        )
+        await self.events.emit(
+            "model.started", **fields, provider=model.provider, model_id=model.id,
+        )
+        response = await self._request(
+            model=model.id, messages=messages, stream=False, event_fields=fields,
+            extra_body=body, extra_headers=extra_headers,
+        )
+        await _checkpoint()
+        message, reason = self._parse_response(response)
+        content = message.get("content")
+        if reason != "stop" or not isinstance(content, str) or message.get("refusal"):
+            raise CompactionError("The model did not return a complete history summary.")
+        return content
+
+    async def compact(
+        self, *, session: Session, operation_id: str,
+    ) -> CompactionCheckpoint | None:
+        """Propose a manual checkpoint. The caller owns the session transaction."""
+        if session.provider != self._provider:
+            raise ValueError("Session provider does not match the ChatClient connection.")
+        model = resolve_model(session.provider, session.model_id, catalog=self._catalog)
+        compactor = Compactor(model.context_window)
+        raw = session.messages.snapshot()
+        previous = session.compaction
+        through = compactor.cut(raw, previous)
+        if through is None:
+            return None
+        number = 0
+
+        async def summarize(messages: list[dict[str, Any]], output_limit: int) -> str:
+            nonlocal number
+            number += 1
+            return await self._request_summary(model, messages, output_limit, {
+                "session_id": session.id, "turn_id": operation_id,
+                "request_number": number, "purpose": "compaction", "maintenance": True,
+            })
+
+        checkpoint = await compactor.summarize(raw, previous, through, summarize)
+        before = self.context.build(session.messages, previous)
+        after = self.context.build(session.messages, checkpoint)
+        if request_budget(after, {}, None).input_tokens >= request_budget(before, {}, None).input_tokens:
+            return None
+        return checkpoint
+
     async def run(
         self,
         *,
@@ -256,7 +318,7 @@ class Agent:
                 require_tools(model)
             for _ in range(self.max_requests):
                 await _checkpoint()
-                messages = self.context.build(working)
+                messages = self.context.build(working, session.compaction)
                 requests += 1
                 request_fields = {**fields, "request_number": requests}
                 await self.events.emit(

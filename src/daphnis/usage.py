@@ -98,6 +98,11 @@ class UsageTracker:
             self.turn = UsageTotals()
             self._requests.clear()
             return
+        maintenance = event.data.get("maintenance") is True
+        if maintenance and event.name == "model.started" and event.turn_id != self.turn_id:
+            self._base = self.session
+            self.turn_id = event.turn_id
+            self._requests.clear()
         if event.turn_id != self.turn_id:
             return
         number = event.data["request_number"]
@@ -108,7 +113,8 @@ class UsageTracker:
         totals = UsageTotals()
         for usage in self._requests.values():
             totals = totals.plus(usage or UsageTotals(requests=1))
-        self.turn = totals
+        if not maintenance:
+            self.turn = totals
         self.session = self._base.plus(totals)
 
     def close(self) -> None:

@@ -8,10 +8,12 @@ from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from saturnus import ChatClient
 
 from .agent import Agent, TurnResult, TurnStatus
+from .compaction import CompactionCheckpoint
 from .context import Context
 from .events import EventBus
 from .history import (
@@ -81,7 +83,7 @@ class Application:
         self._history = history if history is not None else History()
         self._interactive = interactive
         self._observe_model_io = observe_model_io
-        self._task: asyncio.Task[TurnResult] | None = None
+        self._task: asyncio.Task[TurnResult] | asyncio.Task[CompactionCheckpoint | None] | None = None
         self._approval_mode = ApprovalMode.AUTO
         self._approval: asyncio.Future[ApprovalDecision] | None = None
         self._pending_approval: ApprovalRequest | None = None
@@ -402,6 +404,65 @@ class Application:
                 return result
 
         task = asyncio.create_task(run())
+        self._task = task
+        try:
+            return await task
+        finally:
+            if self._task is task:
+                self._task = None
+
+    async def _compact_session(self) -> CompactionCheckpoint | None:
+        self._ensure_idle()
+        session = self._session
+        provider = session.provider
+        agent = Agent(
+            client=self._client(provider), provider=provider, catalog=self._catalog,
+            custom_compatibility=self._connection(provider).get("compatibility") is not None,
+            events=self.events,
+        )
+        fields = {"session_id": session.id, "turn_id": uuid4().hex, "trigger": "manual"}
+
+        async def compact() -> CompactionCheckpoint | None:
+            await self.events.emit("compaction.started", **fields)
+            try:
+                async with self._history.lease(session) as lease:
+                    try:
+                        checkpoint = await agent.compact(
+                            session=session, operation_id=fields["turn_id"],
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        if self._has_usage_to_save():
+                            try:
+                                await self._save_session(session, lease=lease)
+                            except Exception:
+                                logger.exception("压缩用量未能保存。")
+                        raise
+                    if checkpoint is None:
+                        if self._has_usage_to_save():
+                            await self._save_session(session, lease=lease)
+                        await self.events.emit("compaction.finished", **fields, status="skipped")
+                        return None
+                    updated = replace(session, compaction=checkpoint)
+
+                    async def commit() -> None:
+                        await self._save_session(updated, lease=lease)
+                        self._session = updated
+                        await self.events.emit(
+                            "compaction.finished", **fields,
+                            status="committed", through=checkpoint.through,
+                        )
+
+                    await finish_io(commit())
+                    return checkpoint
+            except asyncio.CancelledError:
+                if self._session is session:
+                    await self.events.emit("compaction.finished", **fields, status="cancelled")
+                raise
+            except Exception:
+                await self.events.emit("compaction.finished", **fields, status="failed")
+                raise
+
+        task = asyncio.create_task(compact())
         self._task = task
         try:
             return await task

@@ -13,6 +13,7 @@ from typing import Self, TypeVar
 
 from saturnus import Messages
 
+from .compaction import CompactionCheckpoint
 from .session import Session
 from .usage import UsageTotals
 
@@ -195,6 +196,7 @@ class History:
             thinking=session.thinking,
             enabled_tools=session.enabled_tools,
             title=session.title,
+            compaction=session.compaction,
         )
         data = {
             "version": 2,
@@ -209,6 +211,8 @@ class History:
         }
         if validated.title is not None:
             data["title"] = validated.title
+        if validated.compaction is not None:
+            data["compaction"] = asdict(validated.compaction)
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())
@@ -259,6 +263,11 @@ class History:
         enabled_tools = data["enabled_tools"]
         if not isinstance(enabled_tools, list):
             raise TypeError("Session enabled_tools must be a JSON array.")
+        checkpoint = data.get("compaction")
+        if checkpoint is not None:
+            if not isinstance(checkpoint, dict) or checkpoint.keys() != {"through", "summary"}:
+                raise ValueError("Invalid session compaction checkpoint.")
+            checkpoint = CompactionCheckpoint(**checkpoint)
         return Session(
             id=data["id"],
             workspace=data["workspace"],
@@ -270,4 +279,5 @@ class History:
             usage=UsageTotals.from_dict(data["usage"]),
             _saved_revision=(session_id, sha256(raw).hexdigest()),
             title=data.get("title"),
+            compaction=checkpoint,
         )

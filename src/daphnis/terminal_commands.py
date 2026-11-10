@@ -30,6 +30,7 @@ HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型�
 /mcp [reconnect|disconnect|refresh Server名]  查看 MCP 状态或管理连接
 /session [会话ID]  列出或恢复会话
 /new  新建会话，保留旧会话
+/compact  压缩旧上下文，保留原始历史
 /clear  仅清理屏幕，保留历史
 /help  显示帮助
 Enter 发送；Shift+Enter 换行；Alt+Enter / F2 为换行备用键。
@@ -87,6 +88,12 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
                 raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
     if ops.running:
         raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
+    if name == "/compact" and not args:
+        checkpoint = await ops.compact()
+        return CommandResult(text=(
+            f"已压缩至第 {checkpoint.through} 条消息，原始历史保留。"
+            if checkpoint is not None else "当前没有可有效压缩的旧上下文。"
+        ))
     if name == "/approval":
         if args:
             if len(args) != 1 or args[0] not in tuple(ApprovalMode):
