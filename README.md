@@ -23,6 +23,26 @@ PYTHONDONTWRITEBYTECODE=1 uv run --locked python -m unittest discover -s tests -
 uv run --locked ruff check --no-cache .
 ```
 
+### Web 客户端
+
+在仓库根目录配置好同一个 `.env`，然后运行：
+
+```sh
+npm --prefix web ci
+npm --prefix web run build
+uv run --locked --extra web daphnis-web --workspace .
+```
+
+前端构建需要 Node.js 20.19+ 或 22.12+。打开终端打印的
+`http://127.0.0.1:8765`，输入同一终端显示的 Web 访问令牌。
+可用 `--port` 指定其他端口，或用 `--session <会话 ID>` 代替
+`--workspace`，恢复使用该会话保存的工作区。
+
+每个 Web 进程运行一个本地 Agent，同一进程的多个标签页共享当前会话。
+会话历史与终端客户端共用。刷新或断线重连可恢复当前运行状态、待审批请求和
+已缓存的调试记录。关闭调试栏、刷新页面或关闭浏览器连接时，Agent 继续运行。
+重启服务会生成新的访问令牌，并清空进程内调试记录。
+
 ## 运行结构
 
 Daphnis 是基于 Saturnus 和 Textual 的终端编程助手。启动入口负责加载

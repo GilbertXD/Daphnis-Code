@@ -5,7 +5,7 @@ import json
 import os
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -87,6 +87,7 @@ class SessionInfo:
     model_id: str
     message_count: int
     updated_at: float
+    title: str | None = None
 
 
 class History:
@@ -114,6 +115,7 @@ class History:
                         session.model_id,
                         len(session.messages),
                         path.stat().st_mtime,
+                        session.title,
                     )
                 )
             except (OSError, TypeError, ValueError) as exc:
@@ -163,6 +165,17 @@ class History:
     async def save_async(self, session: Session, *, lease: SessionLease | None = None) -> None:
         await finish_io(asyncio.to_thread(self.save, session, lease=lease))
 
+    async def rename(self, session_id: str, title: str) -> None:
+        def update() -> None:
+            self.save(replace(self.load(session_id), title=title))
+
+        await finish_io(asyncio.to_thread(update))
+
+    async def delete(self, session: Session) -> None:
+        async with self.lease(session) as lease:
+            # Keep the stable lock file so concurrent processes lock the same inode.
+            await finish_io(asyncio.to_thread(lease.destination.unlink, missing_ok=True))
+
     def save(self, session: Session, *, lease: SessionLease | None = None) -> None:
         destination = self._path(session.id)
         if lease is None:
@@ -181,6 +194,7 @@ class History:
             usage=session.usage,
             thinking=session.thinking,
             enabled_tools=session.enabled_tools,
+            title=session.title,
         )
         data = {
             "version": 2,
@@ -193,6 +207,8 @@ class History:
             "messages": validated.messages.snapshot(),
             "usage": asdict(validated.usage),
         }
+        if validated.title is not None:
+            data["title"] = validated.title
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())
@@ -253,4 +269,5 @@ class History:
             messages=Messages(data["messages"]),
             usage=UsageTotals.from_dict(data["usage"]),
             _saved_revision=(session_id, sha256(raw).hexdigest()),
+            title=data.get("title"),
         )

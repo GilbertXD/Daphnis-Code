@@ -1,0 +1,148 @@
+import { memo } from 'react'
+import { clock } from './protocol'
+import type { AgentEvent, Usage, View } from './protocol'
+import { DataBlock, ToolRow } from './transcript'
+import type { TraceTool } from './transcript'
+
+export type Tab = 'events' | 'tools' | 'context' | 'requests'
+
+const tabs: { id: Tab; title: string }[] = [
+  { id: 'events', title: '事件' }, { id: 'tools', title: '工具' },
+  { id: 'context', title: '上下文' }, { id: 'requests', title: '请求 / 响应' },
+]
+
+const names: Record<string, string> = {
+  'turn.started': '新一轮对话开始',
+  'turn.finished': 'Agent 结束本轮',
+  'model.started': '开始模型请求',
+  'model.request': '取得实际请求 JSON',
+  'model.delta': '收到流式分片（合并展示）',
+  'model.usage': '模型报告 Token 用量',
+  'model.finished': '收到完整模型响应',
+  'model.response_error': '模型 HTTP 响应出错',
+  'tool.started': '开始调用工具',
+  'tool.approval_requested': '需要确认工具权限',
+  'tool.blocked': '工具调用已拦截',
+  'tool.finished': '工具调用结束',
+  'web.send_finished': 'Operation 返回',
+  'mcp.error': 'MCP 连接错误',
+  'mcp.tools_changed': 'MCP 工具目录更新',
+}
+
+function Tokens({ title, usage }: { title: string; usage: Usage | null }) {
+  return <div><strong>{title}</strong>{usage ? <dl className="facts">
+    <div><dt>输入</dt><dd>{usage.prompt_tokens.toLocaleString()}</dd></div>
+    <div><dt>输出</dt><dd>{usage.completion_tokens.toLocaleString()}</dd></div>
+    <div><dt>合计</dt><dd>{usage.total_tokens.toLocaleString()}</dd></div>
+    <div><dt>报告用量的请求</dt><dd>{usage.reported_requests} / {usage.requests}</dd></div>
+    {usage.unrecorded && <div><dt>历史用量</dt><dd>记录不完整</dd></div>}
+  </dl> : <p className="muted">暂无</p>}</div>
+}
+
+function StatusPanel({ view }: { view: View }) {
+  const { status, state } = view
+  return <details className="debug-status">
+    <summary>运行状态 <span className="muted">
+      {status.approval ? '等待审批' : status.running ? '运行中' : '空闲'} · {status.session_usage.total_tokens.toLocaleString()} Tokens
+    </span></summary>
+    <dl className="facts">
+      <div><dt>会话</dt><dd>{state.session.id}</dd></div>
+      <div><dt>工作区</dt><dd>{state.session.workspace}</dd></div>
+      <div><dt>模型</dt><dd>{state.model.provider} / {state.model.id}</dd></div>
+      <div><dt>窗口</dt><dd>{state.model.context_window?.toLocaleString() ?? '未知'}</dd></div>
+      <div><dt>审批模式</dt><dd>{state.approval_mode}</dd></div>
+    </dl>
+    <Tokens title="本轮 Token" usage={status.turn_usage} />
+    <Tokens title="会话 Token" usage={status.session_usage} />
+  </details>
+}
+
+const Timeline = memo(function Timeline({ events }: { events: AgentEvent[] }) {
+  if (!events.length) return <p className="muted">此会话暂无已捕获的事件。</p>
+  return <ol className="timeline">{events.map((event) => (
+    <li key={event.id}>
+      <time>{clock(event.time)}</time>
+      <details>
+        <summary><strong>{event.name}</strong><span className="muted">
+          {names[event.name] ?? event.name}{event.data.name ? ' · ' + event.data.name : ''}
+          {event.data.chunks != null ? ` · ${event.data.chunks} 个流式分片` : ''}
+        </span></summary>
+        <DataBlock value={{ turn_id: event.turn_id, ...event.data }} />
+      </details>
+    </li>
+  ))}</ol>
+})
+
+const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
+  const requests = new Map<string, AgentEvent[]>()
+  for (const event of events) {
+    if (!['model.started', 'model.request', 'model.finished', 'model.response_error'].includes(event.name)) continue
+    const key = `${event.turn_id}:${event.data.request_number}`
+    const items = requests.get(key) ?? []
+    items.push(event)
+    requests.set(key, items)
+  }
+  if (!requests.size) return <p className="muted">运行一轮后可查看模型请求和响应。</p>
+  return <div className="request-list">{[...requests].reverse().map(([key, items]) => {
+    const request = items.find((event) => event.name === 'model.request')
+    const response = items.find((event) => event.name === 'model.finished' || event.name === 'model.response_error')
+    const first = items[0]
+    return <details className="request-row" key={key}>
+      <summary>请求 {first.data.request_number} <span className="muted">
+        {clock(first.time)}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
+      </span></summary>
+      <h4>请求 JSON</h4>
+      {request?.data.body
+        ? <DataBlock value={request.data.body} />
+        : <p className="muted">{request?.data.omitted ?? '暂无可用的 HTTP 请求正文。'}</p>}
+      <h4>响应 JSON</h4>
+      {response?.data.response || response?.data.body
+        ? <DataBlock value={response.data.response ?? response.data.body} />
+        : <p className="muted">{response?.data.omitted ?? '暂无完整 JSON 响应。'}</p>}
+    </details>
+  })}</div>
+})
+
+export function Debug({ view, tools, tab, select, close }: {
+  view: View
+  tools: TraceTool[]
+  tab: Tab
+  select: (tab: Tab) => void
+  close: () => void
+}) {
+  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && event.data.body?.messages)
+  return <aside className="debug" aria-label="调试详情">
+    <div className="debug-heading">
+      <button className="icon" aria-label="关闭调试面板" onClick={close}>›</button>
+      <h2>调试详情</h2>
+    </div>
+    <div className="tabs" role="group" aria-label="调试页签">{tabs.map(({ id, title }) =>
+      <button key={id} type="button" aria-pressed={tab === id} onClick={() => select(id)}>{title}</button>)}
+    </div>
+    <div className="debug-body" key={tab}>
+      {tab === 'events' && <Timeline events={view.events} />}
+      {tab === 'tools' && (tools.length ? tools.map((tool) => <ToolRow key={tool.key} tool={tool}
+        inspect={document.getElementById(`tool-${tool.key}`) ? () => {
+          const row = document.getElementById(`tool-${tool.key}`) as HTMLDetailsElement | null
+          if (row) {
+            row.open = true
+            row.scrollIntoView({ block: 'center' })
+            row.querySelector('summary')?.focus({ preventScroll: true })
+          }
+        } : undefined} />) : <p className="muted">此会话暂无已捕获的工具调用。</p>)}
+      {tab === 'context' && <>
+        <details className="context-group" open><summary>最近模型请求的上下文</summary>
+          {lastRequest
+            ? <DataBlock value={lastRequest.data.body?.messages} />
+            : <p className="muted">暂无已捕获的请求上下文。</p>}
+        </details>
+        <details className="context-group" open={!lastRequest}><summary>当前已提交消息</summary>
+          <DataBlock value={view.state.messages} />
+        </details>
+      </>}
+      {tab === 'requests' && <Requests events={view.events} />}
+      <StatusPanel view={view} />
+      <p className="debug-note">调试数据保留在当前服务进程中，按会话有限缓存。浏览器收到的内容已执行凭据脱敏。</p>
+    </div>
+  </aside>
+}

@@ -1,6 +1,6 @@
 """Public business operations and read-only views of an Application."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
+from .events import Callback
 from .history import finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
@@ -28,6 +29,7 @@ class SessionSnapshot:
     workspace: Path
     provider: str
     model_id: str
+    title: str | None = None
 
 
 class Operations:
@@ -40,12 +42,17 @@ class Operations:
     def session(self) -> SessionSnapshot:
         session = self._app._session
         return SessionSnapshot(
-            session.id, Path(session.workspace), session.provider, session.model_id
+            session.id, Path(session.workspace), session.provider, session.model_id,
+            session.title,
         )
 
     def message_snapshot(self) -> list[dict[str, Any]]:
         """Return detached copies of committed messages for display."""
         return self._app._session.messages.snapshot()
+
+    def subscribe(self, name: str, callback: Callback) -> Callable[[], None]:
+        """Subscribe to detached event snapshots and return an unsubscribe function."""
+        return self._app.events.on(name, callback)
 
     @property
     def model(self) -> ModelInfo:
@@ -280,6 +287,42 @@ class Operations:
         app._session = restored
         app._use_saved_tool_preferences = True
         app._usage.select_session(restored.id, restored.usage)
+
+    async def rename_session(self, session_id: str, title: str) -> None:
+        app = self._app
+        app._ensure_idle()
+        if not isinstance(title, str) or not 0 < len(title.strip()) <= 120:
+            raise ValueError("会话名称必须包含 1–120 个字符。")
+        if session_id == self.session.id:
+            await app._update_session(replace(app._session, title=title.strip()))
+        else:
+            async with app._state_lock:
+                await app._history.rename(session_id, title.strip())
+
+    async def delete_session(self, session_id: str) -> SessionSnapshot:
+        """Delete under the history lease; replace an active session with a blank one."""
+        app = self._app
+        app._ensure_idle()
+        current = app._session
+
+        async def delete_and_select() -> None:
+            if session_id != current.id:
+                await app._history.delete(app._history.load(session_id))
+                return
+            fresh = Session(
+                workspace=current.workspace,
+                provider=current.provider,
+                model_id=current.model_id,
+                thinking=current.thinking,
+                enabled_tools=current.enabled_tools,
+            )
+            await app._history.delete(current)
+            app._session = fresh
+            app._usage.select_session(fresh.id, fresh.usage)
+
+        async with app._state_lock:
+            await finish_io(delete_and_select())
+        return self.session
 
     async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream)

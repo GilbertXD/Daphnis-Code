@@ -12,8 +12,12 @@ dependencies = [
     "textual>=8.2.8",
 ]
 
+[project.optional-dependencies]
+web = ["starlette>=1.10,<2", "uvicorn>=0.54,<1", "websockets>=15,<17"]
+
 [project.scripts]
 daphnis = "daphnis.cli:main"
+daphnis-web = "daphnis.web.__main__:main"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]

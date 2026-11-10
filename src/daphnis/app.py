@@ -22,6 +22,7 @@ from .history import (
     finish_io,
 )
 from .mcp import TOOL_PREFIX, MCPConnection
+from .model_io import ObservedChatClient
 from .models import (
     MODELS,
     ModelInfo,
@@ -67,6 +68,7 @@ class Application:
         history: History | None = None,
         catalog: Sequence[ModelInfo] = MODELS,
         interactive: bool = False,
+        observe_model_io: bool = False,
     ) -> None:
         self._catalog = tuple(catalog)
         validate_catalog(self._catalog)
@@ -78,6 +80,7 @@ class Application:
         self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
         self._interactive = interactive
+        self._observe_model_io = observe_model_io
         self._task: asyncio.Task[TurnResult] | None = None
         self._approval_mode = ApprovalMode.AUTO
         self._approval: asyncio.Future[ApprovalDecision] | None = None
@@ -113,7 +116,12 @@ class Application:
             options["compatibility"] = provider_compatibility(
                 provider, override=options.get("compatibility")
             )
-            self._clients[provider] = ChatClient(**options)
+            if self._observe_model_io:
+                self._clients[provider] = ObservedChatClient(
+                    events=self.events, provider=provider, **options
+                )
+            else:
+                self._clients[provider] = ChatClient(**options)
         return self._clients[provider]
 
     def _model_for(self, provider: str, model_id: str) -> ModelInfo:

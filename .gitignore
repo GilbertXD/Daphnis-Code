@@ -15,3 +15,6 @@ wheels/
 .DS_Store
 
 AGENTS.md
+
+# Web dependencies
+web/node_modules/

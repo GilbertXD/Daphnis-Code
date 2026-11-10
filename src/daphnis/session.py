@@ -20,6 +20,7 @@ class Session:
     thinking: str | None = None
     enabled_tools: tuple[str, ...] = ()
     _saved_revision: tuple[str, str] | None = field(default=None, repr=False, compare=False)
+    title: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):
@@ -48,3 +49,7 @@ class Session:
             raise ValueError("enabled_tools must contain non-empty tool names.")
         if len(set(self.enabled_tools)) != len(self.enabled_tools):
             raise ValueError("enabled_tools must not contain duplicates.")
+        if self.title is not None and (
+            not isinstance(self.title, str) or not self.title.strip()
+        ):
+            raise ValueError("title must be a non-empty string or None.")
