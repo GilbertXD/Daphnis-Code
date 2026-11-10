@@ -15,6 +15,8 @@ _EVENT_NAMES = (
     "model.delta", "model.usage", "model.finished", "model.response_error",
     "tool.started", "tool.approval_requested", "tool.blocked", "tool.finished",
     "mcp.error", "mcp.tools_changed",
+    "context.budget", "context.overflow",
+    "compaction.started", "compaction.finished", "compaction.committed", "compaction.discarded",
 )
 _MAX_EVENT_BYTES = 1024 * 1024
 _MAX_JOURNAL_BYTES = 4 * _MAX_EVENT_BYTES
@@ -148,6 +150,7 @@ class Bridge:
         reset = previous_session != session or (journal is not None and cursor < journal.floor)
         approval = ops.pending_approval
         usage = ops.turn_usage
+        budget = ops.context_budget
         frame = {
             "session_id": session,
             "revision": self.revision,
@@ -159,6 +162,9 @@ class Bridge:
                 "approval": asdict(approval) if approval else None,
                 "session_usage": asdict(ops.session_usage),
                 "turn_usage": asdict(usage) if usage else None,
+                "context_budget": asdict(budget) if budget else None,
+                "compacting": ops.compacting,
+                "compacted_through": ops.compacted_through,
             }),
             "run": self.redactor.json(self.run),
             "live": {

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from .agent import TurnResult
     from .app import Application
     from .history import SessionInfo
+    from .token_budget import TokenBudget
     from .tools import ApprovalRequest
     from .usage import UsageTotals
 
@@ -102,6 +103,23 @@ class Operations:
     @property
     def turn_usage(self) -> "UsageTotals | None":
         return self._app._usage.turn
+
+    @property
+    def context_budget(self) -> "TokenBudget | None":
+        observed = self._app._last_budget
+        session = self.session
+        if observed is not None and observed[:3] == (session.id, session.provider, session.model_id):
+            return observed[3]
+        return None
+
+    @property
+    def compacting(self) -> bool:
+        return self._app._compacting
+
+    @property
+    def compacted_through(self) -> int:
+        checkpoint = self._app._session.compaction
+        return checkpoint.through if checkpoint else 0
 
     def configured(self, provider: str) -> bool:
         return provider in self._app._connections

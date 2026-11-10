@@ -2,11 +2,59 @@
 
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
+from typing import Any
 
 from saturnus import APIError, ChatClient, ResponseError
 
 logger = logging.getLogger(__name__)
+
+
+_CONTEXT_CODES = {
+    "context_length_exceeded", "context_window_exceeded", "context_size_exceeded",
+    "max_context_length_exceeded", "model_context_window_exceeded",
+}
+_CONTEXT_MESSAGE = re.compile(
+    r"maximum context length is \d|context (?:length|window|size) (?:has been )?exceeded"
+    r"|(?:exceeds?|exceeded) (?:the )?(?:maximum |model )?context (?:length|window|size)"
+    r"|input tokens? exceed(?:s|ed)? (?:the )?limit",
+    re.IGNORECASE,
+)
+
+
+class ContextOverflowError(RuntimeError):
+    """The provider explicitly rejected the context size."""
+
+    def __init__(self, *, retryable: bool = True) -> None:
+        super().__init__("The provider rejected the request because the context window was exceeded.")
+        self.retryable = retryable
+
+
+def is_context_overflow(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    error = payload.get("error", payload)
+    if isinstance(error, str):
+        return bool(_CONTEXT_MESSAGE.search(error))
+    if not isinstance(error, dict):
+        return False
+    if any(
+        isinstance(value := error.get(field), str) and value.lower() in _CONTEXT_CODES
+        for field in ("code", "type")
+    ):
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and bool(_CONTEXT_MESSAGE.search(message))
+
+
+def is_http_context_overflow(exc: APIError | ResponseError) -> bool:
+    if exc.response.status_code not in (200, 400, 413, 422, 500):
+        return False
+    try:
+        return is_context_overflow(exc.response.json())
+    except (ValueError, RuntimeError):
+        return False
 
 
 class ObservedChatClient(ChatClient):
@@ -29,6 +77,8 @@ class ObservedChatClient(ChatClient):
             "turn_id": event.turn_id,
             "request_number": event.data["request_number"],
         }
+        if "purpose" in event.data:
+            fields["purpose"] = event.data["purpose"]
         try:
             await self._events.emit(
                 "model.request",

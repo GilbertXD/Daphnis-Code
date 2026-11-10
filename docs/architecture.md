@@ -19,8 +19,9 @@
 | [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 通过公共 Operations 查询或执行操作，通过 `Operations.subscribe()` 观察事件，再投影成浏览器快照、流式文本和有界调试记录。Bridge 持有的是 Web 任务、游标和缓存，Core 状态以 Operations 为准。 |
 | [Operations](../src/daphnis/operations.py) | 提供面向客户端的命令、只读视图及订阅入口。在共享运行状态上校验操作，协调会话和配置变更。 |
 | [Application](../src/daphnis/app.py) | 持有当前 Session、History、按厂商缓存的客户端、工具目录、MCP 连接、审批和用量跟踪器。为每轮装配 Agent，管理任务、持久化、取消和资源清理。 |
-| [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 负责模型和工具循环及消息提交。Context 从工作消息创建请求快照，在其前面按需加入系统提示。 |
-| [Session](../src/daphnis/session.py)、[History](../src/daphnis/history.py) | Session 持有已提交消息、工作区、模型、思考档位、工具偏好和用量。History 负责本地 V2 JSON、会话列表、版本校验和写入互斥。 |
+| [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 负责模型和工具循环及消息提交。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
+| [Token Budget](../src/daphnis/token_budget.py)、[Compactor](../src/daphnis/compaction.py) | 估算模型请求输入与输出空间。Compactor 选择完整的工具交换边界，在请求副本中修剪输出，并将旧消息摘要为检查点。 |
+| [Session](../src/daphnis/session.py)、[History](../src/daphnis/history.py) | Session 持有已提交原始消息、摘要检查点、工作区、模型、思考档位、工具偏好和用量。History 负责本地 V2 JSON、会话列表、版本校验和写入互斥。 |
 | [模型适配](../src/daphnis/models)、[模型观测](../src/daphnis/model_io.py) | Daphnis 管理模型能力目录，检查工具和思考选项，并为厂商配置 Saturnus `Compatibility` 映射。Saturnus 提供 Chat Completions 通信、消息与流式响应累积、工具参数校验和注册表执行。可选的模型观测通过 Saturnus 的公开响应接口读取 HTTP 数据。 |
 | [工具与审批](../src/daphnis/tools)、[MCP](../src/daphnis/mcp/__init__.py) | ToolExecutor 在调用 Saturnus 注册表执行前检查路径、权限和审批。MCP 模块通过 SDK 建立连接、发现工具、处理目录变化和调用结果，发现的工具进入同一套审批流程。 |
 | [EventBus](../src/daphnis/events.py)、[Usage](../src/daphnis/usage.py) | EventBus 分发观察通知。UsageTracker 按请求记录 API 报告的用量并汇总到本轮与会话，流式的重复用量快照以该请求的最新报告为准。 |
@@ -28,17 +29,21 @@
 ## 一轮任务的生命周期
 
 1. Application 检查运行状态，选定本轮模型、思考档位、审批模式和在线工具，然后取得会话租约。
-2. Agent 将已提交消息复制到本轮工作消息，加入用户输入。每次请求带上系统提示和当前工作消息，后续请求继续携带工具调用与结果。常见工具失败作为工具结果交给模型，严重错误终止本轮。
-3. 模型正常结束并给出可见文本或拒绝内容时，Agent 提交本轮消息。提交前失败或取消时，已提交消息保留原状。已执行命令、写入文件或 MCP 调用可能留下外部副作用。
-4. Application 保存成功轮的消息，失败或取消轮的已报告用量也可独立保存。磁盘保存失败时，`SessionSaveError` 携带原始 `TurnResult`，已提交的内存消息仍可读取。
+2. Agent 将已提交消息复制到本轮工作消息，加入用户输入。每次请求使用 Context 构造的有效上下文，后续请求继续携带完整的工具调用与结果配对。常见工具失败作为工具结果交给模型，严重错误终止本轮。
+3. 模型正常结束并给出可见文本或拒绝内容时，Agent 一起提交本轮原始消息和暂存检查点。提交前失败或取消时，已提交状态保留原状。已执行命令、写入文件或 MCP 调用可能留下外部副作用。
+4. Application 保存成功轮的消息，失败或取消轮的已报告用量也可独立保存。磁盘保存失败时，`SessionSaveError` 携带原始 `TurnResult`，已提交的内存消息和检查点仍可读取。
 
-当前 Context 使用完整历史构造请求。模型目录中的上下文窗口是能力信息，Context 目前没有自动裁剪或压缩步骤。
+### 上下文与压缩
+
+预算以模型目录登记的窗口为准，按序列化消息、工具定义等估算输入 Token，并预留输出和估算余量。DeepSeek 的默认输出预留随思考档位变化。窗口未知时仍会报告输入估算。已知窗口接近阈值时，Agent 先在请求副本中修剪旧工具输出，再按需摘要旧历史。摘要优先保留当前用户消息和最近一次工具交换。最新工具输出本身过大时也可发送摘录，调用 ID 和结果配对仍完整。
+
+手动 `/compact` 优先保留最近一轮。摘要作为低权限的历史数据发送，生成摘要的请求没有工具。明确的服务端上下文超限可以触发压缩，整个 Turn 最多重试一次，且要求请求确实缩短、流式输出尚未开始。摘要请求和重试计入本轮模型请求上限。
 
 ### 本地历史与并发
 
-默认目录是 `~/.daphnis/sessions`，消息、工具结果、思考档位和工具偏好保存在 V2 JSON 中。CLI、TUI 与 Web 使用同一目录。History 在同目录写临时文件后替换目标 JSON，并以稳定的 POSIX 锁文件协调 Daphnis 进程。
+默认目录是 `~/.daphnis/sessions`，消息、工具结果、思考档位和工具偏好保存在 V2 JSON 中。可选的压缩检查点与原始消息在同一个 JSON 中原子保存。旧会话缺少检查点时使用完整历史。CLI、TUI 与 Web 使用同一目录。History 在同目录写临时文件后替换目标 JSON，并以稳定的 POSIX 锁文件协调 Daphnis 进程。
 
-租约覆盖模型请求、工具调用、人工审批和保存。同会话的锁已被占用时会立即抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`，需重新加载后再继续。不同会话可以并行。保存和设置写入在线程中执行，取消会等待已开始的写入完成后再释放租约。锁只协调遵守同一机制的进程。
+租约覆盖模型请求、工具调用、人工审批、手动压缩和保存。同会话的锁已被占用时会立即抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`，需重新加载后再继续。不同会话可以并行。保存和设置写入在线程中执行，取消会等待已开始的写入完成后再释放租约。锁只协调遵守同一机制的进程。
 
 ## 事件订阅
 
@@ -49,6 +54,9 @@
 | `turn.started`、`turn.finished` | Agent 开始和结束本轮。结束事件包含状态、错误、请求及工具调用计数、可能的外部副作用，在 Application 落盘之前发出。 |
 | `model.started`、`model.delta`、`model.usage`、`model.finished` | 以从 1 开始的 `request_number` 标识本轮内的请求，分别提供请求身份、流式分片、API 用量及解析后的模型响应。 |
 | `model.request`、`model.response_error` | 启用 `observe_model_io` 时，根据可用的 HTTP 响应观测实际请求 JSON、HTTP 状态及错误响应正文。Web 启动启用此选项。 |
+| `context.budget`、`context.overflow` | 主模型请求的输入估算、窗口、输出预留和阈值，以及明确超限后的恢复决定。 |
+| `compaction.started`、`compaction.finished` | 手动、压力或超限触发的压缩尝试及结果。摘要模型请求以 `purpose=compaction` 标识。 |
+| `compaction.committed`、`compaction.discarded` | 自动检查点随 Turn 在内存中提交或丢弃。 |
 | `tool.started`、`tool.approval_requested`、`tool.blocked`、`tool.finished` | 携带请求序号、工具调用 ID 和工具名。审批事件额外提供独立的 `request_id`，工具结束事件包含状态、内容和错误。 |
 | `mcp.error`、`mcp.tools_changed` | 通知连接异常或工具目录刷新，`turn_id` 为空字符串。 |
 

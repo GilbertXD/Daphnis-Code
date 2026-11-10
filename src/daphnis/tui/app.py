@@ -216,6 +216,11 @@ class DaphnisApp(App[None]):
             "model.delta",
             "model.finished",
             "model.usage",
+            "context.budget",
+            "context.overflow",
+            "compaction.started",
+            "compaction.finished",
+            "compaction.committed",
             "tool.started",
             "tool.finished",
             "tool.approval_requested",
@@ -247,6 +252,8 @@ class DaphnisApp(App[None]):
         state = (
             "approval"
             if ops.pending_approval
+            else "compacting"
+            if ops.compacting
             else "running"
             if busy
             else "ready"
@@ -277,6 +284,9 @@ class DaphnisApp(App[None]):
             model_id=session.model_id,
             thinking=ops.thinking,
             tools=len(ops.effective_tools),
+            context_budget=ops.context_budget,
+            context_window=ops.model.context_window,
+            compacted_through=ops.compacted_through,
         )
         for picker in self.query(ModelPicker):
             picker.disabled = busy
@@ -295,7 +305,10 @@ class DaphnisApp(App[None]):
         if event.name == "mcp.tools_changed":
             self.update_status()
             return
-        await self.query_one(ChatView).event(event)
+        if event.name == "context.overflow" and event.data["retrying"]:
+            self.notify("上下文超限，已缩短请求并重试。")
+        if event.data.get("purpose") != "compaction":
+            await self.query_one(ChatView).event(event)
         if event.name == "tool.approval_requested":
             request = self.ops.pending_approval
             if request is not None and request.request_id == event.data["request_id"]:

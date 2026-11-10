@@ -48,16 +48,28 @@ export type Usage = {
   unrecorded: boolean
 }
 
+export type ContextBudget = {
+  input_tokens: number
+  context_window: number | null
+  output_reserve: number
+  compaction_threshold: number | null
+  needs_compaction: boolean
+}
+
 export type Status = {
   running: boolean
   approval: Approval | null
   session_usage: Usage
   turn_usage: Usage | null
+  context_budget: ContextBudget | null
+  compacting: boolean
+  compacted_through: number
 }
 
 export type EventData = {
   name?: string
   request_number?: number
+  purpose?: string
   tool_call_id?: string
   arguments?: string
   content?: string | null

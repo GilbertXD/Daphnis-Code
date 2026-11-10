@@ -27,6 +27,15 @@ class TokenBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(unknown.compaction_threshold)
         self.assertFalse(unknown.needs_compaction)
 
+    def test_deepseek_reserves_the_default_completion_space_for_each_mode(self):
+        for mode, reserve in ((None, 65_536), ("off", 8192), ("max", 131_072)):
+            with self.subTest(mode=mode):
+                body = {"thinking_mode": mode} if mode else {}
+                budget = request_budget([], body, 1_048_576, provider="deepseek")
+                self.assertEqual(budget.output_reserve, reserve)
+        budget = request_budget([], {"output_limit": 512}, 1_048_576, provider="deepseek")
+        self.assertEqual(budget.output_reserve, 512)
+
     async def test_budget_observation_leaves_model_request_unchanged(self):
         state = session()
         model = ModelInfo("model-a", "compatible", context_window=80, supports_tools=True)

@@ -80,6 +80,40 @@ async def submit(ui, pilot, text):
 
 
 class TUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_command_updates_status_without_rendering_summary_as_chat(self):
+        summary = json.dumps({
+            "goals": "keep the release tag", "progress": "tag recorded",
+            "files": "", "next_steps": "continue",
+        })
+
+        def handler(request):
+            body = json.loads(request.content)
+            if body.get("stream"):
+                self.assertEqual(body["messages"][1]["reasoning_content"], "")
+                self.assertIn("history summary", body["messages"][1]["content"])
+                return sse({"role": "assistant", "content": "continued"})
+            return httpx.Response(200, json={"choices": [{
+                "index": 0, "message": {"role": "assistant", "content": summary},
+                "finish_reason": "stop",
+            }]})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            app = controller(Path(temporary), handler)
+            app._session.messages.add_user("old conversation " * 180)
+            app._session.messages.add_assistant("old answer")
+            app._session.messages.add_user("latest task")
+            app._session.messages.add_assistant("latest answer")
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "/compact")
+                await until(pilot, lambda: ops.compacted_through == 2)
+                self.assertIn("摘要至 #2", ui.query_one(UsageView).tooltip)
+                await submit(ui, pilot, "continue")
+                await until(pilot, lambda: len(ops.message_snapshot()) == 6)
+                self.assertIn("上下文 ≈", ui.query_one(UsageView).tooltip)
+                self.assertNotIn(summary, [row.text for row in ui.query(ChatRow)])
+
     async def test_terminal_controls_are_removed_after_streaming_and_before_render(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = controller(Path(temporary), lambda request: self.fail("Unexpected model call"))

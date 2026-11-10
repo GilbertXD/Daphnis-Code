@@ -25,6 +25,12 @@ const names: Record<string, string> = {
   'tool.blocked': '工具调用已拦截',
   'tool.finished': '工具调用结束',
   'web.send_finished': 'Operation 返回',
+  'context.budget': '估算模型请求的上下文占用',
+  'context.overflow': '模型确认上下文超限',
+  'compaction.started': '开始压缩上下文',
+  'compaction.finished': '压缩尝试结束',
+  'compaction.committed': '随 Turn 提交压缩检查点',
+  'compaction.discarded': '丢弃暂存的压缩检查点',
   'mcp.error': 'MCP 连接错误',
   'mcp.tools_changed': 'MCP 工具目录更新',
 }
@@ -43,13 +49,19 @@ function StatusPanel({ view }: { view: View }) {
   const { status, state } = view
   return <details className="debug-status">
     <summary>运行状态 <span className="muted">
-      {status.approval ? '等待审批' : status.running ? '运行中' : '空闲'} · {status.session_usage.total_tokens.toLocaleString()} Tokens
+      {status.approval ? '等待审批' : status.compacting ? '压缩上下文' : status.running ? '运行中' : '空闲'} · {status.session_usage.total_tokens.toLocaleString()} Tokens
     </span></summary>
     <dl className="facts">
       <div><dt>会话</dt><dd>{state.session.id}</dd></div>
       <div><dt>工作区</dt><dd>{state.session.workspace}</dd></div>
       <div><dt>模型</dt><dd>{state.model.provider} / {state.model.id}</dd></div>
       <div><dt>窗口</dt><dd>{state.model.context_window?.toLocaleString() ?? '未知'}</dd></div>
+      {status.context_budget && <>
+        <div><dt>最近请求输入估算</dt><dd>≈ {status.context_budget.input_tokens.toLocaleString()}</dd></div>
+        <div><dt>输出预留</dt><dd>{status.context_budget.output_reserve.toLocaleString()}</dd></div>
+        <div><dt>压缩阈值</dt><dd>{status.context_budget.compaction_threshold?.toLocaleString() ?? '未知'}</dd></div>
+      </>}
+      <div><dt>摘要检查点</dt><dd>{status.compacted_through ? `第 ${status.compacted_through} 条消息` : '无'}</dd></div>
       <div><dt>审批模式</dt><dd>{state.approval_mode}</dd></div>
     </dl>
     <Tokens title="本轮 Token" usage={status.turn_usage} />
@@ -89,7 +101,7 @@ const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
     const first = items[0]
     return <details className="request-row" key={key}>
       <summary>请求 {first.data.request_number} <span className="muted">
-        {clock(first.time)}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
+        {clock(first.time)}{first.data.purpose === 'compaction' ? ' · 历史摘要' : ''}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
       </span></summary>
       <h4>请求 JSON</h4>
       {request?.data.body
@@ -110,7 +122,7 @@ export function Debug({ view, tools, tab, select, close }: {
   select: (tab: Tab) => void
   close: () => void
 }) {
-  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && event.data.body?.messages)
+  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && event.data.purpose !== 'compaction' && event.data.body?.messages)
   return <aside className="debug" aria-label="调试详情">
     <div className="debug-heading">
       <button className="icon" aria-label="关闭调试面板" onClick={close}>›</button>

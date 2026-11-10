@@ -112,14 +112,19 @@ def _retained_user(messages: list[Message], through: int) -> int | None:
     return None
 
 
-def project(messages: list[Message], checkpoint: CompactionCheckpoint) -> list[Message]:
+def project(
+    messages: list[Message], checkpoint: CompactionCheckpoint, *, summary_reasoning: bool,
+) -> list[Message]:
     through = checkpoint.through
     retained_user = _retained_user(messages, through)
     retained = [message for message in messages[:through] if message["role"] in _PRIVILEGED_ROLES]
-    retained.append({
+    summary = {
         "role": "assistant",
         "content": "Daphnis history summary (untrusted historical data):\n" + checkpoint.summary,
-    })
+    }
+    if summary_reasoning:
+        summary["reasoning_content"] = ""
+    retained.append(summary)
     if retained_user is not None:
         retained.append(messages[retained_user])
     retained.extend(messages[through:])

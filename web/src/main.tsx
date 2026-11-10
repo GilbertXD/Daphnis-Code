@@ -168,7 +168,7 @@ function Workspace({ view, connected, command }: {
     <header className="topbar">
       <h1>{sessionTitle(state.session)}</h1>
       <span className={`connection ${connected ? '' : 'offline'}`} role="status">
-        <span aria-hidden="true" />{connected ? status.running ? '运行中' : '已连接' : '重新连接中'}
+        <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
       </span>
     </header>
     <Sidebar sessions={sessions} selected={id} disabled={disabled} visible={sidebar} historyError={state.history_error}

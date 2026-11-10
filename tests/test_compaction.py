@@ -7,7 +7,15 @@ from unittest.mock import patch
 
 import httpx
 from saturnus import Messages
-from test_agent_core import make_client, registry, reply, session, tool_call
+from test_agent_core import (
+    CATALOG,
+    make_client,
+    registry,
+    reply,
+    session,
+    stream_reply,
+    tool_call,
+)
 
 from daphnis import Agent, Context, History, Operations, TurnStatus
 from daphnis.app import Application, SessionSaveError
@@ -242,3 +250,107 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             restored = history.load(ops.session.id)
             self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
             self.assertEqual(restored.compaction, app._session.compaction)
+
+
+class OverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unknown_window_recovers_http_overflow_without_reexecuting_tools(self):
+        state = session()
+        requested, executed, recoveries = [], [], []
+
+        def execute(text):
+            executed.append(text)
+            return "large result " * 160
+
+        def handler(request):
+            body = json.loads(request.content)
+            requested.append(body["messages"])
+            if len(requested) == 1:
+                return httpx.Response(200, json=reply(
+                    None, finish="tool_calls", calls=[tool_call()],
+                ))
+            if len(requested) == 2:
+                return httpx.Response(400, json={"error": {"code": "context_length_exceeded"}})
+            self.assertEqual(requested[-1][-1]["tool_call_id"], "call-1")
+            self.assertIn("Tool output excerpt", requested[-1][-1]["content"])
+            return httpx.Response(200, json=reply())
+
+        async with make_client(handler) as client:
+            agent = Agent(client=client, provider="compatible", catalog=CATALOG, tools=registry(execute))
+            agent.events.on("context.overflow", recoveries.append)
+            result = await agent.run(session=state, prompt="use a tool")
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(result.model_requests, 3)
+        self.assertEqual(len(executed), 1)
+        self.assertTrue(recoveries[0].data["retrying"])
+        self.assertEqual(state.messages.get(2)["content"], "large result " * 160)
+
+    async def test_streaming_overflow_retries_once_and_discards_checkpoint_on_failure(self):
+        state = session()
+        state.messages.add_user("large prior history " * 150)
+        state.messages.add_assistant("prior answer")
+        original = state.messages.snapshot()
+        events, requested = [], []
+
+        def handler(request):
+            body = json.loads(request.content)
+            requested.append(body)
+            if not body.get("stream"):
+                return httpx.Response(200, json=reply(SUMMARY))
+            return stream_reply({"error": {"message": "This model's maximum context length is 1000 tokens."}})
+
+        async with make_client(handler) as client:
+            agent = Agent(client=client, provider="compatible")
+            agent.events.on("context.overflow", events.append)
+            result = await agent.run(session=state, prompt="continue", stream=True)
+        self.assertEqual(result.status, TurnStatus.FAILED)
+        self.assertIn("context window was exceeded", result.error)
+        self.assertEqual([bool(body.get("stream")) for body in requested], [True, False, True])
+        self.assertEqual([event.data["retrying"] for event in events], [True, False])
+        self.assertEqual(events[-1].data["reason"], "retry_exhausted")
+        self.assertIsNone(state.compaction)
+        self.assertEqual(state.messages.snapshot(), original)
+
+    async def test_only_explicit_overflow_retries_and_requires_reduction(self):
+        cases = (
+            (429, {"error": {"code": "rate_limit", "message": "Rate limit exceeded"}}, None),
+            (400, {"error": {"message": "Invalid tool input"}}, None),
+            (400, {"error": {"message": "Unable to determine maximum context length"}}, None),
+            (200, reply("truncated", finish="length"), None),
+            (400, {"message": "Input token exceed the limit"}, "no_reduction"),
+        )
+        for status, payload, reason in cases:
+            with self.subTest(status=status, reason=reason):
+                events, requests = [], []
+
+                def handler(request, requests=requests, status=status, payload=payload):
+                    requests.append(request)
+                    return httpx.Response(status, json=payload)
+
+                async with make_client(handler) as client:
+                    agent = Agent(client=client, provider="compatible")
+                    agent.events.on("context.overflow", events.append)
+                    result = await agent.run(session=session(), prompt="cannot reduce this")
+                self.assertEqual(result.status, TurnStatus.FAILED)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual([event.data["reason"] for event in events], [reason] if reason else [])
+
+    async def test_stream_with_visible_output_is_not_retried(self):
+        state = session()
+        state.messages.add_user("older data " * 150)
+        state.messages.add_assistant("older response")
+        requested, events = [], []
+
+        def handler(request):
+            requested.append(request)
+            return stream_reply(
+                {"choices": [{"index": 0, "delta": {"content": "visible output"}, "finish_reason": None}]},
+                {"error": {"type": "context_window_exceeded"}},
+            )
+
+        async with make_client(handler) as client:
+            agent = Agent(client=client, provider="compatible")
+            agent.events.on("context.overflow", events.append)
+            result = await agent.run(session=state, prompt="continue", stream=True)
+        self.assertEqual(result.status, TurnStatus.FAILED)
+        self.assertEqual(len(requested), 1)
+        self.assertEqual(events[0].data["reason"], "stream_started")

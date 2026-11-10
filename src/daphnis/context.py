@@ -15,12 +15,13 @@ class Context:
 
     def build(
         self, working_messages: Messages, checkpoint: CompactionCheckpoint | None = None,
+        *, summary_reasoning: bool = False,
     ) -> list[dict[str, Any]]:
         """Working messages include all committed and pending raw history."""
         messages = working_messages.snapshot()
         prompt = self.system_prompt
         if checkpoint is not None:
-            messages = project(messages, checkpoint)
+            messages = project(messages, checkpoint, summary_reasoning=summary_reasoning)
             prompt = f"{prompt}\n\n{SUMMARY_POLICY}" if prompt is not None else SUMMARY_POLICY
         if prompt is not None:
             messages.insert(0, {"role": "system", "content": prompt})

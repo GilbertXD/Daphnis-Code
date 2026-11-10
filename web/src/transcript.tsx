@@ -196,7 +196,7 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
   const { run, live, events } = view
   const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id) : []
   const finished = run?.turn_id
-    ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished')
+    ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
     : []
   const requests = [...new Set([
     ...Object.keys(live).map(Number), ...activeTools.map((tool) => tool.number),

@@ -10,9 +10,11 @@ from typing import Any
 from uuid import uuid4
 
 from saturnus import (
+    APIError,
     ChatClient,
     Messages,
     ResponseAccumulator,
+    ResponseError,
     SaturnusError,
     ToolCallValidationError,
     ToolExecutionError,
@@ -24,6 +26,11 @@ from saturnus import (
 from .compaction import CompactionCheckpoint, CompactionError, Compactor
 from .context import Context
 from .events import EventBus
+from .model_io import (
+    ContextOverflowError,
+    is_context_overflow,
+    is_http_context_overflow,
+)
 from .models import (
     MODELS,
     ModelInfo,
@@ -33,7 +40,7 @@ from .models import (
 )
 from .models.models import validate_catalog
 from .session import Session
-from .token_budget import request_budget
+from .token_budget import TokenBudget, request_budget
 from .tools import ToolExecutor
 
 _ACTIVE_SESSIONS: set[str] = set()
@@ -138,6 +145,8 @@ class Agent:
                 extra_body=extra_body,
                 extra_headers=extra_headers,
             )
+            if "error" in response and is_context_overflow(response):
+                raise ContextOverflowError
             if response.get("usage") is not None:
                 await self.events.emit(
                     "model.usage", **event_fields, usage=response["usage"]
@@ -145,6 +154,7 @@ class Agent:
             return response
         accumulator = ResponseAccumulator()
         refusals: dict[int, list[str]] = {}
+        streamed = False
         async with self._client.stream(
             model=model,
             messages=messages,
@@ -152,7 +162,13 @@ class Agent:
             extra_headers=extra_headers,
         ) as chunks:
             async for chunk in chunks:
+                if "error" in chunk and is_context_overflow(chunk):
+                    raise ContextOverflowError(retryable=not streamed)
                 accumulator.add_chunk(chunk)
+                streamed |= any(
+                    any(value for key, value in choice["delta"].items() if key != "role")
+                    for choice in chunk["choices"]
+                )
                 for choice in chunk["choices"]:
                     refusal = choice["delta"].get("refusal")
                     if isinstance(refusal, str) and refusal:
@@ -207,6 +223,15 @@ class Agent:
                 ids.add(call_id)
         return message, reason
 
+    def _model_context(
+        self, working: Messages, checkpoint: CompactionCheckpoint | None,
+    ) -> list[dict[str, Any]]:
+        if checkpoint is None:
+            return self.context.build(working)
+        return self.context.build(
+            working, checkpoint, summary_reasoning=self._provider == "deepseek",
+        )
+
     async def _request_summary(
         self,
         model: ModelInfo,
@@ -233,6 +258,9 @@ class Agent:
         )
         await _checkpoint()
         message, reason = self._parse_response(response)
+        await self.events.emit(
+            "model.finished", **fields, finish_reason=reason, response=response,
+        )
         content = message.get("content")
         if reason != "stop" or not isinstance(content, str) or message.get("refusal"):
             raise CompactionError("The model did not return a complete history summary.")
@@ -262,11 +290,19 @@ class Agent:
             })
 
         checkpoint = await compactor.summarize(raw, previous, through, summarize)
-        before = self.context.build(session.messages, previous)
-        after = self.context.build(session.messages, checkpoint)
+        before = self._model_context(session.messages, previous)
+        after = self._model_context(session.messages, checkpoint)
         if request_budget(after, {}, None).input_tokens >= request_budget(before, {}, None).input_tokens:
             return None
         return checkpoint
+
+    def _request_budget(
+        self, messages: list[dict[str, Any]], body: dict[str, Any], window: int | None,
+    ) -> TokenBudget:
+        return request_budget(
+            messages, body, window,
+            provider=None if self._custom_compatibility else self._provider,
+        )
 
     async def _compact_request(
         self,
@@ -278,32 +314,34 @@ class Agent:
         compactor: Compactor,
         summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]],
         fields: dict[str, Any],
+        trigger: str = "pressure",
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
-        fields = {**fields, "trigger": "pressure"}
+        fields = {**fields, "trigger": trigger}
+        overflow = trigger == "overflow"
         window = compactor.context_window
-        before = request_budget(messages, body, window).input_tokens
+        before = self._request_budget(messages, body, window).input_tokens
         await self.events.emit("compaction.started", **fields, input_tokens=before)
         status = "skipped"
         error = None
         try:
             pruned = compactor.prune(messages)
-            budget = request_budget(pruned, body, window)
+            budget = self._request_budget(pruned, body, window)
             messages = pruned
-            if budget.needs_compaction:
+            if overflow or budget.needs_compaction:
                 raw = working.snapshot()
                 through = compactor.cut(raw, checkpoint, within_turn=True)
                 if through is not None:
                     try:
                         candidate = await compactor.summarize(raw, checkpoint, through, summarize)
-                    except (CompactionError, SaturnusError, ValueError) as exc:
+                    except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
                         error = type(exc).__name__
                     else:
-                        projected = compactor.prune(self.context.build(working, candidate))
-                        after = request_budget(projected, body, window)
+                        projected = compactor.prune(self._model_context(working, candidate))
+                        after = self._request_budget(projected, body, window)
                         if after.input_tokens < budget.input_tokens:
                             checkpoint, messages, budget = candidate, projected, after
                             status = "staged"
-            if budget.needs_compaction:
+            if overflow or budget.needs_compaction:
                 # The latest exchange can itself be oversized. Keep its IDs and excerpts.
                 messages = compactor.prune(messages, include_latest=True)
             return checkpoint, messages
@@ -311,9 +349,12 @@ class Agent:
             status = "cancelled"
             raise
         finally:
-            after_tokens = request_budget(messages, body, window).input_tokens
+            after_tokens = self._request_budget(messages, body, window).input_tokens
             if status == "skipped":
-                status = "failed" if error else "trimmed" if after_tokens < before else "skipped"
+                if error:
+                    status = "failed"
+                elif after_tokens < before:
+                    status = "trimmed"
             await self.events.emit(
                 "compaction.finished", **fields, status=status, error=error,
                 before_tokens=before, after_tokens=after_tokens,
@@ -342,6 +383,7 @@ class Agent:
         final_message: dict[str, Any] | None = None
         requests = calls_executed = 0
         side_effects = False
+        retried_overflow = False
         committed_checkpoint = checkpoint = session.compaction
         try:
             provider, model_id = session.provider, session.model_id
@@ -381,10 +423,32 @@ class Agent:
                     **fields, "request_number": requests, "purpose": "compaction",
                 }, extra_headers)
 
-            for _ in range(self.max_requests):
+            async def send_request(
+                messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                nonlocal requests
+                requests += 1
+                request_fields = {**fields, "request_number": requests}
+                await self.events.emit(
+                    "model.started", **request_fields, provider=provider, model_id=model_id,
+                )
+                await self.events.emit(
+                    "context.budget", **request_fields, **asdict(budget),
+                    provider=provider, model_id=model_id,
+                )
+                try:
+                    response = await self._request(
+                        model=model_id, messages=messages, stream=stream,
+                        event_fields=request_fields, extra_body=body, extra_headers=extra_headers,
+                    )
+                except (APIError, ResponseError) as exc:
+                    if is_http_context_overflow(exc):
+                        raise ContextOverflowError from exc
+                    raise
+                return response, request_fields
+
+            while requests < self.max_requests:
                 await _checkpoint()
-                if requests >= self.max_requests:
-                    raise RuntimeError("Maximum model-request count exceeded.")
                 body = prepare_request_options(
                     model=model,
                     thinking_mode=thinking_mode,
@@ -393,31 +457,45 @@ class Agent:
                     extra_body=extra_body,
                     custom_compatibility=self._custom_compatibility,
                 )
-                messages = self.context.build(working, checkpoint)
-                budget = request_budget(messages, body, model.context_window)
+                messages = self._model_context(working, checkpoint)
+                budget = self._request_budget(messages, body, model.context_window)
                 if budget.needs_compaction:
                     checkpoint, messages = await self._compact_request(
                         working=working, checkpoint=checkpoint, messages=messages,
                         body=body, compactor=compactor, summarize=summarize, fields=fields,
                     )
-                    budget = request_budget(messages, body, model.context_window)
-                requests += 1
-                request_fields = {**fields, "request_number": requests}
-                await self.events.emit(
-                    "model.started",
-                    **request_fields,
-                    provider=provider,
-                    model_id=model_id,
-                )
-                await self.events.emit("context.budget", **request_fields, **asdict(budget))
-                response = await self._request(
-                    model=model_id,
-                    messages=messages,
-                    stream=stream,
-                    event_fields=request_fields,
-                    extra_body=body,
-                    extra_headers=extra_headers,
-                )
+                    budget = self._request_budget(messages, body, model.context_window)
+                while True:
+                    try:
+                        response, request_fields = await send_request(messages, body, budget)
+                        break
+                    except ContextOverflowError as exc:
+                        failure_fields = {**fields, "request_number": requests}
+                        reason = None
+                        if retried_overflow:
+                            reason = "retry_exhausted"
+                        elif not exc.retryable:
+                            reason = "stream_started"
+                        elif requests >= self.max_requests:
+                            reason = "request_limit"
+                        if reason is None:
+                            before = budget.input_tokens
+                            checkpoint, reduced = await self._compact_request(
+                                working=working, checkpoint=checkpoint, messages=messages,
+                                body=body, compactor=compactor, summarize=summarize,
+                                fields=failure_fields, trigger="overflow",
+                            )
+                            budget = self._request_budget(reduced, body, model.context_window)
+                            if budget.input_tokens >= before:
+                                reason = "no_reduction"
+                        await self.events.emit(
+                            "context.overflow", **failure_fields,
+                            retrying=reason is None, reason=reason,
+                        )
+                        if reason is not None:
+                            raise
+                        retried_overflow = True
+                        messages = reduced
                 await _checkpoint()
                 message, reason = self._parse_response(response)
                 await self.events.emit(

@@ -15,7 +15,7 @@ from saturnus import ChatClient
 from .agent import Agent, TurnResult, TurnStatus
 from .compaction import CompactionCheckpoint
 from .context import Context
-from .events import EventBus
+from .events import Event, EventBus
 from .history import (
     History,
     SessionBusyError,
@@ -33,6 +33,7 @@ from .models import (
 )
 from .models.models import validate_catalog
 from .session import Session
+from .token_budget import TokenBudget
 from .tools import (
     ApprovalDecision,
     ApprovalMode,
@@ -103,9 +104,28 @@ class Application:
         if not Path(self._session.workspace).is_dir():
             raise ValueError("Workspace 必须是现有目录。")
         self.events = EventBus()
+        self._last_budget: tuple[str, str, str, TokenBudget] | None = None
+        self._compacting = False
+        for name in ("context.budget", "compaction.started", "compaction.finished"):
+            self.events.on(name, self._observe_context)
         self._usage = UsageTracker(self.events)
         self._usage.select_session(self._session.id, self._session.usage)
         self._client(provider)
+
+    def _observe_context(self, event: Event) -> None:
+        if event.session_id != self._session.id:
+            return
+        if event.name == "context.budget":
+            data = event.data
+            self._last_budget = (
+                event.session_id, data["provider"], data["model_id"],
+                TokenBudget(
+                    data["input_tokens"], data["context_window"], data["output_reserve"],
+                    data["compaction_threshold"], data["needs_compaction"],
+                ),
+            )
+        else:
+            self._compacting = event.name == "compaction.started"
 
     def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:

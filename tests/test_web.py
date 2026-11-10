@@ -48,11 +48,22 @@ class WebTests(unittest.TestCase):
         self.workspace.mkdir()
         self.history = History(root / "sessions")
         self.requests = []
+        self.overflowed = False
 
         async def provider(request):
             body = json.loads(request.content)
             self.requests.append(body)
             last = body["messages"][-1]
+            if "Summarize the coding conversation" in body["messages"][0]["content"]:
+                return httpx.Response(200, json={"choices": [{
+                    "index": 0, "message": {"role": "assistant", "content": json.dumps({
+                        "goals": "continue", "progress": "recorded old state",
+                        "files": "", "next_steps": "reply",
+                    })}, "finish_reason": "stop",
+                }]})
+            if last.get("content") == "overflow" and not self.overflowed:
+                self.overflowed = True
+                return httpx.Response(400, json={"error": {"code": "context_window_exceeded"}})
             if last.get("content") == "pause":
                 self.resume = asyncio.Event()
                 return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedReply(
@@ -118,6 +129,30 @@ class WebTests(unittest.TestCase):
                 return frame
             time.sleep(0.01)
         self.fail("Expected Web state did not appear")
+
+    def test_context_status_and_diagnostics_preserve_the_full_transcript(self):
+        initial = self.snapshot()
+        sid = initial["session_id"]
+        old_prompt = "long historical text " * 140
+        self.command("send", sid, 202, prompt=old_prompt)
+        self.wait_for(lambda frame: not frame["status"]["running"] and len(frame["state"]["messages"]) == 2)
+        self.command("send", sid, 202, prompt="overflow")
+        frame = self.wait_for(
+            lambda frame: not frame["status"]["running"] and frame["status"]["compacted_through"] == 2
+        )
+        self.assertEqual(frame["state"]["messages"][0]["content"], old_prompt)
+        self.assertEqual(len(frame["state"]["messages"]), 4)
+        self.assertGreater(frame["status"]["context_budget"]["input_tokens"], 0)
+        self.assertFalse(frame["status"]["compacting"])
+        names = [event["name"] for event in frame["events"]]
+        self.assertIn("context.overflow", names)
+        self.assertIn("compaction.committed", names)
+        summary_requests = [
+            event for event in frame["events"]
+            if event["name"] == "model.request" and event["data"].get("purpose") == "compaction"
+        ]
+        self.assertEqual(len(summary_requests), 1)
+        self.assertIn("history summary", self.requests[-1]["messages"][1]["content"])
 
     def test_access_session_and_configuration(self):
         with (

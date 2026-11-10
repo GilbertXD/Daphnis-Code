@@ -10,6 +10,8 @@ _DEFAULT_RESERVE = 16_384
 def estimate_tokens(value: Any) -> int:
     """Approximate serialized text, charging more for non-ASCII text."""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if text.isascii():
+        return (len(text) + 2) // 3
     ascii_count = sum(character.isascii() for character in text)
     non_ascii_bytes = len(text.encode("utf-8", errors="surrogatepass")) - ascii_count
     return (ascii_count + 2) // 3 + (non_ascii_bytes + 1) // 2
@@ -28,6 +30,8 @@ def request_budget(
     messages: list[dict[str, Any]],
     body: dict[str, Any],
     context_window: int | None,
+    *,
+    provider: str | None = None,
 ) -> TokenBudget:
     # Only prompt-bearing options are counted as input. Allow for chat framing.
     input_tokens = estimate_tokens(messages) + 4 * len(messages) + 3
@@ -39,10 +43,16 @@ def request_budget(
         for field in ("output_limit", "max_tokens", "max_completion_tokens")
         if type(limit := body.get(field)) is int and limit > 0
     ]
-    reserve = max(limits) if limits else (
-        _DEFAULT_RESERVE if context_window is None
-        else min(_DEFAULT_RESERVE, max(1, context_window // 8))
-    )
+    if limits:
+        reserve = max(limits)
+    elif provider == "deepseek":
+        # DeepSeek Chat Completions defaults for off, default thinking, and max effort.
+        reserve = {"off": 8192, "max": 131_072}.get(body.get("thinking_mode"), 65_536)
+    else:
+        reserve = (
+            _DEFAULT_RESERVE if context_window is None
+            else min(_DEFAULT_RESERVE, max(1, context_window // 8))
+        )
     threshold = (
         None if context_window is None
         else max(0, context_window - reserve - context_window // 20)
