@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -6,11 +7,12 @@ from unittest.mock import patch
 
 import httpx
 from saturnus import Messages
-from test_agent_core import reply, tool_call
+from test_agent_core import make_client, registry, reply, session, tool_call
 
-from daphnis import Context, History, Operations, TurnStatus
-from daphnis.app import Application
+from daphnis import Agent, Context, History, Operations, TurnStatus
+from daphnis.app import Application, SessionSaveError
 from daphnis.compaction import CompactionCheckpoint, CompactionError, safe_boundaries
+from daphnis.models import ModelInfo
 from daphnis.terminal_commands import terminal_command
 
 SUMMARY = json.dumps({
@@ -115,3 +117,128 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         checkpoint.validate(raw.snapshot())
         effective = Context().build(raw, checkpoint)
         self.assertEqual(effective[-2:], [raw.get(0), raw.get(4)])
+
+
+SMALL_MODEL = ModelInfo("model-a", "compatible", context_window=1200, supports_tools=True)
+
+
+class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_tool_loop_trims_then_summarizes_and_commits_raw_history(self):
+        state = session()
+        tool_output = "tool-data " * 150
+        calls, requests, events = [], [], []
+
+        def execute(text):
+            calls.append(text)
+            return tool_output
+
+        def handler(request):
+            body = json.loads(request.content)
+            messages = body["messages"]
+            if "Summarize" in messages[0]["content"]:
+                self.assertNotIn("tools", body)
+                return httpx.Response(200, json=reply(SUMMARY))
+            requests.append(messages)
+            if len(requests) <= 7:
+                return httpx.Response(200, json=reply(
+                    None, finish="tool_calls", calls=[tool_call(str(len(requests)))],
+                ))
+            return httpx.Response(200, json=reply("finished"))
+
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(SMALL_MODEL,),
+                tools=registry(execute),
+            )
+            for event in ("compaction.finished", "compaction.committed", "context.budget"):
+                agent.events.on(event, events.append)
+            result = await agent.run(session=state, prompt="active user request")
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(len(calls), 7)
+        raw = state.messages.snapshot()
+        self.assertEqual([item["content"] for item in raw if item["role"] == "tool"], [tool_output] * 7)
+        self.assertIsNotNone(state.compaction)
+        state.compaction.validate(raw)
+        self.assertTrue(any(event.data.get("status") == "trimmed" for event in events))
+        self.assertTrue(any(event.data.get("status") == "staged" for event in events))
+        self.assertTrue(any(event.name == "compaction.committed" for event in events))
+        for sent in requests:
+            self.assertIn(raw[0], sent)
+            self.assertIn(len(sent), safe_boundaries(sent))
+            self.assertNotIn("Tool output excerpt", sent[-1].get("content", "") or "")
+        budgets = [event.data for event in events if event.name == "context.budget"]
+        self.assertFalse(any(budget["needs_compaction"] for budget in budgets))
+
+    async def test_cancel_or_failure_after_staging_keeps_committed_checkpoint(self):
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                state = session()
+                state.messages.add_user("old request")
+                state.messages.add_assistant("old answer")
+                state.messages.add_user("older raw data " * 350)
+                state.messages.add_assistant("older response")
+                prior = CompactionCheckpoint(2, SUMMARY)
+                state.compaction = prior
+                original = state.messages.snapshot()
+                entered, discarded = asyncio.Event(), []
+
+                async def handler(request, entered=entered, cancel=cancel):
+                    body = json.loads(request.content)
+                    if "Summarize" in body["messages"][0]["content"]:
+                        return httpx.Response(200, json=reply(SUMMARY))
+                    entered.set()
+                    if cancel:
+                        await asyncio.Future()
+                    return httpx.Response(500, json={"error": "server failure"})
+
+                async with make_client(handler) as client:
+                    agent = Agent(client=client, provider="compatible", catalog=(SMALL_MODEL,))
+                    agent.events.on("compaction.discarded", discarded.append)
+                    task = asyncio.create_task(agent.run(session=state, prompt="continue"))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assertEqual(state.compaction, prior)
+                    if cancel:
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    else:
+                        self.assertEqual((await task).status, TurnStatus.FAILED)
+                self.assertEqual(state.messages.snapshot(), original)
+                self.assertEqual(state.compaction, prior)
+                self.assertEqual(discarded[0].data["through"], 4)
+
+    async def test_disk_failure_keeps_each_history_and_checkpoint_pair_consistent(self):
+        def handler(request):
+            body = json.loads(request.content)
+            summary = "Summarize" in body["messages"][0]["content"]
+            return httpx.Response(200, json=reply(SUMMARY if summary else "done"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(Path(directory) / "history")
+            app = Application(
+                workspace=directory, provider="compatible", model_id="model-a",
+                connections={"compatible": {
+                    "base_url": "https://model.test/v1", "transport": httpx.MockTransport(handler),
+                }}, history=history, catalog=(SMALL_MODEL,),
+            )
+            self.addAsyncCleanup(app.close)
+            ops = Operations(app)
+            await ops.set_tools(())
+            app._session.messages.add_user("original " * 600)
+            app._session.messages.add_assistant("answer")
+            history.save(app._session)
+            before = history.load(ops.session.id)
+            with (
+                patch.object(history, "_replace", side_effect=OSError("disk unavailable")),
+                self.assertRaises(SessionSaveError),
+            ):
+                await ops.send("continue", stream=False)
+            disk = history.load(ops.session.id)
+            self.assertEqual(disk.messages.snapshot(), before.messages.snapshot())
+            self.assertIsNone(disk.compaction)
+            self.assertEqual(len(ops.message_snapshot()), 4)
+            app._session.compaction.validate(ops.message_snapshot())
+            self.assertEqual((await ops.send("continue again", stream=False)).status, TurnStatus.COMPLETED)
+            restored = history.load(ops.session.id)
+            self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
+            self.assertEqual(restored.compaction, app._session.compaction)

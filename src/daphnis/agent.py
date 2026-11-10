@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -13,6 +13,7 @@ from saturnus import (
     ChatClient,
     Messages,
     ResponseAccumulator,
+    SaturnusError,
     ToolCallValidationError,
     ToolExecutionError,
     ToolRegistry,
@@ -267,6 +268,58 @@ class Agent:
             return None
         return checkpoint
 
+    async def _compact_request(
+        self,
+        *,
+        working: Messages,
+        checkpoint: CompactionCheckpoint | None,
+        messages: list[dict[str, Any]],
+        body: dict[str, Any],
+        compactor: Compactor,
+        summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]],
+        fields: dict[str, Any],
+    ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
+        fields = {**fields, "trigger": "pressure"}
+        window = compactor.context_window
+        before = request_budget(messages, body, window).input_tokens
+        await self.events.emit("compaction.started", **fields, input_tokens=before)
+        status = "skipped"
+        error = None
+        try:
+            pruned = compactor.prune(messages)
+            budget = request_budget(pruned, body, window)
+            messages = pruned
+            if budget.needs_compaction:
+                raw = working.snapshot()
+                through = compactor.cut(raw, checkpoint, within_turn=True)
+                if through is not None:
+                    try:
+                        candidate = await compactor.summarize(raw, checkpoint, through, summarize)
+                    except (CompactionError, SaturnusError, ValueError) as exc:
+                        error = type(exc).__name__
+                    else:
+                        projected = compactor.prune(self.context.build(working, candidate))
+                        after = request_budget(projected, body, window)
+                        if after.input_tokens < budget.input_tokens:
+                            checkpoint, messages, budget = candidate, projected, after
+                            status = "staged"
+            if budget.needs_compaction:
+                # The latest exchange can itself be oversized. Keep its IDs and excerpts.
+                messages = compactor.prune(messages, include_latest=True)
+            return checkpoint, messages
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            after_tokens = request_budget(messages, body, window).input_tokens
+            if status == "skipped":
+                status = "failed" if error else "trimmed" if after_tokens < before else "skipped"
+            await self.events.emit(
+                "compaction.finished", **fields, status=status, error=error,
+                before_tokens=before, after_tokens=after_tokens,
+                through=checkpoint.through if checkpoint else 0,
+            )
+
     async def run(
         self,
         *,
@@ -289,6 +342,7 @@ class Agent:
         final_message: dict[str, Any] | None = None
         requests = calls_executed = 0
         side_effects = False
+        committed_checkpoint = checkpoint = session.compaction
         try:
             provider, model_id = session.provider, session.model_id
             identity = (
@@ -316,17 +370,21 @@ class Agent:
             definitions = tools.definitions() if tools is not None else []
             if definitions:
                 require_tools(model)
+            compactor = Compactor(model.context_window)
+
+            async def summarize(messages: list[dict[str, Any]], limit: int) -> str:
+                nonlocal requests
+                if requests + 1 >= self.max_requests:
+                    raise CompactionError("No model requests available for compaction.")
+                requests += 1
+                return await self._request_summary(model, messages, limit, {
+                    **fields, "request_number": requests, "purpose": "compaction",
+                }, extra_headers)
+
             for _ in range(self.max_requests):
                 await _checkpoint()
-                messages = self.context.build(working, session.compaction)
-                requests += 1
-                request_fields = {**fields, "request_number": requests}
-                await self.events.emit(
-                    "model.started",
-                    **request_fields,
-                    provider=provider,
-                    model_id=model_id,
-                )
+                if requests >= self.max_requests:
+                    raise RuntimeError("Maximum model-request count exceeded.")
                 body = prepare_request_options(
                     model=model,
                     thinking_mode=thinking_mode,
@@ -335,11 +393,23 @@ class Agent:
                     extra_body=extra_body,
                     custom_compatibility=self._custom_compatibility,
                 )
+                messages = self.context.build(working, checkpoint)
+                budget = request_budget(messages, body, model.context_window)
+                if budget.needs_compaction:
+                    checkpoint, messages = await self._compact_request(
+                        working=working, checkpoint=checkpoint, messages=messages,
+                        body=body, compactor=compactor, summarize=summarize, fields=fields,
+                    )
+                    budget = request_budget(messages, body, model.context_window)
+                requests += 1
+                request_fields = {**fields, "request_number": requests}
                 await self.events.emit(
-                    "context.budget",
+                    "model.started",
                     **request_fields,
-                    **asdict(request_budget(messages, body, model.context_window)),
+                    provider=provider,
+                    model_id=model_id,
                 )
+                await self.events.emit("context.budget", **request_fields, **asdict(budget))
                 response = await self._request(
                     model=model_id,
                     messages=messages,
@@ -370,6 +440,7 @@ class Agent:
                     if (
                         current_identity != identity
                         or session.messages.snapshot() != committed
+                        or session.compaction != committed_checkpoint
                     ):
                         raise RuntimeError(
                             "Session changed while its Turn was running."
@@ -377,6 +448,7 @@ class Agent:
                     final_message = deepcopy(message)
                     # No suspension between commit and terminal notification.
                     session.messages = working
+                    session.compaction = checkpoint
                     status = TurnStatus.COMPLETED
                     break
                 if tools is None or not definitions:
@@ -461,6 +533,12 @@ class Agent:
             error = f"{type(exc).__name__}: {exc}"
         finally:
             try:
+                if checkpoint != committed_checkpoint:
+                    await self.events.emit(
+                        "compaction.committed" if status is TurnStatus.COMPLETED
+                        else "compaction.discarded",
+                        **fields, through=checkpoint.through,
+                    )
                 await self.events.emit(
                     "turn.finished",
                     **fields,

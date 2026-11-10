@@ -133,7 +133,10 @@ class Compactor:
             2048 if context_window is None else min(2048, max(1, context_window // 8))
         )
 
-    def cut(self, messages: list[Message], previous: CompactionCheckpoint | None) -> int | None:
+    def cut(
+        self, messages: list[Message], previous: CompactionCheckpoint | None,
+        *, within_turn: bool = False,
+    ) -> int | None:
         """Prefer retaining the latest turn. Keep at least the newest exchange."""
         previous_end = previous.through if previous else 0
         latest_user = next(
@@ -144,10 +147,30 @@ class Compactor:
         cuts = [cut for cut in safe_boundaries(messages) if previous_end < cut < len(messages)]
         if not cuts:
             return None
-        through = latest_user if latest_user in cuts else cuts[-1]
+        through = latest_user if not within_turn and latest_user in cuts else cuts[-1]
         if not any(self._source(messages, previous_end, through)):
             return None
         return through
+
+    @staticmethod
+    def prune(messages: list[Message], *, include_latest: bool = False) -> list[Message]:
+        """Replace long tool payloads only in this detached request view."""
+        end = len(messages)
+        if not include_latest:
+            while end and messages[end - 1]["role"] == "tool":
+                end -= 1
+        pruned = messages.copy()
+        for index, message in enumerate(messages[:end]):
+            if message["role"] != "tool":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+            if len(content) <= 640:
+                continue
+            preview = content[:256] + "\n[Tool output excerpt. Full result retained in session history.]\n" + content[-256:]
+            pruned[index] = {**message, "content": preview}
+        return pruned
 
     @staticmethod
     def _source(messages: list[Message], start: int, through: int) -> Iterator[Message]:
