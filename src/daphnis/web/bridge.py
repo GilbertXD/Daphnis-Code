@@ -62,7 +62,10 @@ class Bridge:
         self.changed = asyncio.Event()
 
     def _record(self, name, session_id, turn_id, data):
-        journal = self.journals.setdefault(session_id, Journal())
+        journal = self.journals.get(session_id)
+        if journal is None:
+            journal = Journal()
+            self.journals[session_id] = journal
         self.journals.move_to_end(session_id)
         if len(self.journals) > _MAX_SESSIONS:
             self.journals.popitem(last=False)

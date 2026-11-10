@@ -64,25 +64,27 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
     if name == "/clear" and not args:
         return CommandResult("clear", "已清理屏幕；会话历史保留。")
     if name == "/mcp":
-        if not args:
-            return CommandResult(
-                text="\n".join(
-                    f"{server.name}  {server.state}  {server.tool_count} 个工具"
-                    + (f" · {server.error}" if server.error else "")
-                    for server in ops.mcp_status()
+        match args:
+            case []:
+                return CommandResult(
+                    text="\n".join(
+                        f"{server.name}  {server.state}  {server.tool_count} 个工具"
+                        + (f" · {server.error}" if server.error else "")
+                        for server in ops.mcp_status()
+                    )
+                    or "尚未配置 MCP Server。"
                 )
-                or "尚未配置 MCP Server。"
-            )
-        if len(args) == 2 and args[0] == "reconnect":
-            await ops.reconnect_mcp(args[1])
-            return CommandResult(text=f"MCP {args[1]} 已连接。")
-        if len(args) == 2 and args[0] == "disconnect":
-            await ops.disconnect_mcp(args[1])
-            return CommandResult(text=f"MCP {args[1]} 已断开。")
-        if len(args) == 2 and args[0] == "refresh":
-            await ops.refresh_mcp(args[1])
-            return CommandResult(text=f"MCP {args[1]} 工具目录已刷新。")
-        raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
+            case ["reconnect", server]:
+                await ops.reconnect_mcp(server)
+                return CommandResult(text=f"MCP {server} 已连接。")
+            case ["disconnect", server]:
+                await ops.disconnect_mcp(server)
+                return CommandResult(text=f"MCP {server} 已断开。")
+            case ["refresh", server]:
+                await ops.refresh_mcp(server)
+                return CommandResult(text=f"MCP {server} 工具目录已刷新。")
+            case _:
+                raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
     if ops.running:
         raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
     if name == "/approval":

@@ -291,13 +291,14 @@ class Operations:
     async def rename_session(self, session_id: str, title: str) -> None:
         app = self._app
         app._ensure_idle()
-        if not isinstance(title, str) or not 0 < len(title.strip()) <= 120:
+        title = title.strip() if isinstance(title, str) else ""
+        if not 0 < len(title) <= 120:
             raise ValueError("会话名称必须包含 1–120 个字符。")
-        if session_id == self.session.id:
-            await app._update_session(replace(app._session, title=title.strip()))
+        if session_id == app._session.id:
+            await app._update_session(replace(app._session, title=title))
         else:
             async with app._state_lock:
-                await app._history.rename(session_id, title.strip())
+                await app._history.rename(session_id, title)
 
     async def delete_session(self, session_id: str) -> SessionSnapshot:
         """Delete under the history lease; replace an active session with a blank one."""
