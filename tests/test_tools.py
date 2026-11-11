@@ -242,6 +242,28 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bypass.value["error"]["code"], "permission_denied")
             self.assertFalse(target.exists())
 
+    async def test_patch_reports_hunk_content_beyond_declared_counts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            tools = bound(workspace, approval=approve)
+            target = workspace / "new.txt"
+            patch = "--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,60 @@\n" + "+line\n" * 73
+            patch += "--- /dev/null\n+++ b/other.txt\n@@ -0,0 +1 @@\n+other\n"
+
+            result = await tools.execute(call("apply_patch", patch=patch))
+            error = result.value["error"]
+            self.assertEqual(error["code"], "invalid_patch")
+            self.assertIn("Hunk at patch line 3", error["message"])
+            self.assertIn("declared line counts (old: 0, new: 60)", error["message"])
+            self.assertIn("patch line 64", error["message"])
+            self.assertEqual(list(workspace.iterdir()), [])
+
+            corrected = patch.replace("+1,60 @@", "+1,73 @@", 1)
+            result = await tools.execute(call("apply_patch", patch=corrected))
+            self.assertTrue(result.value["ok"], result.value)
+            self.assertEqual(target.read_text(), "line\n" * 73)
+            self.assertEqual((workspace / "other.txt").read_text(), "other\n")
+
     async def test_patch_preflight_races_and_partial_failure_are_explicit(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()

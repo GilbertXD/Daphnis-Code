@@ -202,19 +202,29 @@ def parse_patch(patch: str) -> list[FilePatch]:
                 raise ToolError("invalid_patch", "Invalid hunk header.")
             old_start, old_count, new_start, new_count = match.groups()
             old_count, new_count = int(old_count or 1), int(new_count or 1)
+            hunk_line = index + 1
             index += 1
             content: list[tuple[str, str]] = []
             consumed_old = consumed_new = 0
-            while consumed_old < old_count or consumed_new < new_count:
+            while index < len(lines) and lines[index][0] in " +-":
                 if (
-                    index >= len(lines)
-                    or not lines[index]
-                    or lines[index][0] not in " +-"
+                    consumed_old == old_count
+                    and consumed_new == new_count
+                    and lines[index].startswith("--- ")
+                    and index + 1 < len(lines)
+                    and lines[index + 1].startswith("+++ ")
                 ):
-                    raise ToolError("invalid_patch", "Incomplete hunk body.")
+                    break
                 kind, value = lines[index][0], lines[index][1:]
                 consumed_old += kind != "+"
                 consumed_new += kind != "-"
+                if consumed_old > old_count or consumed_new > new_count:
+                    raise ToolError(
+                        "invalid_patch",
+                        f"Hunk at patch line {hunk_line} exceeds its declared line counts "
+                        f"(old: {old_count}, new: {new_count}) at patch line {index + 1}. "
+                        "Correct the counts in the @@ header or adjust the hunk body.",
+                    )
                 content.append((kind, value))
                 index += 1
                 if (
@@ -223,8 +233,8 @@ def parse_patch(patch: str) -> list[FilePatch]:
                 ):
                     content[-1] = (kind, value.removesuffix("\n").removesuffix("\r"))
                     index += 1
-                if consumed_old > old_count or consumed_new > new_count:
-                    raise ToolError("invalid_patch", "Hunk line counts do not match.")
+            if consumed_old < old_count or consumed_new < new_count:
+                raise ToolError("invalid_patch", "Incomplete hunk body.")
             hunks.append(
                 Hunk(
                     int(old_start), old_count, int(new_start), new_count, tuple(content)
