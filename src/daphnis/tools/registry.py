@@ -1,7 +1,8 @@
 """Select and authorize tools before delegating execution to Saturnus."""
 
+import asyncio
 import json
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -54,19 +55,31 @@ class _Permit:
     name: str
     arguments: dict[str, Any]
     operation: Operation
+    workspace: Target
 
 
 _PERMIT: ContextVar[_Permit | None] = ContextVar("daphnis_tool_permit", default=None)
 _PREPARERS = {
     "read_file": prepare_read,
     "list_directory": prepare_list,
-    "search": prepare_search,
     "write_file": prepare_write,
     "replace_text": prepare_replace,
     "apply_patch": prepare_patch,
     "run_command": prepare_command,
 }
 _HISTORY_TOOLS = {"history_search", "history_read", "history_operations"}
+
+
+def _verify_workspace(workspace: Target) -> None:
+    # The directory may gain files, but its path and identity must stay the same.
+    current = Target.capture(workspace.requested, workspace.path)
+    if (
+        current.path != workspace.path
+        or current.identity is None
+        or workspace.identity is None
+        or current.identity[:3] != workspace.identity[:3]
+    ):
+        raise ToolError("target_changed", "Session workspace changed; rebind tools.")
 
 
 class _ExecutionDecision(Enum):
@@ -97,6 +110,7 @@ def _guarded_handler(name):
                 "permission_denied", "Use Daphnis ToolExecutor.execute for this tool."
             )
         try:
+            _verify_workspace(permit.workspace)
             permit.operation.verify()
             return await permit.operation.run()
         except CleanupError as exc:
@@ -131,6 +145,7 @@ class ToolExecutor:
         mode: ApprovalMode = ApprovalMode.AUTO,
         trusted: set[tuple[str, str]] | None = None,
         redactor: Redactor | None = None,
+        search_excluded_directory: Path | None = None,
     ) -> None:
         self._registry = registry
         self._approval = approval
@@ -139,6 +154,7 @@ class ToolExecutor:
         self._mode = mode
         self._trusted = trusted if trusted is not None else set()
         self._redactor = redactor if redactor is not None else Redactor(())
+        self._search_excluded_directory = search_excluded_directory
 
     def definitions(self) -> list[dict[str, Any]]:
         return self._registry.definitions()
@@ -154,6 +170,7 @@ class ToolExecutor:
             mode=self._mode if mode is None else mode,
             trusted=self._trusted,
             redactor=self._redactor,
+            search_excluded_directory=self._search_excluded_directory,
         )
 
     def bind(
@@ -172,10 +189,12 @@ class ToolExecutor:
             mode=self._mode,
             trusted=self._trusted,
             redactor=self._redactor,
+            search_excluded_directory=self._search_excluded_directory,
         )
 
     async def execute(
-        self, call: dict[str, Any], *, request_number: int = 0
+        self, call: dict[str, Any], *, request_number: int = 0,
+        before_execute: Callable[[str], Awaitable[None]] | None = None,
     ) -> ToolResult:
         call = deepcopy(call)
         arguments = self._registry.validate_call(call)
@@ -225,6 +244,10 @@ class ToolExecutor:
                 )
             elif name in _HISTORY_TOOLS:
                 operation = prepare_history(name, arguments, binding.session.messages, self._redactor)
+            elif name == "search":
+                operation = prepare_search(
+                    arguments, binding.workspace.path, excluded=self._search_excluded_directory,
+                )
             else:
                 operation = _PREPARERS[name](arguments, binding.workspace.path)
             forced = operation.force_approval or any(
@@ -278,24 +301,8 @@ class ToolExecutor:
                         "permission_denied",
                         "Approval was refused or no approval callback is available.",
                     )
-            # The workspace may gain files, but must not be replaced or retargeted.
-            current = Target.capture(
-                binding.workspace.requested, binding.workspace.path
-            )
-            if (
-                current.path != binding.workspace.path
-                or current.identity is None
-                or current.identity[:3] != binding.workspace.identity[:3]
-            ):
-                raise ToolError(
-                    "target_changed", "Session workspace changed; rebind tools."
-                )
+            _verify_workspace(binding.workspace)
             operation.verify()
-            token = _PERMIT.set(_Permit(name, deepcopy(arguments), operation))
-            try:
-                return await self._registry.execute(call)
-            finally:
-                _PERMIT.reset(token)
         except ToolError as exc:
             if exc.code in ("permission_denied", "command_blocked"):
                 await binding.events.emit(
@@ -311,6 +318,17 @@ class ToolExecutor:
         except (OSError, ValueError) as exc:
             return result(failure("invalid_operation", str(exc)))
 
+        # A barrier failure must propagate to the Turn, including I/O failures.
+        if before_execute is not None:
+            await before_execute(call["id"])
+            await binding.events.emit("tool.executing", **fields)
+            await asyncio.sleep(0)
+        token = _PERMIT.set(_Permit(name, deepcopy(arguments), operation, binding.workspace))
+        try:
+            return await self._registry.execute(call)
+        finally:
+            _PERMIT.reset(token)
+
 
 def create_tools(
     *,
@@ -318,6 +336,7 @@ def create_tools(
     connections: Iterable[MCPConnection] = (),
     trusted: set[tuple[str, str]] | None = None,
     redactor: Redactor | None = None,
+    search_excluded_directory: Path | None = None,
 ) -> ToolExecutor:
     """Build the tool catalogue; use select() to choose the enabled subset."""
     registry = ToolRegistry()
@@ -474,4 +493,5 @@ def create_tools(
             mcp_tools[name] = connection, tool.name
     return ToolExecutor(
         registry, approval=approval, mcp_tools=mcp_tools, trusted=trusted, redactor=redactor,
+        search_excluded_directory=search_excluded_directory,
     )

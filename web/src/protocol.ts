@@ -29,6 +29,7 @@ export type Message = {
   reasoning_content?: string | null
   tool_calls?: ToolCall[] | null
   tool_call_id?: string
+  daphnis_tool_state?: 'PENDING' | 'RUNNING'
 }
 
 export type Approval = {

@@ -19,6 +19,7 @@ from daphnis import (
     TurnStatus,
 )
 from daphnis.models import ModelInfo, provider_compatibility
+from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.usage import UsageTotals
 
 CATALOG = tuple(
@@ -192,6 +193,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             "model.delta",
             "model.finished",
             "tool.started",
+            "tool.executing",
             "tool.finished",
             "turn.finished",
         )
@@ -275,6 +277,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 "model.usage",
                 "model.finished",
                 "tool.started",
+                "tool.executing",
                 "tool.finished",
                 "model.started",
                 "model.usage",
@@ -512,7 +515,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("environment unavailable", result.error)
         self.assertTrue(result.external_side_effects_possible)
-        self.assertEqual(len(state.messages), 1)
+        self.assertEqual(state.messages.get(-1)[TOOL_STATE], RUNNING)
 
     async def test_last_request_keeps_tools_and_commits_its_response(self):
         async def check(final_calls, max_primary, max_total):
@@ -631,19 +634,28 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         tool_finished = []
         events.on("tool.finished", tool_finished.append)
         state = session()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        history = History(temporary.name)
         async with make_client(handler) as client:
             agent = make_agent(client, tools=registry(handler_tool), events=events, max_requests=1)
-            task = asyncio.create_task(agent.run(session=state, prompt="tool"))
+            task = asyncio.create_task(agent.run(session=state, prompt="tool", persist=history.save_async))
             await asyncio.wait_for(entered.wait(), 2)
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertEqual(state.messages.snapshot(), [{"role": "user", "content": "tool"}])
+            state = history.load(state.id)
+            self.assertEqual(state.messages.get(-2)["content"], "hello")
+            self.assertEqual(state.messages.get(-1)[TOOL_STATE], RUNNING)
             self.assertEqual(finished[-1].data["status"], "CANCELLED")
             self.assertTrue(finished[-1].data["external_side_effects_possible"])
-            self.assertEqual(tool_finished[-1].data["status"], "CANCELLED")
-            result = await agent.run(session=state, prompt="next")
+            self.assertEqual([event.data["tool_call_id"] for event in tool_finished], ["call-1"])
+            result = await agent.run(session=state, prompt="继续", persist=history.save_async)
             self.assertEqual(result.status, TurnStatus.COMPLETED)
+            self.assertEqual(
+                json.loads(state.messages.get(-2)["content"])["error"]["code"],
+                "execution_result_unknown",
+            )
 
     async def test_shared_client_allows_parallel_sessions_with_distinct_models(self):
         entered = asyncio.Event()
@@ -683,7 +695,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(two.status, TurnStatus.COMPLETED, two.error)
                 self.assertEqual(two.message["content"], "model-b")
                 self.assertFalse(one.done())
-                self.assertEqual(len(first_session.messages), 1)
+                self.assertEqual(first_session.messages.get(-1)[TOOL_STATE], RUNNING)
             finally:
                 release.set()
                 result = await asyncio.wait_for(one, 2)
@@ -722,7 +734,8 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("Session changed", result.error)
         self.assertTrue(result.external_side_effects_possible)
-        self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "use tool"}])
+        self.assertEqual(state.messages.snapshot()[:-2], [*original, {"role": "user", "content": "use tool"}])
+        self.assertEqual(state.messages.get(-1)[TOOL_STATE], RUNNING)
 
     async def test_provider_and_tool_capabilities_are_checked_before_request(self):
         states = (

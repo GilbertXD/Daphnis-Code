@@ -208,6 +208,7 @@ class Application:
             approval=self._request_approval,
             trusted=self._trusted_tools,
             redactor=self._history_redactor,
+            search_excluded_directory=self._history.directory,
             connections=(
                 server
                 for server in self._mcp.values()

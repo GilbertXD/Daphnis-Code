@@ -17,6 +17,7 @@ from ..agent import assistant_text
 from ..events import Event
 from ..mcp import TOOL_PREFIX
 from ..terminal_commands import sanitize_terminal
+from ..tool_state import PENDING, RUNNING, TOOL_STATE
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -270,7 +271,9 @@ class ChatView(VerticalScroll):
                     tool_summary(function),
                     classes="tool",
                 )
-                row.outcome = "已保存"
+                row.outcome = {PENDING: "等待恢复", RUNNING: "结果未知"}.get(
+                    message.get(TOOL_STATE), "已保存",
+                )
                 row.edits = patch_counts(function.get("arguments", "{}"))
                 if function.get("name") == "run_command":
                     row.output = command_output(message.get("content"))
@@ -279,7 +282,10 @@ class ChatView(VerticalScroll):
                 try:
                     result = json.loads(message.get("content") or "{}")
                     if isinstance(result, dict) and "ok" in result:
-                        row.outcome = "COMPLETED" if result["ok"] else "ERROR"
+                        if result.get("source") == "daphnis_recovery":
+                            row.outcome = "结果未知"
+                        else:
+                            row.outcome = "COMPLETED" if result["ok"] else "ERROR"
                         if isinstance(result.get("error"), dict):
                             row.outcome += (
                                 " · " + str(result["error"].get("message", ""))[:300]
@@ -287,7 +293,7 @@ class ChatView(VerticalScroll):
                 except (TypeError, ValueError):
                     pass
                 row.dirty = True
-                if row.output or row.outcome.startswith("ERROR"):
+                if row.output or row.outcome.startswith(("ERROR", "结果未知", "等待恢复")):
                     row.tool_group.reveal()
             else:
                 content = assistant_text(message) if role == "assistant" else message.get("content")
@@ -357,8 +363,10 @@ class ChatView(VerticalScroll):
                 )
                 self.tools[key] = row
             if event.name == "tool.started":
-                row.outcome = "运行中"
+                row.outcome = "准备中"
                 row.edits = patch_counts(data.get("arguments", "{}"))
+            elif event.name == "tool.executing":
+                row.outcome = "运行中"
             elif event.name == "tool.approval_requested":
                 row.outcome = "等待审批"
             elif event.name == "tool.blocked":
@@ -385,6 +393,13 @@ class ChatView(VerticalScroll):
             if row.output or row.outcome.startswith(("ERROR", "FAILED", "等待审批")):
                 row.tool_group.reveal()
         elif event.name == "turn.finished":
+            if data["status"] in ("FAILED", "CANCELLED"):
+                for (turn_id, _, _), row in self.tools.items():
+                    if turn_id != event.turn_id:
+                        continue
+                    if row.outcome in ("准备中", "等待审批", "运行中"):
+                        row.outcome = "已中断"
+                        row.dirty = True
             if data["status"] in ("FAILED", "CANCELLED") and data.get("external_side_effects_possible"):
                 await self.add("运行结果", "已执行的工具可能产生外部副作用。", classes="notice")
             self.refresh_rows()

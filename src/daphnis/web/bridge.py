@@ -14,7 +14,7 @@ from .redaction import Redactor
 _EVENT_NAMES = (
     "turn.started", "turn.finished", "model.started", "model.request",
     "model.delta", "model.usage", "model.finished", "model.response_error",
-    "tool.started", "tool.approval_requested", "tool.blocked", "tool.finished",
+    "tool.started", "tool.approval_requested", "tool.blocked", "tool.executing", "tool.finished",
     "mcp.error", "mcp.tools_changed",
     "context.budget", "context.overflow",
     "compaction.started", "compaction.finished", "compaction.committed", "compaction.discarded",

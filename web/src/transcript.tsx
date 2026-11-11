@@ -70,11 +70,12 @@ export function collectTools(events: AgentEvent[]) {
     const key = `${event.turn_id}:${d.request_number ?? 0}:${d.tool_call_id}`
     const tool = tools.get(key) ?? {
       key, id: d.tool_call_id, name: d.name ?? '工具', turn: event.turn_id,
-      number: d.request_number ?? 0, status: '运行中', events: [],
+      number: d.request_number ?? 0, status: '准备中', events: [],
     }
     tool.events.push(event)
     if (event.name === 'tool.started') Object.assign(tool, { start: event.time, arguments: d.arguments })
     if (event.name === 'tool.approval_requested') tool.status = '等待审批'
+    if (event.name === 'tool.executing') tool.status = '运行中'
     if (event.name === 'tool.blocked') Object.assign(tool, { status: '已拦截', error: d.reason })
     if (event.name === 'tool.finished') Object.assign(tool, {
       end: event.time, status: d.status ?? '已结束', content: d.content, error: d.error,
@@ -138,9 +139,12 @@ function UserMessage({ text }: { text: string }) {
   return <article className="user-message"><RichText text={text} /></article>
 }
 
-function savedResult(content: string | null | undefined): { status: string; error?: unknown } {
+function savedResult(message: Message): { status: string; error?: unknown } {
+  if (message.daphnis_tool_state === 'PENDING') return { status: '等待恢复' }
+  if (message.daphnis_tool_state === 'RUNNING') return { status: '结果未知' }
   try {
-    const value = JSON.parse(content ?? '')
+    const value = JSON.parse(typeof message.content === 'string' ? message.content : '')
+    if (value?.source === 'daphnis_recovery') return { status: '结果未知', error: value.error }
     if (value?.ok === false || value?.error) return { status: 'ERROR', error: value.error }
     if (value?.ok === true) return { status: 'COMPLETED' }
   } catch { /* Plain-text results are supported. */ }
@@ -170,10 +174,12 @@ const Committed = memo(function Committed({ messages, tools, turns }: {
     const turn = turns.find(({ start, end }) => index >= start && index < end)
     const observed = tools.find((tool) => tool.turn === turn?.id && tool.number === request && tool.id === message.tool_call_id)
     const id = message.tool_call_id ?? String(index)
+    const saved = savedResult(message)
     const tool: TraceTool = {
       key: observed?.key ?? `saved-${index}`, id, turn: turn?.id ?? '', number: request,
-      name: call?.function.name ?? '工具结果', ...savedResult(typeof message.content === 'string' ? message.content : null),
-      events: [], ...observed, arguments: call?.function.arguments ?? observed?.arguments,
+      name: call?.function.name ?? '工具结果', ...saved,
+      events: [], ...observed, status: observed?.end != null ? observed.status : saved.status,
+      arguments: call?.function.arguments ?? observed?.arguments,
       content: typeof message.content === 'string' ? message.content : observed?.content,
     }
     return <ToolRow key={index} tool={tool} locate />

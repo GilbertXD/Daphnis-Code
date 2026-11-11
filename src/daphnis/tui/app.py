@@ -222,6 +222,7 @@ class DaphnisApp(App[None]):
             "compaction.finished",
             "compaction.committed",
             "tool.started",
+            "tool.executing",
             "tool.finished",
             "tool.approval_requested",
             "tool.blocked",

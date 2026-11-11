@@ -8,6 +8,7 @@ from itertools import chain
 from typing import Any
 
 from .token_budget import DEFAULT_COUNTER, TokenCounter, request_budget
+from .tool_state import TOOL_STATE
 
 Message = dict[str, Any]
 _SUMMARY_FIELDS = ("goals", "progress", "files", "next_steps")
@@ -74,7 +75,7 @@ def safe_boundaries(messages: list[Message]) -> Iterator[int]:
         message = messages[index]
         role = message["role"]
         calls = message.get("tool_calls")
-        if role == "tool" or message.get("function_call") or role == "function":
+        if role in ("tool", "function") or TOOL_STATE in message or message.get("function_call"):
             return
         index += 1
         if calls:
@@ -92,7 +93,13 @@ def safe_boundaries(messages: list[Message]) -> Iterator[int]:
                     return
                 result = messages[index]
                 call_id = result.get("tool_call_id")
-                if result["role"] != "tool" or not isinstance(call_id, str) or call_id not in pending:
+                if (
+                    result["role"] != "tool"
+                    or TOOL_STATE in result
+                    or not isinstance(result.get("content"), (str, list))
+                    or not isinstance(call_id, str)
+                    or call_id not in pending
+                ):
                     return
                 pending.remove(call_id)
                 index += 1

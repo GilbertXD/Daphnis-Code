@@ -13,6 +13,7 @@ from textual.widgets import Button, Checkbox, OptionList, SelectionList, Static
 from daphnis import Event, History, Operations, Session
 from daphnis.app import Application
 from daphnis.models import ModelInfo
+from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.tools import ApprovalDecision, ApprovalRequest
 from daphnis.tui.app import ChoiceScreen, DaphnisApp, ToolsScreen
 from daphnis.tui.approval import ApprovalScreen
@@ -317,7 +318,9 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertIsNone(ops.pending_approval)
-                self.assertEqual(ops.message_snapshot(), [*committed, {"role": "user", "content": "wait then cancel"}])
+                messages = ops.message_snapshot()
+                self.assertEqual(messages[:-2], [*committed, {"role": "user", "content": "wait then cancel"}])
+                self.assertEqual(messages[-1][TOOL_STATE], PENDING)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
 
     async def test_approval_trust_checkbox_requires_allow(self):

@@ -21,6 +21,7 @@ const names: Record<string, string> = {
   'model.finished': '收到完整模型响应',
   'model.response_error': '模型 HTTP 响应出错',
   'tool.started': '开始调用工具',
+  'tool.executing': '执行工具',
   'tool.approval_requested': '需要确认工具权限',
   'tool.blocked': '工具调用已拦截',
   'tool.finished': '工具调用结束',

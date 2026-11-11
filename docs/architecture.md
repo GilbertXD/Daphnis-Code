@@ -31,9 +31,19 @@
 ## 一轮任务的生命周期
 
 1. Application 检查运行状态，选定本轮模型、思考档位、审批模式和在线工具，然后取得会话租约。
-2. Agent 创建工作消息副本，分别在加入用户输入后、每组工具调用均有结果后、取得最终回复后提交快照。常见工具失败也作为工具结果保存。
-3. Application 在现有会话租约内将快照与检查点一起落盘。保存成功后，Agent 发布内存状态。取消、执行失败或保存失败时保留最近一次成功提交的完整记录。最近一次提交之后执行的工具仍可能产生外部副作用。
+2. Agent 提交用户输入。收到模型的工具调用后，Agent 先校验响应和调用数量，再将 Assistant 消息与整组占位结果一次提交。每次工具开始执行和返回结果时，Agent 分别提交对应状态。最终回复也单独提交。
+3. Application 在会话租约内将快照、检查点与用量一起落盘。保存成功后，Agent 发布内存状态。取消或保存失败时，最近一次成功提交的状态仍可恢复。
 4. 每次主请求均使用正常任务上下文和已启用的工具。最后一次请求若给出最终回复，返回 `COMPLETED`。若给出工具调用，执行并保存完整工具组后返回 `PAUSED_LIMIT`。暂停提示由客户端显示。再次 `send()` 使用已保存的历史和新一轮预算。单轮 CLI 以退出码 `3` 表示暂停。失败或取消时，晚于最近一次消息保存的用量也可独立保存。
+
+### 工具状态与中断恢复
+
+History 允许最后一个工具组含占位。每条占位是带 `tool_call_id` 的工具消息，通过 ID 关联同组 Assistant 消息中的调用。扩展字段 `daphnis_tool_state` 存放 `PENDING` 或 `RUNNING`，占位的 `content` 为 null。保存真实结果时，用同一位置的标准工具消息替换占位。标准结果消息隐式表示 `FINISHED`，旧 V2 会话可直接读取。
+
+ToolExecutor 先校验参数、准备操作、处理审批并核验目标，然后等待 Agent 的执行前回调。回调将该调用保存为 `RUNNING`，之后 ToolExecutor 才能进入实际操作。内置与 MCP 工具共用屏障，工具入口继续核验工作区和目标。审批拒绝、参数错误等可直接从 `PENDING` 保存为错误结果。关键保存失败会结束当前轮，已持久化的状态保留在原位置。
+
+重载会校验末尾工具组并保留已保存结果。下一次 Turn 在会话租约内将遗留的 `RUNNING` 转成带 `source: "daphnis_recovery"` 和 `execution_result_unknown` 的框架说明。只有用户发送「继续」才会处理尚未开始的 `PENDING`，并按原顺序走当前工具选择、审批和校验。整组形成完整交换后，Agent 才用它更新 Working 并继续请求模型。恢复轮使用本轮预算，恢复已有调用不占用模型请求次数。
+
+从保存 `RUNNING` 到保存结果期间，进程可能在实际调用之前、调用期间或返回之后中断。这三个窗口都按结果未知处理。已产生的外部副作用需要核对，History 原子替换只保护会话文件。
 
 ### 上下文与压缩
 
@@ -58,11 +68,14 @@
 | `model.request`、`model.response_error` | 启用 `observe_model_io` 时，根据可用的 HTTP 响应观测实际请求 JSON、HTTP 状态及错误响应正文。Web 启动启用此选项。 |
 | `context.budget`、`context.overflow` | 主模型请求的输入估算、窗口、输出预留和阈值，以及明确超限后的恢复决定。 |
 | `compaction.started`、`compaction.finished` | 手动、压力或超限触发的压缩尝试及结果。摘要模型请求以 `purpose=compaction` 标识。 |
-| `compaction.committed`、`compaction.discarded` | 自动检查点随完整的消息快照提交，或在尚未提交时随本轮结束丢弃。 |
-| `tool.started`、`tool.approval_requested`、`tool.blocked`、`tool.finished` | 携带请求序号、工具调用 ID 和工具名。审批事件额外提供独立的 `request_id`，工具结束事件包含状态、内容和错误。 |
+| `compaction.committed`、`compaction.discarded` | 自动检查点随下一次消息快照保存，或在尚未提交时随本轮结束丢弃。 |
+| `tool.started` | 占位已经保存，开始处理调用。携带工具名、调用 ID、请求序号及参数。恢复已有调用时请求序号为 0。 |
+| `tool.approval_requested`、`tool.blocked` | 通知审批请求及策略拦截。审批事件包含独立的 `request_id`。 |
+| `tool.executing` | `RUNNING` 已保存，即将执行工具。 |
+| `tool.finished` | 真实结果或可报告的工具错误已保存。事件携带 `COMPLETED` 或 `ERROR`、结果正文和错误详情。 |
 | `mcp.error`、`mcp.tools_changed` | 通知连接异常或工具目录刷新，`turn_id` 为空字符串。 |
 
-事件用于观察。审批通过 `resolve_approval()` 回传，取消通过 `cancel()` 发起。客户端应以 `send()` 的结果或异常判断整次操作的结局。Web 的 `web.send_finished` 是 Bridge 在该操作结束后生成的传输记录，Core 的订阅事件列表见上表。
+事件用于观察，工具状态由 Agent 通过 Session 保存接口直接提交。异步订阅器可能以不同顺序完成。审批通过 `resolve_approval()` 回传，取消通过 `cancel()` 发起。客户端应以 `send()` 的结果或异常判断整次操作的结局。Web 的 `web.send_finished` 是 Bridge 在该操作结束后生成的传输记录，Core 的订阅事件列表见上表。
 
 Web 通过 `POST /api/command` 接收命令，通过 `/api/events` WebSocket 发送状态帧。Bridge 用会话 ID、状态版本和事件游标区分全量快照与增量记录。服务端调试记录按会话有界缓存，重连时可重新获取仍在缓存中的记录。持续连接的浏览器会在本地累积已收到的同会话事件，直到收到重置帧或切换会话。
 

@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from daphnis import History, Operations, Session
 from daphnis.app import Application
 from daphnis.history import SessionLease
+from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
 from daphnis.web.server import create_app
@@ -321,7 +322,9 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
         self.assertEqual(waiting["run"]["base_count"], 0)
-        self.assertEqual(waiting["state"]["messages"], [{"role": "user", "content": "test patch"}])
+        waiting_messages = waiting["state"]["messages"]
+        self.assertEqual(waiting_messages[0], {"role": "user", "content": "test patch"})
+        self.assertEqual(waiting_messages[-1][TOOL_STATE], PENDING)
         self.command("approve", session_id, request_id=waiting["status"]["approval"]["request_id"], decision="allow_once")
         paused = self.wait_for(lambda frame: not frame["status"]["running"])
         outcome = paused["events"][-1]["data"]

@@ -2,6 +2,8 @@
 
 内置工具包括 `read_file`、`list_directory`、`search`、`write_file`、`replace_text`、`apply_patch` 和 `run_command`。启用工具后，只有能力明确支持工具调用的模型可以使用它们，实际执行仍受审批规则约束。
 
+工作区的 `search` 跳过 Daphnis 会话存储目录。对话记录可通过受限的[历史回查工具](context_compaction.md#历史回查)访问。
+
 模型请求发往选定的模型服务，可能包含会话消息、文件内容和工具结果。模型响应、工作区文件和 MCP 工具结果都可能包含外部提供的内容，工具调用由本地规则校验和授权。
 
 ## 审批规则

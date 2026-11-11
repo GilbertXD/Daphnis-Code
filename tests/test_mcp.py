@@ -14,6 +14,7 @@ import httpx
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
 from daphnis.mcp import MCPConnection
+from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
 
 DEMO = Path(__file__).with_name("mcp_demo_server.py").resolve()
@@ -185,6 +186,7 @@ asyncio.run(main())
             result_bytes = []
             calls = []
             advertised = set()
+            executing = {}
 
             def model(request):
                 body = json.loads(request.content)
@@ -235,6 +237,15 @@ asyncio.run(main())
             ops = Operations(app)
             log = root / "calls"
 
+            def record_execution(event):
+                call_id = event.data["tool_call_id"]
+                messages = History(root / "sessions").load(event.session_id).messages.snapshot()
+                executing[call_id] = next(
+                    message.get(TOOL_STATE) for message in messages
+                    if message.get("tool_call_id") == call_id
+                )
+
+            ops.subscribe("tool.executing", record_execution)
             async def approve(
                 call_id, decision=ApprovalDecision.ALLOW_ONCE, *, server="demo"
             ):
@@ -280,6 +291,8 @@ asyncio.run(main())
                 )
                 self.assertEqual(advertised, {"list_directory", add, special})
                 self.assertTrue(outcomes[0]["ok"])
+                self.assertEqual(executing["approved"], RUNNING)
+                self.assertNotIn("denied", executing)
                 self.assertEqual(outcomes[1]["structured_content"], {"sum": 42})
                 self.assertEqual(outcomes[1]["text"], "42")
                 self.assertEqual(outcomes[2]["structured_content"], {"sum": 3})

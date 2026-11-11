@@ -20,6 +20,7 @@ from daphnis import History, Operations, TurnResult, TurnStatus
 from daphnis.app import Application
 from daphnis.config import environment_connections
 from daphnis.models import CapabilityError, ModelInfo
+from daphnis.tool_state import PENDING, TOOL_STATE
 
 CATALOG = (
     ModelInfo(
@@ -177,7 +178,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 await a.close()
                 await b.close()
 
-    async def test_turn_persists_complete_tool_groups_and_stops_on_save_failure(self):
+    async def test_turn_persists_complete_tool_groups_and_stops_on_group_save_failure(self):
         async def check(scenario):
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -230,7 +231,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("stage write failed", result.error)
                         self.assertIsNone(result.notice)
                         self.assertEqual(result.model_requests, 1)
-                        self.assertTrue(result.external_side_effects_possible)
+                        self.assertFalse(result.external_side_effects_possible)
                 finally:
                     await ops.close()
                 restored = Operations(Application(**options))
@@ -381,10 +382,12 @@ asyncio.run(main())
                 self.assertIsNone(ops.pending_approval)
                 self.assertFalse(ops.resolve_approval(request.request_id, "allow_once"))
                 saved = history.load(seed.id)
-                self.assertEqual(len(saved.messages), 1)
+                self.assertEqual(saved.messages.get(-1)[TOOL_STATE], PENDING)
                 self.assertEqual(saved.usage.total_tokens, 5)
                 peer.restore_session(seed.id)
-                self.assertEqual((await peer.send("retry", stream=False)).status, TurnStatus.COMPLETED)
+                self.assertEqual((await peer.send("retry", stream=False)).status, TurnStatus.FAILED)
+                self.assertEqual((await peer.send("继续", stream=False)).status, TurnStatus.COMPLETED)
+                self.assertFalse((root / "effect").exists())
             finally:
                 if process is not None and process.returncode is None:
                     process.kill()
@@ -762,7 +765,9 @@ asyncio.run(main())
                         self.assertFalse(ops.running)
                         self.assertIsNone(ops.pending_approval)
                         self.assertFalse(ops.resolve_approval(pending.request_id, "allow_once"))
-                        self.assertEqual(ops.message_snapshot(), [{"role": "user", "content": "edit"}])
+                        messages = ops.message_snapshot()
+                        self.assertEqual(messages[0], {"role": "user", "content": "edit"})
+                        self.assertEqual(messages[-1][TOOL_STATE], PENDING)
                         self.assertEqual(len(ops.list_sessions()), 1)
                         self.assertEqual(len(finished), 1)
                         self.assertEqual(

@@ -1,4 +1,4 @@
-"""Single-Agent execution with message commits at complete exchanges."""
+"""Single-Agent execution with durable conversation and tool transitions."""
 
 import asyncio
 import json
@@ -48,6 +48,15 @@ from .models import (
 from .models.models import validate_catalog
 from .session import Session
 from .token_budget import TokenBudget, request_budget
+from .tool_state import (
+    PENDING,
+    RESUME_PROMPT,
+    RUNNING,
+    TOOL_STATE,
+    interrupted_tool_group,
+    stage_tool_group,
+    update_tool_result,
+)
 from .tools import ToolExecutor
 
 _ACTIVE_SESSIONS: set[str] = set()
@@ -234,27 +243,32 @@ class Agent:
         if require_visible and reason == "stop" and not assistant_text(message):
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
-            if not calls:
-                raise ValueError("Tool-call response has no tool calls.")
-            ids: set[str] = set()
-            for call in calls:
-                if not isinstance(call, dict):
-                    raise TypeError("Tool call must be an object.")
-                call_id = call.get("id")
-                function = call.get("function")
-                if (
-                    not isinstance(call_id, str)
-                    or not call_id.strip()
-                    or call_id in ids
-                    or call.get("type") != "function"
-                    or not isinstance(function, dict)
-                    or not isinstance(function.get("name"), str)
-                    or not function["name"].strip()
-                    or not isinstance(function.get("arguments"), str)
-                ):
-                    raise ValueError("Incomplete or duplicate tool-call identity.")
-                ids.add(call_id)
+            Agent._validate_tool_calls(calls)
+        message.pop(TOOL_STATE, None)
         return message, reason
+
+    @staticmethod
+    def _validate_tool_calls(calls: list[dict[str, Any]] | None) -> None:
+        if not calls:
+            raise ValueError("Tool-call response has no tool calls.")
+        ids: set[str] = set()
+        for call in calls:
+            if not isinstance(call, dict):
+                raise TypeError("Tool call must be an object.")
+            call_id = call.get("id")
+            function = call.get("function")
+            if (
+                not isinstance(call_id, str)
+                or not call_id.strip()
+                or call_id in ids
+                or call.get("type") != "function"
+                or not isinstance(function, dict)
+                or not isinstance(function.get("name"), str)
+                or not function["name"].strip()
+                or not isinstance(function.get("arguments"), str)
+            ):
+                raise ValueError("Incomplete or duplicate tool-call identity.")
+            ids.add(call_id)
 
     def _model_context(
         self, working: Messages, checkpoint: CompactionCheckpoint | None,
@@ -317,6 +331,8 @@ class Agent:
             model.context_window, counter=model.token_counter, recent_tokens=self.recent_tokens,
         )
         raw = session.messages.snapshot()
+        if raw and len(raw) not in safe_boundaries(raw):
+            raise ValueError("工具交换尚未完成。请先发送「继续」。")
         previous = session.compaction
         through = compactor.cut(raw, previous)
         if through is None:
@@ -467,10 +483,9 @@ class Agent:
                     "Session provider does not match the ChatClient connection."
                 )
             model = resolve_model(provider, model_id, catalog=self._catalog)
-            working = Messages(committed)
             if not isinstance(prompt, str):
                 raise TypeError("prompt must be a string.")
-            working.add_user(prompt)
+            interrupted = interrupted_tool_group(committed)
             tools = (
                 self.tools.bind(session=session, events=self.events, turn_id=turn_id)
                 if isinstance(self.tools, ToolExecutor)
@@ -494,11 +509,10 @@ class Agent:
                 ):
                     raise RuntimeError("Session changed while its Turn was running.")
 
-            async def commit() -> None:
+            async def commit(
+                snapshot: list[dict[str, Any]], *, tool_finished: dict[str, Any] | None = None,
+            ) -> None:
                 check_session()
-                snapshot = working.snapshot()
-                if len(snapshot) not in safe_boundaries(snapshot):
-                    raise ValueError("Cannot commit an incomplete tool exchange.")
                 candidate = replace(session, messages=Messages(snapshot), compaction=checkpoint)
 
                 async def save_and_publish() -> None:
@@ -513,11 +527,78 @@ class Agent:
                     if committed_checkpoint != checkpoint:
                         committed_checkpoint = checkpoint
                         await self.events.emit("compaction.committed", **fields, through=checkpoint.through)
+                    if tool_finished is not None:
+                        await self.events.emit("tool.finished", **tool_finished)
 
                 if persist is None:
                     await save_and_publish()
                 else:
                     await finish_io(save_and_publish())
+
+            async def process_tool(
+                call: dict[str, Any], index: int, request_fields: dict[str, Any],
+            ) -> None:
+                nonlocal calls_executed, side_effects
+                await _checkpoint()
+                calls_executed += 1
+                call_id = call["id"]
+                tool_fields = {
+                    **request_fields,
+                    "tool_call_id": call_id,
+                    "name": call["function"]["name"],
+                }
+                await self.events.emit(
+                    "tool.started", **tool_fields, arguments=call["function"]["arguments"],
+                )
+
+                async def before_execute(executing_id: str) -> None:
+                    nonlocal side_effects
+                    if executing_id != call_id:
+                        raise ValueError("Execution barrier received a different tool call ID.")
+                    snapshot = update_tool_result(committed, index, executing_id)
+                    try:
+                        await commit(snapshot)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Could not persist RUNNING for {call_id!r}: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    side_effects = True
+
+                tool_error = None
+                try:
+                    if tools is None:
+                        raise ToolCallValidationError("Tool is no longer enabled.", code="unknown_tool")
+                    if isinstance(tools, ToolExecutor):
+                        result = await tools.execute(
+                            call, request_number=tool_fields["request_number"], before_execute=before_execute,
+                        )
+                    else:
+                        tools.validate_call(call)
+                        await before_execute(call_id)
+                        await self.events.emit("tool.executing", **tool_fields)
+                        await _checkpoint()
+                        result = await tools.execute(call)
+                    content = result.content
+                    if isinstance(tools, ToolExecutor) and not result.value.get("ok", False):
+                        tool_error = result.value.get("error")
+                except (ToolCallValidationError, ToolExecutionError) as exc:
+                    if isinstance(exc.__cause__, FatalToolError):
+                        raise exc.__cause__
+                    tool_error = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "code": getattr(exc, "code", "execution_error"),
+                    }
+                    content = json.dumps({"error": tool_error}, ensure_ascii=False)
+                if not isinstance(content, str):
+                    raise TypeError("Tool result content must be a string.")
+                await commit(
+                    update_tool_result(committed, index, call_id, content=content),
+                    tool_finished={
+                        **tool_fields, "status": "ERROR" if tool_error else "COMPLETED",
+                        "content": content, "error": tool_error,
+                    },
+                )
 
             def primary_remaining() -> int:
                 return min(self.max_primary_requests - primary_requests, self.max_total_requests - requests)
@@ -563,7 +644,13 @@ class Agent:
                 return response, request_fields
 
             await _checkpoint()
-            await commit()
+            resuming = interrupted is not None and prompt.strip() == RESUME_PROMPT
+            if interrupted is None:
+                if committed and len(committed) not in safe_boundaries(committed):
+                    raise ValueError("Cannot append to an incomplete tool exchange.")
+                working = Messages(committed)
+                working.add_user(prompt)
+                await commit(working.snapshot())
             body = prepare_request_options(
                 model=model,
                 thinking_mode=thinking_mode,
@@ -572,6 +659,37 @@ class Agent:
                 extra_body=extra_body,
                 custom_compatibility=self._custom_compatibility,
             )
+            if interrupted is not None:
+                calls, indices = interrupted
+                self._validate_tool_calls(calls)
+                prefix = committed[:min(indices.values()) - 1]
+                if prefix and len(prefix) not in safe_boundaries(prefix):
+                    raise ValueError("Cannot recover a tool group after an incomplete exchange.")
+                for call_id, index in indices.items():
+                    if committed[index].get(TOOL_STATE) == RUNNING:
+                        side_effects = True
+                        unknown = json.dumps({
+                            "ok": False,
+                            "source": "daphnis_recovery",
+                            "error": {
+                                "code": "execution_result_unknown",
+                                "message": "执行中断，工具可能已经产生副作用，请检查实际环境。",
+                            },
+                        }, ensure_ascii=False)
+                        await commit(update_tool_result(committed, index, call_id, content=unknown))
+                pending = [
+                    call for call in calls if committed[indices[call["id"]]].get(TOOL_STATE) == PENDING
+                ]
+                if pending and not resuming:
+                    raise ValueError("上轮有尚未执行的工具调用。请发送「继续」以恢复。")
+                if len(pending) > self.max_tool_calls:
+                    raise RuntimeError("Maximum tool-call count exceeded.")
+                for call in pending:
+                    await process_tool(call, indices[call["id"]], {**fields, "request_number": 0})
+                working = Messages(committed)
+                if not resuming:
+                    working.add_user(prompt)
+                    await commit(working.snapshot())
             while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
@@ -637,10 +755,10 @@ class Agent:
                 )
                 if reason not in ("stop", "tool_calls"):
                     raise ValueError(f"Model did not finish normally: {reason!r}.")
-                working.add(message)
                 if reason == "stop":
+                    working.add(message)
                     await _checkpoint()
-                    await commit()
+                    await commit(working.snapshot())
                     final_message = deepcopy(message)
                     status = TurnStatus.COMPLETED
                     break
@@ -651,73 +769,11 @@ class Agent:
                 calls = message["tool_calls"]
                 if calls_executed + len(calls) > self.max_tool_calls:
                     raise RuntimeError("Maximum tool-call count exceeded.")
-                check_session()
-                for call in calls:
-                    await _checkpoint()
-                    calls_executed += 1
-                    tool_fields = {
-                        **request_fields,
-                        "tool_call_id": call["id"],
-                        "name": call["function"]["name"],
-                    }
-                    await self.events.emit(
-                        "tool.started",
-                        **tool_fields,
-                        arguments=call["function"]["arguments"],
-                    )
-                    side_effects = True
-                    tool_error = None
-                    content = None
-                    tool_status = "FAILED"
-                    try:
-                        try:
-                            if isinstance(tools, ToolExecutor):
-                                result = await tools.execute(call, request_number=requests)
-                            else:
-                                result = await tools.execute(call)
-                            content = result.content
-                            if isinstance(tools, ToolExecutor) and not result.value.get(
-                                "ok", False
-                            ):
-                                tool_error = result.value.get("error")
-                        except (ToolCallValidationError, ToolExecutionError) as exc:
-                            if isinstance(exc.__cause__, FatalToolError):
-                                raise exc.__cause__
-                            tool_error = {
-                                "type": type(exc).__name__,
-                                "message": str(exc),
-                                "code": getattr(exc, "code", "execution_error"),
-                            }
-                            content = json.dumps(
-                                {"error": tool_error}, ensure_ascii=False
-                            )
-                        await _checkpoint()
-                        working.add_tool_result(
-                            tool_call_id=call["id"], content=content
-                        )
-                        tool_status = "ERROR" if tool_error else "COMPLETED"
-                    except asyncio.CancelledError as exc:
-                        tool_status = "CANCELLED"
-                        tool_error = {
-                            "type": "CancelledError",
-                            "message": str(exc) or "Tool operation cancelled.",
-                        }
-                        raise
-                    except Exception as exc:
-                        tool_error = {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                        }
-                        raise
-                    finally:
-                        await self.events.emit(
-                            "tool.finished",
-                            **tool_fields,
-                            status=tool_status,
-                            content=content,
-                            error=tool_error,
-                        )
-                await commit()
+                first_result = len(working) + 1
+                await commit(stage_tool_group(working, message).snapshot())
+                for index, call in enumerate(calls, start=first_result):
+                    await process_tool(call, index, request_fields)
+                working = Messages(committed)
             if status is not TurnStatus.COMPLETED:
                 await _checkpoint()
                 status = TurnStatus.PAUSED_LIMIT

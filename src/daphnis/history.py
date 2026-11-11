@@ -15,6 +15,7 @@ from saturnus import Messages, ValidationError
 
 from .compaction import CompactionCheckpoint
 from .session import Session
+from .tool_state import interrupted_tool_group
 from .usage import UsageTotals
 
 if os.name == "posix":
@@ -233,6 +234,7 @@ class History:
             "messages": validated.messages.snapshot(),
             "usage": asdict(validated.usage),
         }
+        interrupted_tool_group(data["messages"])
         if validated.title is not None:
             data["title"] = validated.title
         if validated.compaction is not None:
@@ -292,6 +294,8 @@ class History:
             if not isinstance(checkpoint, dict) or checkpoint.keys() != {"through", "summary"}:
                 raise ValueError("Invalid session compaction checkpoint.")
             checkpoint = CompactionCheckpoint(**checkpoint)
+        messages = Messages(data["messages"])
+        interrupted_tool_group(data["messages"])
         return Session(
             id=data["id"],
             workspace=data["workspace"],
@@ -299,7 +303,7 @@ class History:
             model_id=data["model_id"],
             thinking=data["thinking"],
             enabled_tools=tuple(enabled_tools),
-            messages=Messages(data["messages"]),
+            messages=messages,
             usage=UsageTotals.from_dict(data["usage"]),
             _saved_revision=(session_id, sha256(raw).hexdigest()),
             title=data.get("title"),
