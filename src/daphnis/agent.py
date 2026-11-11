@@ -539,14 +539,11 @@ class Agent:
 
             async def send_request(
                 messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
-                *, closing: bool = False,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
                 nonlocal requests, primary_requests
                 primary_requests += 1
                 requests += 1
                 request_fields = {**fields, "request_number": requests}
-                if closing:
-                    request_fields["purpose"] = "limit_close"
                 await self.events.emit(
                     "model.started", **request_fields, provider=provider, model_id=model_id,
                 )
@@ -575,7 +572,7 @@ class Agent:
                 extra_body=extra_body,
                 custom_compatibility=self._custom_compatibility,
             )
-            while primary_remaining() and not (calls_executed and primary_remaining() == 1):
+            while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
                 messages = self._model_context(working, checkpoint, history_lookup=history_lookup)
@@ -587,8 +584,6 @@ class Agent:
                         history_lookup=history_lookup,
                     )
                     budget = self._request_budget(messages, body, compactor)
-                    if calls_executed and primary_remaining() == 1:
-                        break
                 if not budget.fits:
                     if maintenance_limited:
                         break
@@ -604,7 +599,7 @@ class Agent:
                             reason = "retry_exhausted"
                         elif not exc.retryable:
                             reason = "stream_started"
-                        elif not primary_remaining() or (calls_executed and primary_remaining() == 1):
+                        elif primary_remaining() == 0:
                             reason = "request_limit"
                         if reason is None:
                             before = budget.input_tokens
@@ -619,8 +614,6 @@ class Agent:
                                 reason = "window_limit"
                             elif budget.input_tokens >= before:
                                 reason = "no_reduction"
-                            elif calls_executed and primary_remaining() == 1:
-                                reason = "request_limit"
                         await self.events.emit(
                             "context.overflow", **failure_fields,
                             retrying=reason is None, reason=reason,
@@ -727,46 +720,14 @@ class Agent:
                 await commit()
             if status is not TurnStatus.COMPLETED:
                 await _checkpoint()
-                if primary_remaining():
-                    closing_body = {
-                        key: value for key, value in body.items()
-                        if key not in {"tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"}
-                    }
-                    messages = self._model_context(working, checkpoint)
-                    if self._request_budget(messages, closing_body, compactor).needs_compaction:
-                        checkpoint, messages = await self._compact_request(
-                            working=working, checkpoint=checkpoint, messages=messages,
-                            body=closing_body, compactor=compactor, summarize=summarize, fields=fields,
-                        )
-                    instruction = (
-                        "本轮将因请求预算暂停。请仅根据可见记录和实际工具结果简要说明已验证的进度、"
-                        "未完成或未知的事项，以及继续所需的下一步。不要请求工具或声称未经验证的工作已完成。"
-                    )
-                    if messages and messages[0]["role"] == "system" and isinstance(messages[0].get("content"), str):
-                        messages[0]["content"] += "\n\n" + instruction
-                    else:
-                        messages.insert(0, {"role": "system", "content": instruction})
-                    budget = self._request_budget(messages, closing_body, compactor)
-                    if budget.fits:
-                        try:
-                            response, request_fields = await send_request(messages, closing_body, budget, closing=True)
-                        except ContextOverflowError:
-                            await self.events.emit(
-                                "context.overflow", **fields, request_number=requests,
-                                retrying=False, reason="limit_close",
-                            )
-                        else:
-                            await _checkpoint()
-                            message, reason = self._parse_response(response, require_visible=False)
-                            await self.events.emit(
-                                "model.finished", **request_fields, finish_reason=reason, response=response,
-                            )
-                            if reason == "stop" and assistant_text(message):
-                                working.add(message)
-                                await commit()
-                                final_message = deepcopy(message)
                 status = TurnStatus.PAUSED_LIMIT
-                notice = "本轮因请求预算暂停。已保存进度，发送「继续」可接着处理。"
+                if primary_requests == self.max_primary_requests:
+                    limit_reason = f"达到模型主请求上限（{primary_requests}/{self.max_primary_requests}）"
+                elif requests == self.max_total_requests:
+                    limit_reason = f"达到模型总请求上限（{requests}/{self.max_total_requests}）"
+                else:
+                    limit_reason = "可用于上下文压缩的请求额度不足"
+                notice = f"本轮{limit_reason}，进度已保存。发送「继续」可接着处理。"
         except asyncio.CancelledError:
             status = TurnStatus.CANCELLED
             error = "Turn cancelled; executed tool side effects are not rolled back."

@@ -316,7 +316,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.snapshot()["events"], events)
 
     def test_budget_pause_and_continue_use_saved_history(self):
-        self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=2)
+        self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
         session_id = self.snapshot()["session_id"]
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
@@ -326,18 +326,21 @@ class WebTests(unittest.TestCase):
         paused = self.wait_for(lambda frame: not frame["status"]["running"])
         outcome = paused["events"][-1]["data"]
         self.assertEqual(outcome["status"], "PAUSED_LIMIT")
-        self.assertIn("继续", outcome["notice"])
-        self.assertEqual(len(self.requests), 2)
+        self.assertIn("总请求上限（1/1）", outcome["notice"])
+        self.assertIsNone(outcome["error"])
+        self.assertEqual(len(self.requests), 1)
         self.assertIn("tools", self.requests[0])
-        self.assertNotIn("tools", self.requests[1])
         messages = paused["state"]["messages"]
         self.assertEqual(messages, self.history.load(session_id).messages.snapshot())
-        self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool"])
+        self.assertTrue(json.loads(messages[-1]["content"])["ok"])
 
+        self.command("new", session_id)
+        self.command("restore", self.snapshot()["session_id"], id=session_id)
         self.command("send", session_id, 202, prompt="继续")
         done = self.wait_for(lambda frame: not frame["status"]["running"])
         self.assertEqual(done["events"][-1]["data"]["status"], "COMPLETED")
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(len(self.requests), 2)
         self.assertEqual(self.requests[-1]["messages"][1:-1], messages)
         self.assertIn("tools", self.requests[-1])
 

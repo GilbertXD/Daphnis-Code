@@ -26,7 +26,10 @@ async def execute(ops: Operations, prompt: str) -> int:
         print(sanitize_terminal(assistant_text(result.message)))
     if result.status == TurnStatus.COMPLETED:
         return 0
-    print(sanitize_terminal(safe_error(result.notice or result.error or result.status)), file=sys.stderr)
+    if result.status == TurnStatus.PAUSED_LIMIT:
+        print(sanitize_terminal(result.notice or result.status))
+        return 3
+    print(sanitize_terminal(safe_error(result.error or result.status)), file=sys.stderr)
     return 1
 
 

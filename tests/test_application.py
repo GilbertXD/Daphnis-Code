@@ -11,12 +11,12 @@ import unittest
 from dataclasses import replace
 from inspect import isawaitable
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 from saturnus import Compatibility, ValidationError
 
-from daphnis import History, Operations, TurnStatus
+from daphnis import History, Operations, TurnResult, TurnStatus
 from daphnis.app import Application
 from daphnis.config import environment_connections
 from daphnis.models import CapabilityError, ModelInfo
@@ -200,6 +200,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     "workspace": root, "provider": "deepseek", "model_id": "a", "catalog": CATALOG,
                     "connections": {"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
                     "history": history,
+                    "max_primary_requests": 1 if scenario == "save_failure" else 20,
                 }
                 ops = Operations(Application(**options))
                 session_id = ops.session.id
@@ -227,6 +228,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(snapshot, user)
                     if scenario == "save_failure":
                         self.assertIn("stage write failed", result.error)
+                        self.assertIsNone(result.notice)
+                        self.assertEqual(result.model_requests, 1)
                         self.assertTrue(result.external_side_effects_possible)
                 finally:
                     await ops.close()
@@ -811,6 +814,21 @@ class ConfigTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_budget_pause_prints_notice_with_distinct_exit_code(self):
+        from daphnis import cli
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        ops = Mock(spec=Operations)
+        paused = TurnResult("session", "turn", TurnStatus.PAUSED_LIMIT, notice="进度已保存。发送「继续」可接着处理。")
+        ops.send.return_value = paused
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(asyncio.run(cli.execute(ops, "run")), 3)
+        self.assertEqual(stdout.getvalue(), paused.notice + "\n")
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_argparse_sanitizes_errors_and_help(self):
         from daphnis import cli
 

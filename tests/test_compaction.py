@@ -265,7 +265,7 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(outcome.status, TurnStatus.PAUSED_LIMIT)
         self.assertIsNone(outcome.error)
-        self.assertIn("继续", outcome.notice)
+        self.assertIn("用于上下文压缩的请求额度不足", outcome.notice)
         self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "continue"}])
         self.assertIsNone(state.compaction)
 
@@ -421,7 +421,8 @@ class OverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json=reply())
 
         async with make_client(handler) as client:
-            agent = Agent(client=client, provider="compatible", catalog=CATALOG, tools=registry(execute))
+            agent = Agent(client=client, provider="compatible", catalog=CATALOG, tools=registry(execute),
+                          max_total_requests=3)
             agent.events.on("context.overflow", recoveries.append)
             result = await agent.run(session=state, prompt="use a tool")
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)

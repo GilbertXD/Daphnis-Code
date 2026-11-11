@@ -506,7 +506,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 200, json=reply(None, finish="tool_calls", calls=[tool_call()])
             )
         ) as client:
-            result = await make_agent(client, tools=registry(unsafe)).run(
+            result = await make_agent(client, tools=registry(unsafe), max_requests=1).run(
                 session=state, prompt="use tool"
             )
         self.assertEqual(result.status, TurnStatus.FAILED)
@@ -514,20 +514,49 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.external_side_effects_possible)
         self.assertEqual(len(state.messages), 1)
 
-    async def test_limit_closing_rejects_unsolicited_tool_calls(self):
-        requests = []
-        state = session()
+    async def test_last_request_keeps_tools_and_commits_its_response(self):
+        async def check(final_calls, max_primary, max_total):
+            requests = []
+            state = session()
+            tools = registry()
+            system = {"role": "system", "content": "Be concise."}
+            user = {"role": "user", "content": "use tools"}
 
-        def handler(request):
-            requests.append(json.loads(request.content))
-            return httpx.Response(200, json=reply(None, finish="tool_calls", calls=[tool_call()]))
+            def handler(request):
+                requests.append(json.loads(request.content))
+                if len(requests) == 1:
+                    return httpx.Response(200, json=reply(None, finish="tool_calls", calls=[tool_call()]))
+                self.assertEqual(len(requests), 2)
+                response = reply(None, finish="tool_calls", calls=final_calls) if final_calls else reply("done")
+                return httpx.Response(200, json=response)
 
-        async with make_client(handler) as client:
-            result = await make_agent(client, tools=registry(), max_requests=2).run(session=state, prompt="use tools")
-        self.assertEqual((result.status, result.model_requests, result.tool_calls), (TurnStatus.PAUSED_LIMIT, 2, 1))
-        self.assertIn("tools", requests[0])
-        self.assertNotIn("tools", requests[1])
-        self.assertEqual([message["role"] for message in state.messages.snapshot()], ["user", "assistant", "tool"])
+            async with make_client(handler) as client:
+                result = await make_agent(
+                    client, tools=tools, context=Context(system_prompt=system["content"]),
+                    max_primary_requests=max_primary, max_total_requests=max_total,
+                ).run(session=state, prompt=user["content"])
+
+            messages = state.messages.snapshot()
+            self.assertEqual([body["tools"] for body in requests], [tools.definitions()] * 2)
+            self.assertEqual([body["messages"] for body in requests], [[system, user], [system, *messages[:3]]])
+            self.assertEqual((result.model_requests, result.primary_requests, result.maintenance_requests), (2, 2, 0))
+            self.assertIsNone(result.error)
+            if final_calls:
+                self.assertEqual((result.status, result.tool_calls), (TurnStatus.PAUSED_LIMIT, 3))
+                self.assertIsNone(result.message)
+                self.assertIn("总请求上限（2/2）", result.notice)
+                self.assertEqual(messages[3]["tool_calls"], final_calls)
+                self.assertEqual([item["tool_call_id"] for item in messages[4:]], ["call-2", "call-3"])
+                self.assertEqual(messages[4]["content"], "hello")
+                self.assertEqual(json.loads(messages[5]["content"])["error"]["code"], "unknown_tool")
+            else:
+                self.assertEqual((result.status, result.tool_calls), (TurnStatus.COMPLETED, 1))
+                self.assertEqual(messages[3:], [result.message])
+                self.assertEqual(result.message["content"], "done")
+                self.assertIsNone(result.notice)
+
+        await check(None, max_primary=2, max_total=5)
+        await check([tool_call("call-2"), tool_call("call-3", "missing", "{}")], max_primary=5, max_total=2)
 
     async def test_cancel_stream_closes_resources_and_preserves_history(self):
         received = asyncio.Event()
@@ -603,7 +632,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         events.on("tool.finished", tool_finished.append)
         state = session()
         async with make_client(handler) as client:
-            agent = make_agent(client, tools=registry(handler_tool), events=events)
+            agent = make_agent(client, tools=registry(handler_tool), events=events, max_requests=1)
             task = asyncio.create_task(agent.run(session=state, prompt="tool"))
             await asyncio.wait_for(entered.wait(), 2)
             task.cancel()

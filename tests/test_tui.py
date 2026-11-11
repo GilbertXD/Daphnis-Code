@@ -164,23 +164,22 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
     async def test_budget_pause_preserves_results_and_displays_continue_notice(self):
         def handler(request):
             body = json.loads(request.content)
-            if body["messages"][-1]["role"] == "user":
-                return sse({"role": "assistant", "tool_calls": [{
-                    "id": "list-1", "type": "function",
-                    "function": {"name": "list_directory", "arguments": "{}"},
-                }]}, "tool_calls")
-            self.assertNotIn("tools", body)
-            return sse({"role": "assistant", "content": "已列出工作区。"})
+            self.assertIn("tools", body)
+            self.assertEqual(body["messages"][-1]["role"], "user")
+            return sse({"role": "assistant", "tool_calls": [{
+                "id": "list-1", "type": "function",
+                "function": {"name": "list_directory", "arguments": "{}"},
+            }]}, "tool_calls")
 
         with tempfile.TemporaryDirectory() as temporary:
             app = controller(Path(temporary), handler)
-            app._request_limits.update(max_primary_requests=2, max_total_requests=2)
+            app._request_limits.update(max_primary_requests=1, max_total_requests=2)
             ops = Operations(app)
             ui = DaphnisApp(ops, app.events)
             async with ui.run_test(size=(100, 36)) as pilot:
                 await submit(ui, pilot, "检查工作区")
-                await until(pilot, lambda: any("因请求预算暂停" in row.text for row in ui.query(ChatRow)))
-                self.assertEqual(ops.message_snapshot()[-1]["content"], "已列出工作区。")
+                await until(pilot, lambda: any("主请求上限（1/1）" in row.text for row in ui.query(ChatRow)))
+                self.assertEqual([item["role"] for item in ops.message_snapshot()], ["user", "assistant", "tool"])
                 self.assertFalse(ui.query_one(PromptInput).disabled)
 
     async def test_input_stream_clear_new_and_restore(self):
