@@ -19,6 +19,8 @@ export type Session = {
   message_count?: number
 }
 
+type HistoryIssue = { filename: string; error: string }
+
 export type ToolCall = { id: string; function: { name: string; arguments: string } }
 export type Message = {
   role: string
@@ -92,6 +94,7 @@ export type LiveText = { content: string; reasoning: string; count: number }
 type State = {
   session: Session
   sessions: Session[]
+  history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
   model: Model

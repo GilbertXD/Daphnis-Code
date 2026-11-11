@@ -11,7 +11,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Self, TypeVar
 
-from saturnus import Messages
+from saturnus import Messages, ValidationError
 
 from .compaction import CompactionCheckpoint
 from .session import Session
@@ -27,6 +27,10 @@ class SessionConflictError(RuntimeError):
 
 class SessionBusyError(RuntimeError):
     """Another operation holds the Session lease."""
+
+
+class UnsupportedSessionVersionError(ValueError):
+    """The saved Session uses an unsupported file version."""
 
 
 class SessionLease:
@@ -91,6 +95,18 @@ class SessionInfo:
     title: str | None = None
 
 
+@dataclass(frozen=True)
+class SessionIssue:
+    filename: str
+    error: str
+
+
+@dataclass(frozen=True)
+class SessionScan:
+    sessions: tuple[SessionInfo, ...]
+    issues: tuple[SessionIssue, ...]
+
+
 class History:
     def __init__(self, directory: str | Path | None = None) -> None:
         location = (
@@ -101,13 +117,22 @@ class History:
         self.directory = location.expanduser().resolve()
 
     def list_sessions(self) -> tuple[SessionInfo, ...]:
-        """List saved facts; invalid files raise rather than silently disappearing."""
-        if not self.directory.exists():
-            return ()
+        """List valid saved Sessions, newest first."""
+        return self.scan_sessions().sessions
+
+    def scan_sessions(self) -> SessionScan:
+        """Scan saved Sessions and report per-file errors without exposing file contents."""
+        try:
+            paths = list(self.directory.iterdir())
+        except FileNotFoundError:
+            return SessionScan((), ())
         items = []
-        for path in self.directory.glob("*.json"):
+        issues = []
+        for path in paths:
+            if not path.name.endswith(".json"):
+                continue
             try:
-                session = self.load(path.stem)
+                session = self.load(path.name.removesuffix(".json"))
                 items.append(
                     SessionInfo(
                         session.id,
@@ -119,11 +144,10 @@ class History:
                         session.title,
                     )
                 )
-            except (OSError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Cannot list saved session {path.name}: {exc}"
-                ) from exc
-        return tuple(sorted(items, key=lambda item: item.updated_at, reverse=True))
+            except (OSError, RuntimeError, TypeError, ValueError, ValidationError) as exc:
+                issues.append(SessionIssue(path.name, type(exc).__name__))
+        items.sort(key=lambda item: item.updated_at, reverse=True)
+        return SessionScan(tuple(items), tuple(issues))
 
     def _path(self, session_id: str) -> Path:
         if (
@@ -245,7 +269,7 @@ class History:
             raise ValueError("Session data must be a JSON object.")  # noqa: TRY004 - Malformed history file.
         version = data.get("version")
         if type(version) is not int or version != 2:
-            raise ValueError("Unsupported session file version.")
+            raise UnsupportedSessionVersionError("Unsupported session file version.")
         required = {
             "id",
             "workspace",

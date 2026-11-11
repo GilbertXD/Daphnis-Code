@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -9,7 +10,7 @@ import httpx
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from daphnis import History, Operations
+from daphnis import History, Operations, Session
 from daphnis.app import Application
 from daphnis.history import SessionLease
 from daphnis.web.bridge import Bridge
@@ -177,8 +178,11 @@ class WebTests(unittest.TestCase):
         self.command("tools", first, 400, names=[{}])
         self.command("rename", first, id=first, title="Original")
         self.command("new", first)
-        second = self.snapshot()["session_id"]
+        frame = self.snapshot()
+        second = frame["session_id"]
         self.assertNotEqual(first, second)
+        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first, second})
+        self.assertEqual(frame["state"]["history_issues"], [])
         self.command("send", first, 409, prompt="stale")
         self.command("rename", second, id=first, title="Inactive")
         self.command("restore", second, id=first)
@@ -199,6 +203,87 @@ class WebTests(unittest.TestCase):
         self.assertEqual([row["id"] for row in state["sessions"]], [second])
         with self.assertRaises(FileNotFoundError):
             self.history.load(first)
+
+    def test_history_lists_and_restores_valid_sessions_alongside_invalid_files(self):
+        self.history.directory.mkdir()
+        invalid_files = {
+            "legacy.json": b'{"version": 1, "messages": ["private legacy content"]}',
+            "legacy-unversioned.json": b"{}",
+        }
+        for name, content in invalid_files.items():
+            (self.history.directory / name).write_bytes(content)
+
+        frame = self.snapshot()
+        first = frame["session_id"]
+        self.assertEqual(frame["state"]["sessions"], [])
+        self.assertEqual(len(frame["state"]["history_issues"]), 2)
+        self.assertIsNone(frame["state"]["history_error"])
+        self.assertEqual(self.history.list_sessions(), ())
+
+        invalid_files["broken.json"] = b'{"messages": ["private broken content"'
+        (self.history.directory / "broken.json").write_bytes(invalid_files["broken.json"])
+        archived_workspace = self.workspace.parent / "archived-workspace"
+        archived_workspace.mkdir()
+        archived = Session(archived_workspace, "deepseek", "deepseek-flash")
+        archived.messages.add_user("archived prompt")
+        archived.messages.add_assistant("archived reply")
+        self.history.save(archived)
+        archived_path = self.history.directory / f"{archived.id}.json"
+        os.utime(archived_path, (1, 1))
+        invalid_files["bad-message.json"] = json.dumps({
+            **json.loads(archived_path.read_bytes()),
+            "id": "bad-message",
+            "messages": [None],
+        }).encode()
+        (self.history.directory / "bad-message.json").write_bytes(invalid_files["bad-message.json"])
+
+        self.command("send", first, 202, prompt="current prompt")
+        frame = self.wait_for(lambda frame: not frame["status"]["running"] and frame["state"]["messages"])
+        state = frame["state"]
+        self.assertEqual([row["id"] for row in state["sessions"]], [first, archived.id])
+        self.assertEqual([row.id for row in self.history.list_sessions()], [first, archived.id])
+        self.assertEqual(
+            {issue["filename"]: issue["error"] for issue in state["history_issues"]},
+            {
+                "legacy.json": "UnsupportedSessionVersionError",
+                "legacy-unversioned.json": "UnsupportedSessionVersionError",
+                "broken.json": "JSONDecodeError",
+                "bad-message.json": "ValidationError",
+            },
+        )
+        self.assertIsNone(state["history_error"])
+        encoded_state = json.dumps(state)
+        self.assertNotIn("private legacy content", encoded_state)
+        self.assertNotIn("private broken content", encoded_state)
+        self.assertNotIn("archived prompt", encoded_state)
+
+        self.command("new", first)
+        frame = self.snapshot()
+        fresh = frame["session_id"]
+        self.assertNotEqual(fresh, first)
+        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {fresh, first, archived.id})
+        self.command("restore", fresh, 409, id="legacy")
+        self.assertEqual(self.snapshot()["session_id"], fresh)
+        self.command("restore", fresh, id=first)
+        frame = self.snapshot()
+        self.assertEqual(frame["session_id"], first)
+        self.assertEqual(frame["state"]["messages"], state["messages"])
+        self.command("restore", first, id=archived.id)
+        frame = self.snapshot()
+        self.assertEqual(frame["session_id"], archived.id)
+        self.assertEqual(frame["state"]["messages"], archived.messages.snapshot())
+        self.assertEqual(frame["state"]["session"]["workspace"], str(archived_workspace.resolve()))
+        for name, content in invalid_files.items():
+            self.assertEqual((self.history.directory / name).read_bytes(), content)
+
+    def test_history_directory_error_is_reported_separately(self):
+        self.history.directory.touch()
+        with self.assertRaises(NotADirectoryError):
+            self.history.list_sessions()
+        state = self.snapshot()["state"]
+        self.assertEqual(state["sessions"], [])
+        self.assertEqual(state["history_issues"], [])
+        self.assertIn("NotADirectoryError", state["history_error"])
 
     def test_approval_reconnect_and_exact_model_json(self):
         session_id = self.snapshot()["session_id"]

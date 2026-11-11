@@ -20,12 +20,13 @@ function Dialog({ title, close, children }: { title: string; close: () => void; 
   </dialog>
 }
 
-function Sidebar({ sessions, selected, disabled, visible, historyError, onNew, onSelect, onEdit }: {
+function Sidebar({ sessions, selected, disabled, visible, historyError, historyIssueCount, onNew, onSelect, onEdit }: {
   sessions: Session[]
   selected: string
   disabled: boolean
   visible: boolean
   historyError: string | null
+  historyIssueCount: number
   onNew: () => void
   onSelect: (id: string) => void
   onEdit: (action: 'rename' | 'delete', session: Session) => void
@@ -35,6 +36,7 @@ function Sidebar({ sessions, selected, disabled, visible, historyError, onNew, o
       <button className="icon" onClick={onNew} disabled={disabled} aria-label="新建会话" title="新建会话">＋</button>
     </div>
     <nav>{historyError && <p className="history-error" role="alert">{historyError}</p>}
+      {historyIssueCount > 0 && <p className="history-error muted" role="status">{historyIssueCount} 个历史会话无法加载。</p>}
       {sessions.map((session) => <div className={`session-row ${session.id === selected ? 'selected' : ''}`} key={session.id}>
       <button className="session-select" aria-current={session.id === selected ? 'page' : undefined}
         disabled={disabled && session.id !== selected} onClick={() => onSelect(session.id)}>
@@ -172,6 +174,7 @@ function Workspace({ view, connected, command }: {
       </span>
     </header>
     <Sidebar sessions={sessions} selected={id} disabled={disabled} visible={sidebar} historyError={state.history_error}
+      historyIssueCount={state.history_issues.length}
       onNew={async () => { if (await perform('new')) setSidebar(false) }}
       onSelect={async (target) => { if (target === id || await perform('restore', { id: target })) setSidebar(false) }}
       onEdit={(action, session) => {

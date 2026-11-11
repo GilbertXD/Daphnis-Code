@@ -19,7 +19,7 @@ from .tools import ApprovalDecision, ApprovalMode
 if TYPE_CHECKING:
     from .agent import TurnResult
     from .app import Application
-    from .history import SessionInfo
+    from .history import SessionInfo, SessionScan
     from .token_budget import TokenBudget
     from .tools import ApprovalRequest
     from .usage import UsageTotals
@@ -266,6 +266,9 @@ class Operations:
 
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()
+
+    def scan_sessions(self) -> "SessionScan":
+        return self._app._history.scan_sessions()
 
     async def new_session(self) -> SessionSnapshot:
         app = self._app

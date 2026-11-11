@@ -50,7 +50,7 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 用途 | 接口与行为 |
 | --- | --- |
 | 当前会话 | `session` 返回 ID、工作区、模型身份和可选标题。`message_snapshot()` 返回已提交消息的独立副本。 |
-| 历史 | `list_sessions()` 按更新时间列出已保存会话。`await new_session()`、`restore_session(session_id)` 用于新建或恢复。 |
+| 历史 | `list_sessions()` 按更新时间降序列出有效的已保存会话。`scan_sessions()` 同时返回有效会话和无法加载的文件名及错误类型。`await new_session()`、`restore_session(session_id)` 用于新建或恢复。 |
 | 会话管理 | `await rename_session(session_id, title)` 保存去除首尾空白后长度为 1–120 的标题。`await delete_session(session_id)` 删除历史，删除当前会话时会选中新建的空白会话，并返回当前会话快照。 |
 | 模型 | `model` 返回能力描述。`list_models()` 按厂商分组，`configured(provider)` 查询连接是否已配置。`await set_model(provider, model_id)` 保存选择并返回提示文本，也会重置不适用的思考档位或工具选择。 |
 | 思考档位 | `thinking` 返回当前档位。`await set_thinking(mode)` 保存档位，传入 `None` 采用服务端默认。 |

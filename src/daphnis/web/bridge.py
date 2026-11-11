@@ -7,6 +7,7 @@ from collections import OrderedDict, deque
 from dataclasses import asdict, fields
 from uuid import uuid4
 
+from ..history import SessionScan
 from ..operations import Operations
 from .redaction import Redactor
 
@@ -129,13 +130,14 @@ class Bridge:
         ops = self.ops
         history_error = None
         try:
-            sessions = ops.list_sessions()
-        except (OSError, ValueError) as exc:
-            sessions = ()
-            history_error = str(exc)
+            history = ops.scan_sessions()
+        except OSError as exc:
+            history = SessionScan((), ())
+            history_error = f"无法读取历史会话目录（{type(exc).__name__}）。"
         return self.redactor.json({
             "session": asdict(ops.session),
-            "sessions": [asdict(session) for session in sessions],
+            "sessions": [asdict(session) for session in history.sessions],
+            "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
             "messages": ops.message_snapshot(),
             "model": _model_view(ops.model),
