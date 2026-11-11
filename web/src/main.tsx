@@ -35,8 +35,9 @@ function Sidebar({ sessions, selected, disabled, visible, historyError, historyI
     <div className="section-heading"><h2>历史会话</h2>
       <button className="icon" onClick={onNew} disabled={disabled} aria-label="新建会话" title="新建会话">＋</button>
     </div>
-    <nav>{historyError && <p className="history-error" role="alert">{historyError}</p>}
-      {historyIssueCount > 0 && <p className="history-error muted" role="status">{historyIssueCount} 个历史会话无法加载。</p>}
+    {historyError && <p className="history-notice" role="alert">{historyError}</p>}
+    {historyIssueCount > 0 && <p className="history-notice muted" role="status">{historyIssueCount} 个历史会话无法加载。</p>}
+    <nav>
       {sessions.map((session) => <div className={`session-row ${session.id === selected ? 'selected' : ''}`} key={session.id}>
       <button className="session-select" aria-current={session.id === selected ? 'page' : undefined}
         disabled={disabled && session.id !== selected} onClick={() => onSelect(session.id)}>

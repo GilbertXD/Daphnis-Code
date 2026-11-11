@@ -52,7 +52,7 @@ a { color: inherit; text-underline-offset: 3px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; padding: 13px 14px 10px 22px; }
 .section-heading h2, .debug-heading h2 { font-size: 1.04rem; }
 .sidebar nav { flex: 1; overflow: auto; padding: 0 13px 18px 2px; }
-.history-error { margin: 5px 0 12px 15px; font-size: .82rem; overflow-wrap: anywhere; }
+.history-notice { margin: 0 14px 12px 22px; font-size: .82rem; overflow-wrap: anywhere; }
 .session-row { display: flex; align-items: center; border-left: 5px solid transparent; position: relative; min-width: 0; }
 .session-row + .session-row { margin-top: 5px; }
 .session-row.selected { border-left-color: #111; background: #ededed; }
