@@ -223,7 +223,6 @@ class ChatView(VerticalScroll):
         super().__init__(**kwargs)
         self.assistants: dict[tuple[str, int], ChatRow] = {}
         self.tools: dict[tuple[str, int, str], ChatRow] = {}
-        self.turn_rows: dict[str, list[ChatRow]] = {}
         self.pending_user: ChatRow | None = None
         self._tool_group: ToolGroup | None = None
 
@@ -254,7 +253,6 @@ class ChatView(VerticalScroll):
         await self.remove_children()
         self.assistants.clear()
         self.tools.clear()
-        self.turn_rows.clear()
         self.pending_user = None
         self._tool_group = None
 
@@ -312,9 +310,7 @@ class ChatView(VerticalScroll):
     async def event(self, event: Event) -> None:
         data = event.data
         if event.name == "turn.started":
-            if self.pending_user is not None:
-                self.turn_rows.setdefault(event.turn_id, []).append(self.pending_user)
-                self.pending_user = None
+            self.pending_user = None
         elif event.name in ("model.delta", "model.finished"):
             key = (event.turn_id, data["request_number"])
             if event.name == "model.delta":
@@ -341,7 +337,6 @@ class ChatView(VerticalScroll):
             if row is None:
                 row = await self.add("助手")
                 self.assistants[key] = row
-                self.turn_rows.setdefault(event.turn_id, []).append(row)
             if event.name == "model.delta":
                 if isinstance(content, str):
                     row.text += content
@@ -361,7 +356,6 @@ class ChatView(VerticalScroll):
                     f"工具 · {data['name']}", tool_summary(data), classes="tool"
                 )
                 self.tools[key] = row
-                self.turn_rows.setdefault(event.turn_id, []).append(row)
             if event.name == "tool.started":
                 row.outcome = "运行中"
                 row.edits = patch_counts(data.get("arguments", "{}"))
@@ -391,10 +385,6 @@ class ChatView(VerticalScroll):
             if row.output or row.outcome.startswith(("ERROR", "FAILED", "等待审批")):
                 row.tool_group.reveal()
         elif event.name == "turn.finished":
-            if data["status"] != "COMPLETED":
-                for row in self.turn_rows.get(event.turn_id, []):
-                    row.outcome = f"{data['status']} · 本轮未提交；工具副作用不自动回滚"
-                    row.dirty = True
-                    if row.tool_group is not None:
-                        row.tool_group.reveal()
+            if data["status"] in ("FAILED", "CANCELLED") and data.get("external_side_effects_possible"):
+                await self.add("运行结果", "已执行的工具可能产生外部副作用。", classes="notice")
             self.refresh_rows()

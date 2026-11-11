@@ -77,6 +77,7 @@ export type EventData = {
   content?: string | null
   status?: string
   error?: unknown
+  notice?: string | null
   reason?: string
   request?: Approval
   body?: Record<string, unknown> | null
@@ -113,7 +114,7 @@ type Frame = {
   reset: boolean
   state?: State
   status: Status
-  run: { id: string; turn_id: string; session_id: string; prompt: string } | null
+  run: { id: string; turn_id: string; session_id: string; prompt: string; base_count: number } | null
   live: Record<string, LiveText>
   events: AgentEvent[]
 }

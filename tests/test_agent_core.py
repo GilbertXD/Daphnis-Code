@@ -91,7 +91,7 @@ def registry(handler=None):
 
 
 class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
-    async def test_conversation_commits_once_and_context_is_independent(self):
+    async def test_conversation_commits_user_before_request_and_context_is_independent(self):
         requests = []
         state = session()
 
@@ -101,8 +101,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 body["messages"][0], {"role": "system", "content": "Be concise."}
             )
-            # No pending user or assistant messages are committed during a request.
-            self.assertEqual(len(state.messages), 2 * (len(requests) - 1))
+            self.assertEqual(state.messages.snapshot(), body["messages"][1:])
             return httpx.Response(200, json=reply(f"answer-{len(requests)}"))
 
         async with make_client(handler) as client:
@@ -145,7 +144,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             body = json.loads(request.content)
             requests.append(body)
-            self.assertEqual(len(state.messages), 0)
+            self.assertEqual(state.messages.snapshot(), body["messages"])
             if len(requests) == 1:
                 return httpx.Response(
                     200, json=reply(None, finish="tool_calls", calls=calls)
@@ -370,7 +369,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([event.data["value"] for event in custom], [1])
 
-    async def test_invalid_response_does_not_commit_or_start_tools(self):
+    async def test_invalid_response_only_commits_user_and_does_not_start_tools(self):
         valid = reply()["choices"][0]
         cases = (
             ({"choices": [valid, {**valid, "index": 1}]}, "exactly one"),
@@ -413,7 +412,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                     ).run(session=state, prompt="new question")
                 self.assertEqual(result.status, TurnStatus.FAILED)
                 self.assertIn(error, result.error)
-                self.assertEqual(state.messages.snapshot(), original)
+                self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "new question"}])
                 self.assertEqual(tool_events, [])
 
     async def test_stop_requires_visible_text_or_refusal(self):
@@ -437,7 +436,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.status, expected, result.error)
                 if expected == TurnStatus.FAILED:
                     self.assertIn("no visible text or refusal", result.error)
-                    self.assertEqual(len(state.messages), 0)
+                    self.assertEqual(len(state.messages), 1)
                 else:
                     self.assertEqual(result.message, state.messages.snapshot()[-1])
 
@@ -449,7 +448,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(result.message["refusal"], "Cannot comply.")
 
-    async def test_failure_limits_and_unsafe_tools_do_not_commit(self):
+    async def test_failure_limits_and_unsafe_tools_keep_complete_boundaries(self):
         cases = (
             ("length", {}, registry(), reply("partial", finish="length")),
             ("content_filter", {}, registry(), reply(None, finish="content_filter")),
@@ -486,9 +485,17 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                     result = await make_agent(client, tools=tools, **options).run(
                         session=state, prompt="new question"
                     )
-                self.assertEqual(result.status, TurnStatus.FAILED)
-                self.assertIsNotNone(result.error)
-                self.assertEqual(state.messages.snapshot(), original)
+                if name == "request_limit":
+                    self.assertEqual(result.status, TurnStatus.PAUSED_LIMIT)
+                    self.assertEqual(result.model_requests, 1)
+                    self.assertIsNone(result.error)
+                    self.assertIsNone(result.message)
+                    self.assertIn("继续", result.notice)
+                else:
+                    self.assertEqual(result.status, TurnStatus.FAILED)
+                    self.assertIsNotNone(result.error)
+                self.assertEqual(state.messages.snapshot()[:3], [*original, {"role": "user", "content": "new question"}])
+                self.assertEqual(len(state.messages), 5 if name == "request_limit" else 3)
 
         async def unsafe(text):
             raise FatalToolError("environment unavailable")
@@ -505,7 +512,22 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("environment unavailable", result.error)
         self.assertTrue(result.external_side_effects_possible)
-        self.assertEqual(len(state.messages), 0)
+        self.assertEqual(len(state.messages), 1)
+
+    async def test_limit_closing_rejects_unsolicited_tool_calls(self):
+        requests = []
+        state = session()
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json=reply(None, finish="tool_calls", calls=[tool_call()]))
+
+        async with make_client(handler) as client:
+            result = await make_agent(client, tools=registry(), max_requests=2).run(session=state, prompt="use tools")
+        self.assertEqual((result.status, result.model_requests, result.tool_calls), (TurnStatus.PAUSED_LIMIT, 2, 1))
+        self.assertIn("tools", requests[0])
+        self.assertNotIn("tools", requests[1])
+        self.assertEqual([message["role"] for message in state.messages.snapshot()], ["user", "assistant", "tool"])
 
     async def test_cancel_stream_closes_resources_and_preserves_history(self):
         received = asyncio.Event()
@@ -550,7 +572,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertTrue(stream.closed)
-        self.assertEqual(len(state.messages), 0)
+        self.assertEqual(len(state.messages), 1)
         self.assertEqual(finished[-1].data["status"], "CANCELLED")
 
     async def test_cancel_tool_reports_possible_side_effects_and_releases_session(self):
@@ -558,15 +580,17 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         never = asyncio.Event()
 
         async def handler_tool(text):
-            entered.set()
-            await never.wait()
+            if text == "second":
+                entered.set()
+                await never.wait()
+            return text
 
         requests = []
 
         def handler(request):
             requests.append(request)
             response = (
-                reply(None, finish="tool_calls", calls=[tool_call()])
+                reply(None, finish="tool_calls", calls=[tool_call(), tool_call("call-2", arguments='{"text":"second"}')])
                 if len(requests) == 1
                 else reply()
             )
@@ -585,7 +609,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
-            self.assertEqual(len(state.messages), 0)
+            self.assertEqual(state.messages.snapshot(), [{"role": "user", "content": "tool"}])
             self.assertEqual(finished[-1].data["status"], "CANCELLED")
             self.assertTrue(finished[-1].data["external_side_effects_possible"])
             self.assertEqual(tool_finished[-1].data["status"], "CANCELLED")
@@ -630,7 +654,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(two.status, TurnStatus.COMPLETED, two.error)
                 self.assertEqual(two.message["content"], "model-b")
                 self.assertFalse(one.done())
-                self.assertEqual(len(first_session.messages), 0)
+                self.assertEqual(len(first_session.messages), 1)
             finally:
                 release.set()
                 result = await asyncio.wait_for(one, 2)
@@ -665,11 +689,11 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             result = await make_agent(client, tools=registry(change_model)).run(
                 session=state, prompt="use tool"
             )
-        self.assertEqual(requests, ["model-a", "model-a"])
+        self.assertEqual(requests, ["model-a"])
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("Session changed", result.error)
         self.assertTrue(result.external_side_effects_possible)
-        self.assertEqual(state.messages.snapshot(), original)
+        self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "use tool"}])
 
     async def test_provider_and_tool_capabilities_are_checked_before_request(self):
         states = (

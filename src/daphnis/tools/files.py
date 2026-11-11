@@ -1,4 +1,4 @@
-"""Bounded text reads, directory listing, and exact unified-diff patches."""
+"""Bounded text reads, directory listing, and approved file writes."""
 
 import codecs
 import errno
@@ -391,14 +391,10 @@ def _write(
                 os.rmdir(staging, dir_fd=fd)
 
 
-def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
-    requested = Path(arguments["path"]).expanduser()
-    path = workspace / requested
+def _workspace_file(value: str, workspace: Path) -> tuple[Target, Target, Target]:
+    path = workspace / Path(value).expanduser()
     if path == workspace or ".." in path.parts or not path.is_relative_to(workspace):
-        raise ToolError("permission_denied", "write_file requires a file path inside the workspace without '..'.")
-    content = arguments["content"].encode("utf-8")
-    if len(content) > MAX_FILE_BYTES:
-        raise ToolError("file_too_large", "New file exceeds the 1 MiB limit.")
+        raise ToolError("permission_denied", "A file path inside the workspace without '..' is required.")
 
     workspace_target = Target.capture(workspace, workspace)
     verify_directory(workspace, workspace_target.identity)
@@ -408,17 +404,26 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
             parent = Target(path.parent, path.parent, signature(os.fstat(fd)))
             verify_directory(parent.path, parent.identity)
             try:
-                os.stat(name, dir_fd=fd, follow_symlinks=False)
+                identity = signature(os.stat(name, dir_fd=fd, follow_symlinks=False))
             except FileNotFoundError:
-                pass
-            else:
-                raise ToolError("file_exists", f"Creation will not overwrite: {path}")
+                identity = None
     except FileNotFoundError as exc:
         raise ToolError("file_not_found", "The parent directory must already exist.") from exc
     except OSError as exc:
         if exc.errno in (errno.ENOTDIR, errno.ELOOP):
             raise ToolError("invalid_path", "Parent components must be directories, without symlinks.") from exc
         raise
+    return Target(path, path, identity), parent, workspace_target
+
+
+def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
+    target, parent, workspace_target = _workspace_file(arguments["path"], workspace)
+    path = target.path
+    if target.identity is not None:
+        raise ToolError("file_exists", f"Creation will not overwrite: {path}")
+    content = arguments["content"].encode("utf-8")
+    if len(content) > MAX_FILE_BYTES:
+        raise ToolError("file_too_large", "New file exceeds the 1 MiB limit.")
 
     details = {"path": str(path), "bytes_written": len(content)}
 
@@ -443,6 +448,53 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
         "Create a new UTF-8 file. Filesystem writes require confirmation.",
         (target,),
         {"path": str(path), "size_bytes": len(content), "content": arguments["content"]},
+        run,
+        force_approval=True,
+        allow_session_trust=False,
+    )
+
+
+def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
+    target, parent, workspace_target = _workspace_file(arguments["path"], workspace)
+    require_readable_path(target)
+    if target.identity is None:
+        raise ToolError("file_not_found", f"Target does not exist: {target.path}")
+    if not stat.S_ISREG(target.identity[2]):
+        raise ToolError("invalid_file", "replace_text requires a regular file, without symlinks.")
+    old, new = arguments["old_text"], arguments["new_text"]
+
+    async def run():
+        original, truncated = read_bytes(target, MAX_FILE_BYTES)
+        if truncated:
+            raise ToolError("file_too_large", "Original file exceeds the 1 MiB limit.")
+        text = decode_text(original, False)
+        start = text.find(old)
+        if start < 0:
+            raise ToolError("text_not_found", "old_text was not found. Read the file and use exact text.")
+        if text.find(old, start + 1) >= 0:
+            raise ToolError("ambiguous_match", "old_text matches more than once. Include surrounding text to make it unique.")
+        updated = (text[:start] + new + text[start + len(old):]).encode("utf-8")
+        if len(updated) > MAX_FILE_BYTES:
+            raise ToolError("file_too_large", "Updated file exceeds the 1 MiB limit.")
+        applied: list[str] = []
+        try:
+            _write(target, "modify", original, updated, workspace=workspace_target,
+                   parent=parent, created=None, applied=applied)
+        except (OSError, ToolError) as exc:
+            if not applied:
+                raise
+            return failure(
+                exc.code if isinstance(exc, ToolError) else "io_error",
+                str(exc), partial=True, path=str(target.path),
+                **(exc.details if isinstance(exc, ToolError) else {}),
+            )
+        return {"ok": True, "path": str(target.path), "bytes_written": len(updated)}
+
+    return Operation(
+        Decision.ASK,
+        "Replace one exact text match. Filesystem writes require confirmation.",
+        (target,),
+        {"path": str(target.path), "old_text": old, "new_text": new},
         run,
         force_approval=True,
         allow_session_trust=False,

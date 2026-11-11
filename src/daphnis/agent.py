@@ -1,10 +1,10 @@
-"""Single-Agent execution with turn-level message commit."""
+"""Single-Agent execution with message commits at complete exchanges."""
 
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
@@ -23,9 +23,16 @@ from saturnus import (
     get_message,
 )
 
-from .compaction import SUMMARY_POLICY, CompactionCheckpoint, CompactionError, Compactor
+from .compaction import (
+    SUMMARY_POLICY,
+    CompactionCheckpoint,
+    CompactionError,
+    Compactor,
+    safe_boundaries,
+)
 from .context import Context, history_range_hint
 from .events import EventBus
+from .history import finish_io
 from .model_io import (
     ContextOverflowError,
     is_context_overflow,
@@ -48,6 +55,7 @@ _ACTIVE_SESSIONS: set[str] = set()
 
 class TurnStatus(StrEnum):
     COMPLETED = "COMPLETED"
+    PAUSED_LIMIT = "PAUSED_LIMIT"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
@@ -64,6 +72,7 @@ class TurnResult:
     external_side_effects_possible: bool = False
     primary_requests: int = 0
     maintenance_requests: int = 0
+    notice: str | None = None
 
 
 class FatalToolError(RuntimeError):
@@ -427,6 +436,7 @@ class Agent:
         output_limit: int | None = None,
         extra_body: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
+        persist: Callable[[Session], Awaitable[None]] | None = None,
     ) -> TurnResult:
         session_id = session.id
         if session_id in _ACTIVE_SESSIONS:
@@ -436,6 +446,7 @@ class Agent:
         fields = {"session_id": session_id, "turn_id": turn_id}
         status = TurnStatus.FAILED
         error: str | None = None
+        notice: str | None = None
         final_message: dict[str, Any] | None = None
         requests = primary_requests = maintenance_requests = calls_executed = 0
         side_effects = False
@@ -475,12 +486,48 @@ class Agent:
                 model.context_window, counter=model.token_counter, recent_tokens=self.recent_tokens,
             )
 
-            def primary_available() -> bool:
-                return primary_requests < self.max_primary_requests and requests < self.max_total_requests
+            def check_session() -> None:
+                if (
+                    (session.id, session.workspace, session.provider, session.model_id) != identity
+                    or session.messages.snapshot() != committed
+                    or session.compaction != committed_checkpoint
+                ):
+                    raise RuntimeError("Session changed while its Turn was running.")
+
+            async def commit() -> None:
+                check_session()
+                snapshot = working.snapshot()
+                if len(snapshot) not in safe_boundaries(snapshot):
+                    raise ValueError("Cannot commit an incomplete tool exchange.")
+                candidate = replace(session, messages=Messages(snapshot), compaction=checkpoint)
+
+                async def save_and_publish() -> None:
+                    nonlocal committed, committed_checkpoint
+                    if persist is not None:
+                        await persist(candidate)
+                    session.messages = candidate.messages
+                    session.compaction = candidate.compaction
+                    session.usage = candidate.usage
+                    session._saved_revision = candidate._saved_revision
+                    committed = snapshot
+                    if committed_checkpoint != checkpoint:
+                        committed_checkpoint = checkpoint
+                        await self.events.emit("compaction.committed", **fields, through=checkpoint.through)
+
+                if persist is None:
+                    await save_and_publish()
+                else:
+                    await finish_io(save_and_publish())
+
+            def primary_remaining() -> int:
+                return min(self.max_primary_requests - primary_requests, self.max_total_requests - requests)
+
+            maintenance_limited = False
 
             async def summarize(messages: list[dict[str, Any]], limit: int) -> str:
-                nonlocal requests, maintenance_requests
+                nonlocal requests, maintenance_requests, maintenance_limited
                 if maintenance_requests >= self.max_maintenance_requests or requests + 1 >= self.max_total_requests:
+                    maintenance_limited = True
                     raise CompactionError(
                         "No maintenance requests available for compaction.", reason="maintenance_limit",
                     )
@@ -492,11 +539,14 @@ class Agent:
 
             async def send_request(
                 messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
+                *, closing: bool = False,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
                 nonlocal requests, primary_requests
                 primary_requests += 1
                 requests += 1
                 request_fields = {**fields, "request_number": requests}
+                if closing:
+                    request_fields["purpose"] = "limit_close"
                 await self.events.emit(
                     "model.started", **request_fields, provider=provider, model_id=model_id,
                 )
@@ -515,16 +565,19 @@ class Agent:
                     raise
                 return response, request_fields
 
-            while primary_available():
+            await _checkpoint()
+            await commit()
+            body = prepare_request_options(
+                model=model,
+                thinking_mode=thinking_mode,
+                tools=definitions or None,
+                output_limit=output_limit,
+                extra_body=extra_body,
+                custom_compatibility=self._custom_compatibility,
+            )
+            while primary_remaining() and not (calls_executed and primary_remaining() == 1):
                 await _checkpoint()
-                body = prepare_request_options(
-                    model=model,
-                    thinking_mode=thinking_mode,
-                    tools=definitions or None,
-                    output_limit=output_limit,
-                    extra_body=extra_body,
-                    custom_compatibility=self._custom_compatibility,
-                )
+                maintenance_limited = False
                 messages = self._model_context(working, checkpoint, history_lookup=history_lookup)
                 budget = self._request_budget(messages, body, compactor)
                 if budget.needs_compaction:
@@ -534,7 +587,11 @@ class Agent:
                         history_lookup=history_lookup,
                     )
                     budget = self._request_budget(messages, body, compactor)
+                    if calls_executed and primary_remaining() == 1:
+                        break
                 if not budget.fits:
+                    if maintenance_limited:
+                        break
                     raise CompactionError("The request cannot fit the configured context window.")
                 while True:
                     try:
@@ -547,7 +604,7 @@ class Agent:
                             reason = "retry_exhausted"
                         elif not exc.retryable:
                             reason = "stream_started"
-                        elif not primary_available():
+                        elif not primary_remaining() or (calls_executed and primary_remaining() == 1):
                             reason = "request_limit"
                         if reason is None:
                             before = budget.input_tokens
@@ -562,14 +619,21 @@ class Agent:
                                 reason = "window_limit"
                             elif budget.input_tokens >= before:
                                 reason = "no_reduction"
+                            elif calls_executed and primary_remaining() == 1:
+                                reason = "request_limit"
                         await self.events.emit(
                             "context.overflow", **failure_fields,
                             retrying=reason is None, reason=reason,
                         )
                         if reason is not None:
+                            if reason == "request_limit" or (maintenance_limited and reason in ("window_limit", "no_reduction")):
+                                response = None
+                                break
                             raise
                         retried_overflow = True
                         messages = reduced
+                if response is None:
+                    break
                 await _checkpoint()
                 message, reason = self._parse_response(response)
                 await self.events.emit(
@@ -583,24 +647,8 @@ class Agent:
                 working.add(message)
                 if reason == "stop":
                     await _checkpoint()
-                    current_identity = (
-                        session.id,
-                        session.workspace,
-                        session.provider,
-                        session.model_id,
-                    )
-                    if (
-                        current_identity != identity
-                        or session.messages.snapshot() != committed
-                        or session.compaction != committed_checkpoint
-                    ):
-                        raise RuntimeError(
-                            "Session changed while its Turn was running."
-                        )
+                    await commit()
                     final_message = deepcopy(message)
-                    # No suspension between commit and terminal notification.
-                    session.messages = working
-                    session.compaction = checkpoint
                     status = TurnStatus.COMPLETED
                     break
                 if tools is None or not definitions:
@@ -610,6 +658,7 @@ class Agent:
                 calls = message["tool_calls"]
                 if calls_executed + len(calls) > self.max_tool_calls:
                     raise RuntimeError("Maximum tool-call count exceeded.")
+                check_session()
                 for call in calls:
                     await _checkpoint()
                     calls_executed += 1
@@ -675,8 +724,49 @@ class Agent:
                             content=content,
                             error=tool_error,
                         )
-            else:
-                raise RuntimeError("Maximum model-request count exceeded.")
+                await commit()
+            if status is not TurnStatus.COMPLETED:
+                await _checkpoint()
+                if primary_remaining():
+                    closing_body = {
+                        key: value for key, value in body.items()
+                        if key not in {"tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"}
+                    }
+                    messages = self._model_context(working, checkpoint)
+                    if self._request_budget(messages, closing_body, compactor).needs_compaction:
+                        checkpoint, messages = await self._compact_request(
+                            working=working, checkpoint=checkpoint, messages=messages,
+                            body=closing_body, compactor=compactor, summarize=summarize, fields=fields,
+                        )
+                    instruction = (
+                        "本轮将因请求预算暂停。请仅根据可见记录和实际工具结果简要说明已验证的进度、"
+                        "未完成或未知的事项，以及继续所需的下一步。不要请求工具或声称未经验证的工作已完成。"
+                    )
+                    if messages and messages[0]["role"] == "system" and isinstance(messages[0].get("content"), str):
+                        messages[0]["content"] += "\n\n" + instruction
+                    else:
+                        messages.insert(0, {"role": "system", "content": instruction})
+                    budget = self._request_budget(messages, closing_body, compactor)
+                    if budget.fits:
+                        try:
+                            response, request_fields = await send_request(messages, closing_body, budget, closing=True)
+                        except ContextOverflowError:
+                            await self.events.emit(
+                                "context.overflow", **fields, request_number=requests,
+                                retrying=False, reason="limit_close",
+                            )
+                        else:
+                            await _checkpoint()
+                            message, reason = self._parse_response(response, require_visible=False)
+                            await self.events.emit(
+                                "model.finished", **request_fields, finish_reason=reason, response=response,
+                            )
+                            if reason == "stop" and assistant_text(message):
+                                working.add(message)
+                                await commit()
+                                final_message = deepcopy(message)
+                status = TurnStatus.PAUSED_LIMIT
+                notice = "本轮因请求预算暂停。已保存进度，发送「继续」可接着处理。"
         except asyncio.CancelledError:
             status = TurnStatus.CANCELLED
             error = "Turn cancelled; executed tool side effects are not rolled back."
@@ -687,8 +777,7 @@ class Agent:
             try:
                 if checkpoint != committed_checkpoint:
                     await self.events.emit(
-                        "compaction.committed" if status is TurnStatus.COMPLETED
-                        else "compaction.discarded",
+                        "compaction.discarded",
                         **fields, through=checkpoint.through,
                     )
                 await self.events.emit(
@@ -696,6 +785,7 @@ class Agent:
                     **fields,
                     status=status.value,
                     error=error,
+                    notice=notice,
                     model_requests=requests,
                     primary_requests=primary_requests,
                     maintenance_requests=maintenance_requests,
@@ -715,4 +805,5 @@ class Agent:
             maintenance_requests=maintenance_requests,
             tool_calls=calls_executed,
             external_side_effects_possible=side_effects,
+            notice=notice,
         )

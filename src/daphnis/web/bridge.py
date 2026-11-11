@@ -116,12 +116,12 @@ class Bridge:
         else:
             if event.name == "turn.started" and self.run and self.run["session_id"] == event.session_id:
                 self.run["turn_id"] = event.turn_id
-                data = {**data, "base_count": len(self.ops.message_snapshot())}
+                data = {**data, "base_count": self.run["base_count"]}
             if event.name == "model.finished":
                 item = self.live.get(data["request_number"])
                 if item is not None:
                     data = {**data, "chunks": item["count"]}
-            if event.name == "turn.finished" and data["status"] == "COMPLETED":
+            if event.name == "turn.finished":
                 data = {**data, "committed_count": len(self.ops.message_snapshot())}
             self._record(event.name, event.session_id, event.turn_id, data)
         self._notify(state=event.name in {"mcp.error", "mcp.tools_changed"})
@@ -191,7 +191,8 @@ class Bridge:
 
     def start(self, prompt):
         session_id = self.ops.session.id
-        self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt}
+        self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
+                    "base_count": len(self.ops.message_snapshot())}
         self.live.clear()
         self.task = asyncio.create_task(self._send(prompt, session_id))
         self._notify()
@@ -203,6 +204,7 @@ class Bridge:
             result = {
                 "status": turn.status,
                 "error": turn.error,
+                "notice": turn.notice,
                 "external_side_effects_possible": turn.external_side_effects_possible,
             }
         except asyncio.CancelledError:

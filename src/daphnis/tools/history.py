@@ -17,7 +17,7 @@ MAX_PAGE_CHARS = 4096
 MAX_SEARCH_HITS = 20
 _SEARCH_EXCERPT = 240
 _PRIVATE_THOUGHT = re.compile(r"<think\b[^>]*>.*?(?:</think\s*>|\Z)", re.IGNORECASE | re.DOTALL)
-_VISIBLE_TOOL_RESULTS = {"read_file", "list_directory", "search", "write_file", "apply_patch", "run_command"}
+_VISIBLE_TOOL_RESULTS = {"read_file", "list_directory", "search", "write_file", "replace_text", "apply_patch", "run_command"}
 _SAFE_CALL_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 

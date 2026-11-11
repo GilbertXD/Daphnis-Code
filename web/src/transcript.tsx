@@ -86,7 +86,7 @@ export function collectTools(events: AgentEvent[]) {
 }
 
 const states: Record<string, string> = {
-  COMPLETED: '完成', ERROR: '出错', FAILED: '失败', CANCELLED: '已停止',
+  COMPLETED: '完成', ERROR: '出错', FAILED: '失败', CANCELLED: '已停止', PAUSED_LIMIT: '预算暂停',
 }
 
 export function ToolRow({ tool, locate, inspect }: {
@@ -194,6 +194,7 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
     ]
   })
   const { run, live, events } = view
+  const committed = run ? view.state.messages.slice(0, run.base_count) : view.state.messages
   const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id) : []
   const finished = run?.turn_id
     ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
@@ -213,7 +214,7 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
         <h2>今天要处理什么？</h2>
         <p>描述任务，或让 Agent 检查当前工作区。</p>
       </div>}
-      <Committed messages={view.state.messages} tools={tools} turns={turns} />
+      <Committed messages={committed} tools={tools} turns={turns} />
       {run && <>
         <UserMessage text={run.prompt} />
         {requests.map((number) => {
@@ -229,6 +230,7 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
       </>}
       {!run && outcome && outcome.data.status !== 'COMPLETED' && <div className="outcome" role="status">
         <strong>{states[outcome.data.status ?? ''] ?? '未完成'}</strong>
+        {outcome.data.notice && <p>{outcome.data.notice}</p>}
         {typeof outcome.data.error === 'string' && <p>{outcome.data.error}</p>}
       </div>}
     </div>

@@ -177,6 +177,70 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 await a.close()
                 await b.close()
 
+    async def test_turn_persists_complete_tool_groups_and_stops_on_save_failure(self):
+        async def check(scenario):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                history = History(root / "sessions")
+                (root / "example.txt").write_text("saved result")
+                requests = []
+
+                def handler(request):
+                    saved = history.load(session_id).messages.snapshot()
+                    requests.append(saved)
+                    if len(requests) == 2 or scenario == "first_request":
+                        return httpx.Response(500, json={"error": "test failure"})
+                    calls = [{
+                        "id": f"call-{index}", "type": "function",
+                        "function": {"name": "read_file", "arguments": json.dumps({"path": path})},
+                    } for index, path in enumerate(("example.txt", "missing.txt"))]
+                    return response({"role": "assistant", "tool_calls": calls}, finish="tool_calls")
+
+                options = {
+                    "workspace": root, "provider": "deepseek", "model_id": "a", "catalog": CATALOG,
+                    "connections": {"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+                    "history": history,
+                }
+                ops = Operations(Application(**options))
+                session_id = ops.session.id
+                replace_file = history._replace
+
+                def save(path, data):
+                    if scenario == "save_failure" and json.loads(data)["messages"][-1]["role"] == "tool":
+                        raise OSError("stage write failed")
+                    replace_file(path, data)
+
+                try:
+                    with patch.object(history, "_replace", side_effect=save):
+                        result = await ops.send("check files", stream=False)
+                    self.assertEqual(result.status, TurnStatus.FAILED)
+                    user = [{"role": "user", "content": "check files"}]
+                    self.assertEqual(requests[0], user)
+                    snapshot = ops.message_snapshot()
+                    if scenario == "after_tools":
+                        self.assertEqual(requests[1], snapshot)
+                        self.assertEqual([message["role"] for message in snapshot], ["user", "assistant", "tool", "tool"])
+                        self.assertEqual(json.loads(snapshot[2]["content"])["content"], "saved result")
+                        self.assertFalse(json.loads(snapshot[3]["content"])["ok"])
+                    else:
+                        self.assertEqual(len(requests), 1)
+                        self.assertEqual(snapshot, user)
+                    if scenario == "save_failure":
+                        self.assertIn("stage write failed", result.error)
+                        self.assertTrue(result.external_side_effects_possible)
+                finally:
+                    await ops.close()
+                restored = Operations(Application(**options))
+                try:
+                    restored.restore_session(session_id)
+                    self.assertEqual(restored.message_snapshot(), snapshot)
+                finally:
+                    await restored.close()
+
+        for scenario in ("first_request", "after_tools", "save_failure"):
+            with self.subTest(scenario=scenario):
+                await check(scenario)
+
     async def test_cancel_during_background_save_keeps_session_busy(self):
         with tempfile.TemporaryDirectory() as temporary:
             history = History(Path(temporary) / "sessions")
@@ -216,7 +280,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     release.set()
                     with self.assertRaises(asyncio.CancelledError):
                         await send
-                    self.assertEqual(len(other.load(ops.session.id).messages), 2)
+                    self.assertEqual(other.load(ops.session.id).messages.snapshot(),
+                                     [{"role": "user", "content": "save"}])
+                    self.assertEqual(len(ops.message_snapshot()), 1)
                 finally:
                     release.set()
                     await asyncio.gather(send, return_exceptions=True)
@@ -312,7 +378,7 @@ asyncio.run(main())
                 self.assertIsNone(ops.pending_approval)
                 self.assertFalse(ops.resolve_approval(request.request_id, "allow_once"))
                 saved = history.load(seed.id)
-                self.assertEqual(len(saved.messages), 0)
+                self.assertEqual(len(saved.messages), 1)
                 self.assertEqual(saved.usage.total_tokens, 5)
                 peer.restore_session(seed.id)
                 self.assertEqual((await peer.send("retry", stream=False)).status, TurnStatus.COMPLETED)
@@ -693,8 +759,8 @@ asyncio.run(main())
                         self.assertFalse(ops.running)
                         self.assertIsNone(ops.pending_approval)
                         self.assertFalse(ops.resolve_approval(pending.request_id, "allow_once"))
-                        self.assertEqual(len(ops.message_snapshot()), 0)
-                        self.assertEqual(ops.list_sessions(), ())
+                        self.assertEqual(ops.message_snapshot(), [{"role": "user", "content": "edit"}])
+                        self.assertEqual(len(ops.list_sessions()), 1)
                         self.assertEqual(len(finished), 1)
                         self.assertEqual(
                             finished[0].data["status"], TurnStatus.CANCELLED
@@ -849,7 +915,8 @@ class CLITests(unittest.TestCase):
                     ),
                     "",
                 )
-                self.assertEqual(len(history.load(saved.id).messages), 4)
+                self.assertEqual(history.load(saved.id).messages.get(-1),
+                                 {"role": "user", "content": "empty answer"})
                 self.assertEqual(
                     run("--session", saved.id, "-p", "terminal payload"),
                     "中文**OK**\n\tfin\n",

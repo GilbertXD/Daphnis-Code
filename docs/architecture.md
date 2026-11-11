@@ -31,9 +31,9 @@
 ## 一轮任务的生命周期
 
 1. Application 检查运行状态，选定本轮模型、思考档位、审批模式和在线工具，然后取得会话租约。
-2. Agent 将已提交消息复制到本轮工作消息，加入用户输入。每次请求使用 Context 构造的有效上下文，后续请求继续携带完整的工具调用与结果配对。常见工具失败作为工具结果交给模型，严重错误终止本轮。
-3. 模型正常结束并给出可见文本或拒绝内容时，Agent 一起提交本轮原始消息和暂存检查点。提交前失败或取消时，已提交状态保留原状。已执行命令、写入文件或 MCP 调用可能留下外部副作用。
-4. Application 保存成功轮的消息，失败或取消轮的已报告用量也可独立保存。磁盘保存失败时，`SessionSaveError` 携带原始 `TurnResult`，已提交的内存消息和检查点仍可读取。
+2. Agent 创建工作消息副本，分别在加入用户输入后、每组工具调用均有结果后、取得最终回复后提交快照。常见工具失败也作为工具结果保存。
+3. Application 在现有会话租约内将快照与检查点一起落盘。保存成功后，Agent 发布内存状态。取消、执行失败或保存失败时保留最近一次成功提交的完整记录。最近一次提交之后执行的工具仍可能产生外部副作用。
+4. 请求预算到达收尾边界时，Agent 尽可能使用无工具请求收尾，并返回 `PAUSED_LIMIT` 与继续提示。再次 `send()` 使用该会话已保存的历史和新一轮预算。失败或取消时，晚于最近一次消息保存的用量也可独立保存。
 
 ### 上下文与压缩
 
@@ -53,12 +53,12 @@
 
 | 事件 | 数据与时机 |
 | --- | --- |
-| `turn.started`、`turn.finished` | Agent 开始和结束本轮。结束事件包含状态、错误、请求及工具调用计数、可能的外部副作用，在 Application 落盘之前发出。 |
+| `turn.started`、`turn.finished` | Agent 开始和结束本轮。结束事件包含状态、暂停提示或错误、请求及工具调用计数和可能的外部副作用。消息提交在结束事件前完成。 |
 | `model.started`、`model.delta`、`model.usage`、`model.finished` | 以从 1 开始的 `request_number` 标识本轮内的请求，分别提供请求身份、流式分片、API 用量及解析后的模型响应。 |
 | `model.request`、`model.response_error` | 启用 `observe_model_io` 时，根据可用的 HTTP 响应观测实际请求 JSON、HTTP 状态及错误响应正文。Web 启动启用此选项。 |
 | `context.budget`、`context.overflow` | 主模型请求的输入估算、窗口、输出预留和阈值，以及明确超限后的恢复决定。 |
 | `compaction.started`、`compaction.finished` | 手动、压力或超限触发的压缩尝试及结果。摘要模型请求以 `purpose=compaction` 标识。 |
-| `compaction.committed`、`compaction.discarded` | 自动检查点随 Turn 在内存中提交或丢弃。 |
+| `compaction.committed`、`compaction.discarded` | 自动检查点随完整的消息快照提交，或在尚未提交时随本轮结束丢弃。 |
 | `tool.started`、`tool.approval_requested`、`tool.blocked`、`tool.finished` | 携带请求序号、工具调用 ID 和工具名。审批事件额外提供独立的 `request_id`，工具结束事件包含状态、内容和错误。 |
 | `mcp.error`、`mcp.tools_changed` | 通知连接异常或工具目录刷新，`turn_id` 为空字符串。 |
 

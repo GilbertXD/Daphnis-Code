@@ -89,4 +89,4 @@ class TokenBudgetTests(unittest.IsolatedAsyncioTestCase):
             result = await agent.run(session=state, prompt="中文" * 50, output_limit=30)
         self.assertIn("cannot fit", result.error)
         self.assertEqual(result.model_requests, 0)
-        self.assertEqual(state.messages.snapshot(), [])
+        self.assertEqual(state.messages.snapshot(), [{"role": "user", "content": "中文" * 50}])

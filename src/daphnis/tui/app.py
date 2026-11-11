@@ -356,9 +356,9 @@ class DaphnisApp(App[None]):
     async def _send(self, text: str) -> None:
         try:
             result = await self.ops.send(text, stream=True)
-            if result.error and not self._shutting_down:
+            if (message := result.notice or result.error) and not self._shutting_down:
                 await self.query_one(ChatView).add(
-                    "运行结果", safe_error(result.error), classes="notice"
+                    "运行结果", safe_error(message), classes="notice"
                 )
         except SessionSaveError as exc:
             if not self._shutting_down:
@@ -374,7 +374,7 @@ class DaphnisApp(App[None]):
                     chat.pending_user = None
                 await chat.add(
                     "运行结果",
-                    "已取消，本轮未提交。"
+                    "本轮已取消。已保存的消息仍可查看。"
                     if isinstance(exc, asyncio.CancelledError)
                     else safe_error(exc),
                     classes="notice",

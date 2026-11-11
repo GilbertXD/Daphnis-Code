@@ -9,7 +9,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
-from saturnus import Messages, ToolRegistry, ToolResult
+from saturnus import ToolRegistry, ToolResult
 
 from ..events import EventBus
 from ..mcp import MCPConnection
@@ -32,6 +32,7 @@ from .files import (
     prepare_list,
     prepare_patch,
     prepare_read,
+    prepare_replace,
     prepare_write,
 )
 from .history import MAX_SEARCH_HITS, prepare_history
@@ -45,7 +46,7 @@ class _Binding:
     session_id: str
     turn_id: str
     events: EventBus
-    messages: Messages
+    session: Session
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ _PREPARERS = {
     "list_directory": prepare_list,
     "search": prepare_search,
     "write_file": prepare_write,
+    "replace_text": prepare_replace,
     "apply_patch": prepare_patch,
     "run_command": prepare_command,
 }
@@ -165,7 +167,7 @@ class ToolExecutor:
         return ToolExecutor(
             self._registry,
             approval=self._approval,
-            binding=_Binding(workspace, session.id, turn_id, events, session.messages),
+            binding=_Binding(workspace, session.id, turn_id, events, session),
             mcp_tools=self._mcp_tools,
             mode=self._mode,
             trusted=self._trusted,
@@ -222,7 +224,7 @@ class ToolExecutor:
                     run=run,
                 )
             elif name in _HISTORY_TOOLS:
-                operation = prepare_history(name, arguments, binding.messages, self._redactor)
+                operation = prepare_history(name, arguments, binding.session.messages, self._redactor)
             else:
                 operation = _PREPARERS[name](arguments, binding.workspace.path)
             forced = operation.force_approval or any(
@@ -398,13 +400,27 @@ def create_tools(
             {"path": text_path, "content": {"type": "string", "maxLength": MAX_FILE_BYTES}},
             ["path", "content"],
         ),
+        "replace_text": (
+            (
+                "Prefer for a small, exact edit to an existing UTF-8 file inside the workspace. "
+                "old_text must occur exactly once; include context to make it unique. "
+                "new_text may be empty. Requires approval."
+            ),
+            {
+                "path": text_path,
+                "old_text": {"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES},
+                "new_text": {"type": "string", "maxLength": MAX_FILE_BYTES},
+            },
+            ["path", "old_text", "new_text"],
+        ),
         "apply_patch": (
             (
-                "Use for targeted edits to existing files. Prefer write_file for new files. "
+                "Use for multiple or complex edits. Prefer write_file for new files and replace_text for small exact edits. "
                 "Apply plain unified diff: ---/+++ headers (a/ and b/ optional), "
                 "numbered @@ hunks, /dev/null for create/delete. Exact original text "
                 "required; no rename or Git metadata headers. Requires approval "
-                "and reports partial filesystem effects."
+                "and reports partial filesystem effects. One-line replacement example:\n"
+                "--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old line\n+new line\n"
             ),
             {"patch": {"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES}},
             ["patch"],

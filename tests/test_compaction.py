@@ -18,7 +18,7 @@ from test_agent_core import (
 )
 
 from daphnis import Agent, Context, History, Operations, Session, TurnStatus
-from daphnis.app import Application, SessionSaveError
+from daphnis.app import Application
 from daphnis.compaction import (
     CompactionCheckpoint,
     CompactionError,
@@ -263,8 +263,10 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             outcome = await agent.run(session=state, prompt="continue")
         self.assertEqual((outcome.primary_requests, outcome.maintenance_requests, outcome.model_requests), (0, 1, 1))
         self.assertEqual(len(seen), 1)
-        self.assertIn("cannot fit", outcome.error)
-        self.assertEqual(state.messages.snapshot(), original)
+        self.assertEqual(outcome.status, TurnStatus.PAUSED_LIMIT)
+        self.assertIsNone(outcome.error)
+        self.assertIn("继续", outcome.notice)
+        self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "continue"}])
         self.assertIsNone(state.compaction)
 
     async def test_long_tool_loop_trims_then_summarizes_and_commits_raw_history(self):
@@ -347,7 +349,7 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
                             await task
                     else:
                         self.assertEqual((await task).status, TurnStatus.FAILED)
-                self.assertEqual(state.messages.snapshot(), original)
+                self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "continue"}])
                 self.assertEqual(state.compaction, prior)
                 self.assertEqual(discarded[0].data["through"], 4)
 
@@ -372,16 +374,24 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             app._session.messages.add_assistant("answer")
             history.save(app._session)
             before = history.load(ops.session.id)
-            with (
-                patch.object(history, "_replace", side_effect=OSError("disk unavailable")),
-                self.assertRaises(SessionSaveError),
-            ):
-                await ops.send("continue", stream=False)
+            replace_file = history._replace
+
+            def fail_final_save(path, data):
+                if json.loads(data)["messages"][-1]["role"] == "assistant":
+                    raise OSError("disk unavailable")
+                replace_file(path, data)
+
+            with patch.object(history, "_replace", side_effect=fail_final_save):
+                result = await ops.send("continue", stream=False)
+            self.assertEqual(result.status, TurnStatus.FAILED)
+            self.assertIn("disk unavailable", result.error)
             disk = history.load(ops.session.id)
-            self.assertEqual(disk.messages.snapshot(), before.messages.snapshot())
+            self.assertEqual(disk.messages.snapshot(), [
+                *before.messages.snapshot(), {"role": "user", "content": "continue"},
+            ])
             self.assertIsNone(disk.compaction)
-            self.assertEqual(len(ops.message_snapshot()), 4)
-            app._session.compaction.validate(ops.message_snapshot())
+            self.assertEqual(disk.messages.snapshot(), ops.message_snapshot())
+            self.assertIsNone(app._session.compaction)
             self.assertEqual((await ops.send("continue again", stream=False)).status, TurnStatus.COMPLETED)
             restored = history.load(ops.session.id)
             self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
@@ -444,7 +454,7 @@ class OverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event.data["retrying"] for event in events], [True, False])
         self.assertEqual(events[-1].data["reason"], "retry_exhausted")
         self.assertIsNone(state.compaction)
-        self.assertEqual(state.messages.snapshot(), original)
+        self.assertEqual(state.messages.snapshot(), [*original, {"role": "user", "content": "continue"}])
 
     async def test_only_explicit_overflow_retries_and_requires_reduction(self):
         cases = (

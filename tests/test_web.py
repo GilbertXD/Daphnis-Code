@@ -315,6 +315,32 @@ class WebTests(unittest.TestCase):
         self.command("restore", next_frame["session_id"], id=session_id)
         self.assertEqual(self.snapshot()["events"], events)
 
+    def test_budget_pause_and_continue_use_saved_history(self):
+        self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=2)
+        session_id = self.snapshot()["session_id"]
+        self.command("send", session_id, 202, prompt="test patch")
+        waiting = self.wait_for(lambda frame: frame["status"]["approval"])
+        self.assertEqual(waiting["run"]["base_count"], 0)
+        self.assertEqual(waiting["state"]["messages"], [{"role": "user", "content": "test patch"}])
+        self.command("approve", session_id, request_id=waiting["status"]["approval"]["request_id"], decision="allow_once")
+        paused = self.wait_for(lambda frame: not frame["status"]["running"])
+        outcome = paused["events"][-1]["data"]
+        self.assertEqual(outcome["status"], "PAUSED_LIMIT")
+        self.assertIn("继续", outcome["notice"])
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn("tools", self.requests[0])
+        self.assertNotIn("tools", self.requests[1])
+        messages = paused["state"]["messages"]
+        self.assertEqual(messages, self.history.load(session_id).messages.snapshot())
+        self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool", "assistant"])
+
+        self.command("send", session_id, 202, prompt="继续")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(done["events"][-1]["data"]["status"], "COMPLETED")
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.requests[-1]["messages"][1:-1], messages)
+        self.assertIn("tools", self.requests[-1])
+
     def test_stream_redaction_stop_and_provider_error(self):
         session_id = self.snapshot()["session_id"]
         self.command("send", session_id, 202, prompt="pause")
@@ -323,7 +349,7 @@ class WebTests(unittest.TestCase):
         self.command("cancel", session_id, 409, run_id="old")
         self.command("cancel", session_id, run_id=partial["run"]["id"])
         stopped = self.snapshot()
-        self.assertEqual(stopped["state"]["messages"], [])
+        self.assertEqual(stopped["state"]["messages"], [{"role": "user", "content": "pause"}])
         self.assertEqual(stopped["events"][-1]["data"]["status"], "CANCELLED")
 
         self.command("send", session_id, 202, prompt="pause")
@@ -339,4 +365,6 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response["data"]["http_status"], 429)
         self.assertEqual(response["data"]["body"]["error"]["api_key"], "[REDACTED]")
         self.assertNotIn(API_KEY, json.dumps(failed))
-        self.assertEqual(failed["state"]["messages"], done["state"]["messages"])
+        self.assertEqual(failed["state"]["messages"], [
+            *done["state"]["messages"], {"role": "user", "content": "force-error"},
+        ])

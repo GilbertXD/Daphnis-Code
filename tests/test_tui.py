@@ -161,6 +161,28 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("\x9d", details)
                 self.assertEqual(request.details["patch"], "+中文\x9b31m\x7f\n")
 
+    async def test_budget_pause_preserves_results_and_displays_continue_notice(self):
+        def handler(request):
+            body = json.loads(request.content)
+            if body["messages"][-1]["role"] == "user":
+                return sse({"role": "assistant", "tool_calls": [{
+                    "id": "list-1", "type": "function",
+                    "function": {"name": "list_directory", "arguments": "{}"},
+                }]}, "tool_calls")
+            self.assertNotIn("tools", body)
+            return sse({"role": "assistant", "content": "已列出工作区。"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            app = controller(Path(temporary), handler)
+            app._request_limits.update(max_primary_requests=2, max_total_requests=2)
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "检查工作区")
+                await until(pilot, lambda: any("因请求预算暂停" in row.text for row in ui.query(ChatRow)))
+                self.assertEqual(ops.message_snapshot()[-1]["content"], "已列出工作区。")
+                self.assertFalse(ui.query_one(PromptInput).disabled)
+
     async def test_input_stream_clear_new_and_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -296,7 +318,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertIsNone(ops.pending_approval)
-                self.assertEqual(ops.message_snapshot(), committed)
+                self.assertEqual(ops.message_snapshot(), [*committed, {"role": "user", "content": "wait then cancel"}])
                 self.assertFalse(ui.query_one(PromptInput).disabled)
 
     async def test_approval_trust_checkbox_requires_allow(self):
@@ -588,7 +610,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(entered.wait(), 2)
                 await pilot.press("escape")
                 await until(pilot, lambda: not ui._sending)
-                self.assertEqual(len(ops.message_snapshot()), 0)
+                self.assertEqual(ops.message_snapshot(), [{"role": "user", "content": "wait"}])
                 self.assertFalse(app._closed)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
                 await pilot.press("escape")
@@ -600,4 +622,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("ctrl+q")
                 self.assertTrue(app._closed)
                 self.assertFalse(ops.running)
-                self.assertEqual(ops.message_snapshot(), [])
+                self.assertEqual(ops.message_snapshot(), [
+                    {"role": "user", "content": "wait"},
+                    {"role": "user", "content": "wait then quit"},
+                ])

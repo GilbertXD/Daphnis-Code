@@ -300,6 +300,78 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.read_bytes(), b"concurrent file")
             self.assertEqual(list(parent.iterdir()), [target])
 
+    async def test_replace_text_matches_exactly_once_and_preserves_file_on_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            target = workspace / "example.txt"
+            initial = "你好\r\naaa\n".encode()
+            target.write_bytes(initial)
+            tools = bound(workspace, approval=approve)
+            for old, error in (("missing", "text_not_found"), ("aa", "ambiguous_match")):
+                with self.subTest(old=old):
+                    result = await tools.execute(call("replace_text", path=target.name, old_text=old, new_text=""))
+                    self.assertEqual(result.value["error"]["code"], error)
+                    self.assertEqual(target.read_bytes(), initial)
+            oversized = await tools.execute(call("replace_text", path=target.name, old_text="你好",
+                                                  new_text="中" * (MAX_FILE_BYTES // 3 + 1)))
+            self.assertEqual(oversized.value["error"]["code"], "file_too_large")
+            self.assertEqual(target.read_bytes(), initial)
+            result = await tools.execute(call("replace_text", path=target.name, old_text="你好\r\n", new_text=""))
+            self.assertEqual(result.value, {"ok": True, "path": str(target), "bytes_written": 4})
+            self.assertEqual(target.read_bytes(), b"aaa\n")
+
+    async def test_replace_text_enforces_workspace_approval_and_original_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "work"
+            workspace.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("old")
+            target = workspace / "example.txt"
+            target.write_text("old")
+            (workspace / "alias").symlink_to(target)
+            (workspace / "jump").symlink_to(root, target_is_directory=True)
+            protected = workspace / ".env"
+            protected.write_text("old")
+            (workspace / "hardlink").hardlink_to(protected)
+            approval = AsyncMock(return_value=ApprovalDecision.DENY)
+            tools = bound(workspace, approval=approval).select(["replace_text"], mode=ApprovalMode.FULL)
+            for path, error in (
+                ("../outside.txt", "permission_denied"),
+                (str(outside), "permission_denied"),
+                ("alias", "invalid_file"),
+                ("jump/outside.txt", "invalid_path"),
+                (".env", "sensitive_path"),
+            ):
+                with self.subTest(path=path):
+                    result = await tools.execute(call("replace_text", path=path, old_text="old", new_text="new"))
+                    self.assertEqual(result.value["error"]["code"], error)
+            approval.assert_not_awaited()
+            edit = call("replace_text", path=target.name, old_text="old", new_text="new")
+            with patch("daphnis.tools.files.read_bytes") as read:
+                denied = await tools.execute(edit)
+                read.assert_not_called()
+            self.assertEqual(denied.value["error"]["code"], "permission_denied")
+            self.assertFalse(approval.call_args.args[0].can_trust)
+            self.assertEqual(target.read_text(), "old")
+
+            approval.return_value = ApprovalDecision.ALLOW_ONCE
+            linked = await tools.execute(call("replace_text", path="hardlink", old_text="old", new_text="new"))
+            self.assertEqual(linked.value["error"]["code"], "sensitive_path")
+            real_sync = os.fsync
+
+            def concurrent_write(fd):
+                real_sync(fd)
+                target.write_text("changed by another writer")
+
+            with patch("daphnis.tools.files.os.fsync", side_effect=concurrent_write):
+                raced = await tools.execute(edit)
+            self.assertEqual(raced.value["error"]["code"], "target_changed")
+            self.assertEqual(target.read_text(), "changed by another writer")
+            self.assertEqual(outside.read_text(), "old")
+            self.assertEqual(protected.read_text(), "old")
+            self.assertEqual(list(workspace.glob(".daphnis-*.tmp")), [])
+
     async def test_patch_creation_modification_deletion_and_selected_guard(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
@@ -675,12 +747,13 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 if pid_file.exists():
                     os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
-    async def test_agent_write_read_reject_overwrite_and_patch(self):
+    async def test_agent_write_read_replace_and_patch(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
             target = workspace / "result.py"
             content = "def greeting():\r\n    return '你好'\n"
-            updated = content.replace("你好", "再见")
+            replaced = content.replace("你好", "再见")
+            updated = replaced.replace("greeting", "farewell")
             requests, approvals = [], []
             events = EventBus()
             requested_events = []
@@ -692,16 +765,20 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 if len(approvals) == 1:
                     self.assertEqual(request.tool_name, "write_file")
                     self.assertFalse(target.exists())
+                elif len(approvals) == 2:
+                    self.assertEqual(request.tool_name, "replace_text")
+                    self.assertEqual(target.read_bytes(), content.encode())
                 else:
                     self.assertEqual(request.tool_name, "apply_patch")
-                    self.assertEqual(target.read_bytes(), content.encode())
+                    self.assertEqual(target.read_bytes(), replaced.encode())
                 return ApprovalDecision.ALLOW_ONCE
 
             steps = [
                 call("write_file", path=target.name, content=content),
                 call("read_file", path=target.name),
                 call("write_file", path=target.name, content="overwrite"),
-                call("apply_patch", patch=diff(target.name, content, updated)),
+                call("replace_text", path=target.name, old_text="你好", new_text="再见"),
+                call("apply_patch", patch=diff(target.name, replaced, updated)),
             ]
 
             def handler(request):
@@ -710,7 +787,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 index = len(requests) - 1
                 if index == 0:
                     self.assertEqual({tool["function"]["name"] for tool in body["tools"]},
-                                     {"read_file", "write_file", "apply_patch"})
+                                     {"read_file", "write_file", "replace_text", "apply_patch"})
                 else:
                     output = json.loads(body["messages"][-1]["content"])
                     if index == 1:
@@ -749,7 +826,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     workspace=workspace, provider="compatible", model_id="test"
                 )
                 tools = create_tools(approval=approve_change).select(
-                    ["read_file", "write_file", "apply_patch"]
+                    ["read_file", "write_file", "replace_text", "apply_patch"]
                 )
                 result = await Agent(
                     client=client,
@@ -761,11 +838,11 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     tools=tools,
                     events=events,
-                ).run(session=state, prompt="create, read, try to overwrite, then patch")
+                ).run(session=state, prompt="create, read, try to overwrite, then replace and patch")
             self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
-            self.assertEqual(result.tool_calls, 4)
-            self.assertEqual(len(approvals), 2)
-            self.assertEqual(len(requested_events), 2)
+            self.assertEqual(result.tool_calls, 5)
+            self.assertEqual(len(approvals), 3)
+            self.assertEqual(len(requested_events), 3)
             self.assertEqual(target.read_bytes(), updated.encode())
 
 

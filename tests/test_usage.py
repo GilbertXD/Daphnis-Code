@@ -158,7 +158,7 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 off()
                 await ops.close()
 
-    async def test_failed_and_cancelled_usage_is_saved_without_working_messages(self):
+    async def test_failed_and_cancelled_usage_is_saved_with_committed_users(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             entered = asyncio.Event()
@@ -203,9 +203,10 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                     await task
                 self.assertTrue(pending.closed)
                 self.assertEqual(ops.session_usage, UsageTotals(30, 8, 38, 2, 2))
-                self.assertEqual(len(ops.message_snapshot()), 0)
+                self.assertEqual([item["content"] for item in ops.message_snapshot()],
+                                 ["invalid response", "cancel stream"])
                 restored = app._history.load(ops.session.id)
-                self.assertEqual(len(restored.messages), 0)
+                self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
                 self.assertEqual(restored.usage, ops.session_usage)
             finally:
                 await ops.close()
