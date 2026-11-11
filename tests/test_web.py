@@ -168,6 +168,8 @@ class WebTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 4401)
         frame = self.snapshot()
         first = frame["session_id"]
+        self.assertIn("write_file", frame["state"]["all_tools"])
+        self.assertIn("write_file", frame["state"]["enabled_tools"])
         command = {"action": "new", "session_id": first}
         self.assertEqual(self.client.post("/api/command", headers={"Origin": ORIGIN}, json=command).status_code, 401)
         self.assertEqual(self.client.post("/api/command", headers={**self.headers, "Origin": "https://other.test"},

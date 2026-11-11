@@ -27,7 +27,13 @@ from .approval import (
     ToolError,
     failure,
 )
-from .files import MAX_FILE_BYTES, prepare_list, prepare_patch, prepare_read
+from .files import (
+    MAX_FILE_BYTES,
+    prepare_list,
+    prepare_patch,
+    prepare_read,
+    prepare_write,
+)
 from .history import MAX_SEARCH_HITS, prepare_history
 from .search import prepare_search
 from .shell import prepare_command
@@ -54,6 +60,7 @@ _PREPARERS = {
     "read_file": prepare_read,
     "list_directory": prepare_list,
     "search": prepare_search,
+    "write_file": prepare_write,
     "apply_patch": prepare_patch,
     "run_command": prepare_command,
 }
@@ -382,8 +389,18 @@ def create_tools(
             },
             ["query"],
         ),
+        "write_file": (
+            (
+                "Create a new UTF-8 text file inside the workspace. Never overwrites. "
+                "Provide the complete content (up to 1 MiB, empty allowed) and an existing parent directory. "
+                "Use this directly for new files without touch or a unified diff. Requires approval."
+            ),
+            {"path": text_path, "content": {"type": "string", "maxLength": MAX_FILE_BYTES}},
+            ["path", "content"],
+        ),
         "apply_patch": (
             (
+                "Use for targeted edits to existing files. Prefer write_file for new files. "
                 "Apply plain unified diff: ---/+++ headers (a/ and b/ optional), "
                 "numbered @@ hunks, /dev/null for create/delete. Exact original text "
                 "required; no rename or Git metadata headers. Requires approval "

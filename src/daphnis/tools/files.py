@@ -1,6 +1,7 @@
 """Bounded text reads, directory listing, and exact unified-diff patches."""
 
 import codecs
+import errno
 import os
 import re
 import stat
@@ -254,7 +255,7 @@ def parse_patch(patch: str) -> list[FilePatch]:
     return files
 
 
-def _apply_text(original: str, patch: FilePatch) -> str:
+def _apply_text(original: str, patch: FilePatch) -> bytes:
     lines = original.splitlines(keepends=True)
     result = []
     cursor = 0
@@ -284,9 +285,10 @@ def _apply_text(original: str, patch: FilePatch) -> str:
     updated = "".join(result)
     if patch.action == "delete" and updated:
         raise ToolError("patch_mismatch", "A deletion must remove all file content.")
-    if len(updated.encode("utf-8")) > MAX_FILE_BYTES:
+    encoded = updated.encode("utf-8")
+    if len(encoded) > MAX_FILE_BYTES:
         raise ToolError("file_too_large", "Patched file exceeds the 1 MiB limit.")
-    return updated
+    return encoded
 
 
 def _verify_displaced(stage: int, target: Target, original: bytes) -> None:
@@ -308,18 +310,18 @@ def _verify_displaced(stage: int, target: Target, original: bytes) -> None:
 
 
 def _write(
-    target: Target, action: str, original: bytes | None, content: str, *,
-    workspace: Target, parent: Target, created: list[str], applied: list[str],
+    target: Target, action: str, original: bytes | None, content: bytes, *,
+    workspace: Target, parent: Target, created: list[str] | None, applied: list[str],
 ) -> None:
     verify_directory(workspace.path, workspace.identity)
     target.verify()
-    with target.parent(create=action == "create", created=created) as (fd, name):
+    with target.parent(create=action == "create" and created is not None, created=created) as (fd, name):
         def verify_parent() -> None:
             verify_directory(workspace.path, workspace.identity)
             opened = signature(os.fstat(fd))
             verify_directory(parent.path, opened)
             if parent.identity is not None and parent.identity[:3] != opened[:3]:
-                raise ToolError("target_changed", f"Patch parent was replaced: {parent.path}")
+                raise ToolError("target_changed", f"Parent directory was replaced: {parent.path}")
 
         verify_parent()
         staging = f".daphnis-{uuid4().hex}.tmp"
@@ -332,13 +334,13 @@ def _write(
                 output = os.open("updated", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                                  0o666, dir_fd=stage)
                 with os.fdopen(output, "wb") as stream:
-                    stream.write(content.encode("utf-8"))
+                    stream.write(content)
                     stream.flush()
                     if target.identity is not None:
                         os.fchmod(stream.fileno(), stat.S_IMODE(target.identity[2]))
                     os.fsync(stream.fileno())
-            verify_parent()
             target.verify()
+            verify_parent()
             if original is not None:
                 # Hold the displaced inode until validation. A late writer's
                 # version can be restored or recovered even if the name races.
@@ -387,6 +389,64 @@ def _write(
                 os.close(stage)
             if not keep_original:
                 os.rmdir(staging, dir_fd=fd)
+
+
+def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
+    requested = Path(arguments["path"]).expanduser()
+    path = workspace / requested
+    if path == workspace or ".." in path.parts or not path.is_relative_to(workspace):
+        raise ToolError("permission_denied", "write_file requires a file path inside the workspace without '..'.")
+    content = arguments["content"].encode("utf-8")
+    if len(content) > MAX_FILE_BYTES:
+        raise ToolError("file_too_large", "New file exceeds the 1 MiB limit.")
+
+    workspace_target = Target.capture(workspace, workspace)
+    verify_directory(workspace, workspace_target.identity)
+    target = Target(path, path, None)
+    try:
+        with target.parent() as (fd, name):
+            parent = Target(path.parent, path.parent, signature(os.fstat(fd)))
+            verify_directory(parent.path, parent.identity)
+            try:
+                os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ToolError("file_exists", f"Creation will not overwrite: {path}")
+    except FileNotFoundError as exc:
+        raise ToolError("file_not_found", "The parent directory must already exist.") from exc
+    except OSError as exc:
+        if exc.errno in (errno.ENOTDIR, errno.ELOOP):
+            raise ToolError("invalid_path", "Parent components must be directories, without symlinks.") from exc
+        raise
+
+    details = {"path": str(path), "bytes_written": len(content)}
+
+    async def run():
+        applied: list[str] = []
+        try:
+            _write(target, "create", None, content, workspace=workspace_target,
+                   parent=parent, created=None, applied=applied)
+        except FileExistsError as exc:
+            raise ToolError("file_exists", f"Creation will not overwrite: {path}") from exc
+        except (OSError, ToolError) as exc:
+            if not applied:
+                raise
+            return failure(
+                exc.code if isinstance(exc, ToolError) else "io_error",
+                str(exc), partial=True, **details,
+            )
+        return {"ok": True, **details}
+
+    return Operation(
+        Decision.ASK,
+        "Create a new UTF-8 file. Filesystem writes require confirmation.",
+        (target,),
+        {"path": str(path), "size_bytes": len(content), "content": arguments["content"]},
+        run,
+        force_approval=True,
+        allow_session_trust=False,
+    )
 
 
 def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:

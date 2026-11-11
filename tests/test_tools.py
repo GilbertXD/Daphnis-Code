@@ -17,6 +17,7 @@ from daphnis import Agent, EventBus, History, Operations, Session, TurnStatus
 from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools
+from daphnis.tools.files import MAX_FILE_BYTES
 
 
 def call(name, **arguments):
@@ -201,6 +202,103 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             (workspace / "loop-b").symlink_to("loop-a")
             invalid = await tools.execute(call("read_file", path="loop-a"))
             self.assertEqual(invalid.value["error"]["code"], "invalid_path")
+
+    async def test_write_file_schema_approval_and_empty_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            approval = AsyncMock(return_value=ApprovalDecision.DENY)
+            tools = bound(workspace, approval=approval).select(["write_file"], mode=ApprovalMode.FULL)
+            definition = tools.definitions()[0]["function"]
+            self.assertEqual(definition["name"], "write_file")
+            self.assertEqual(definition["parameters"]["required"], ["path", "content"])
+            for arguments in ({"path": "empty.txt"}, {"path": "empty.txt", "content": 1},
+                              {"path": "empty.txt", "content": "", "overwrite": True}):
+                with self.subTest(arguments=arguments), self.assertRaises(ToolCallValidationError):
+                    await tools.execute(call("write_file", **arguments))
+            approval.assert_not_awaited()
+
+            request = call("write_file", path="empty.txt", content="")
+            denied = await tools.execute(request)
+            self.assertEqual(denied.value["error"]["code"], "permission_denied")
+            self.assertFalse(approval.call_args.args[0].can_trust)
+            self.assertEqual(list(workspace.iterdir()), [])
+
+            approval.return_value = ApprovalDecision.ALLOW_ONCE
+            created = await tools.execute(request)
+            target = workspace / "empty.txt"
+            self.assertEqual(created.value, {"ok": True, "path": str(target), "bytes_written": 0})
+            self.assertEqual(target.read_bytes(), b"")
+
+    async def test_write_file_rejects_unsafe_paths_and_oversized_utf8(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (workspace / "jump").symlink_to(outside, target_is_directory=True)
+            (workspace / "dangling").symlink_to(outside / "new.txt")
+            approval = AsyncMock(return_value=ApprovalDecision.ALLOW_ONCE)
+            tools = bound(workspace, approval=approval)
+            for path, code in (
+                ("../outside/new.txt", "permission_denied"),
+                (str(outside / "new.txt"), "permission_denied"),
+                ("jump/new.txt", "invalid_path"),
+                ("dangling", "file_exists"),
+                ("missing/new.txt", "file_not_found"),
+            ):
+                with self.subTest(path=path):
+                    result = await tools.execute(call("write_file", path=path, content="text"))
+                    self.assertEqual(result.value["error"]["code"], code)
+            result = await tools.execute(call(
+                "write_file", path="large.txt", content="中" * (MAX_FILE_BYTES // 3 + 1),
+            ))
+            self.assertEqual(result.value["error"]["code"], "file_too_large")
+            approval.assert_not_awaited()
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual({path.name for path in workspace.iterdir()}, {"jump", "dangling"})
+
+    async def test_write_file_atomic_creation_and_directory_races(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            workspace = root / "workspace"
+            parent = workspace / "sub"
+            parent.mkdir(parents=True)
+            tools = bound(workspace, approval=approve)
+            request = call("write_file", path="sub/new.txt", content="complete file\n")
+            target = parent / "new.txt"
+
+            with patch("daphnis.tools.files.os.fsync", side_effect=OSError("disk failure")):
+                result = await tools.execute(request)
+            self.assertEqual(result.value["error"]["code"], "io_error")
+            self.assertEqual(list(parent.iterdir()), [])
+
+            real_sync = os.fsync
+            moved = root / "moved"
+
+            def move_after_staging(fd):
+                real_sync(fd)
+                parent.rename(moved)
+                parent.symlink_to(moved, target_is_directory=True)
+
+            with patch("daphnis.tools.files.os.fsync", side_effect=move_after_staging):
+                result = await tools.execute(request)
+            self.assertEqual(result.value["error"]["code"], "target_changed")
+            self.assertEqual(list(moved.iterdir()), [])
+            parent.unlink()
+            parent.mkdir()
+
+            real_link = os.link
+
+            def create_before_publish(*args, **kwargs):
+                target.write_bytes(b"concurrent file")
+                return real_link(*args, **kwargs)
+
+            with patch("daphnis.tools.files.os.link", side_effect=create_before_publish):
+                result = await tools.execute(request)
+            self.assertEqual(result.value["error"]["code"], "file_exists")
+            self.assertEqual(target.read_bytes(), b"concurrent file")
+            self.assertEqual(list(parent.iterdir()), [target])
 
     async def test_patch_creation_modification_deletion_and_selected_guard(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -577,10 +675,12 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 if pid_file.exists():
                     os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
-    async def test_agent_read_create_approve_modify_and_finish(self):
+    async def test_agent_write_read_reject_overwrite_and_patch(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
-            (workspace / "input.txt").write_text("source\n")
+            target = workspace / "result.py"
+            content = "def greeting():\r\n    return '你好'\n"
+            updated = content.replace("你好", "再见")
             requests, approvals = [], []
             events = EventBus()
             requested_events = []
@@ -588,31 +688,40 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
 
             async def approve_change(request):
                 approvals.append(request)
-                self.assertEqual(request.tool_name, "apply_patch")
                 self.assertFalse(request.can_trust)
                 if len(approvals) == 1:
-                    self.assertFalse((workspace / "result.txt").exists())
+                    self.assertEqual(request.tool_name, "write_file")
+                    self.assertFalse(target.exists())
                 else:
-                    self.assertEqual((workspace / "result.txt").read_text(), "created\n")
+                    self.assertEqual(request.tool_name, "apply_patch")
+                    self.assertEqual(target.read_bytes(), content.encode())
                 return ApprovalDecision.ALLOW_ONCE
 
             steps = [
-                call("read_file", path="input.txt"),
-                call(
-                    "apply_patch",
-                    patch="--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+created\n",
-                ),
-                call(
-                    "apply_patch", patch=diff("result.txt", "created\n", "modified\n")
-                ),
+                call("write_file", path=target.name, content=content),
+                call("read_file", path=target.name),
+                call("write_file", path=target.name, content="overwrite"),
+                call("apply_patch", patch=diff(target.name, content, updated)),
             ]
 
             def handler(request):
                 body = json.loads(request.content)
                 requests.append(body)
                 index = len(requests) - 1
-                if index:
-                    self.assertTrue(json.loads(body["messages"][-1]["content"])["ok"])
+                if index == 0:
+                    self.assertEqual({tool["function"]["name"] for tool in body["tools"]},
+                                     {"read_file", "write_file", "apply_patch"})
+                else:
+                    output = json.loads(body["messages"][-1]["content"])
+                    if index == 1:
+                        self.assertEqual(output, {"ok": True, "path": str(target),
+                                                  "bytes_written": len(content.encode())})
+                    elif index == 2:
+                        self.assertEqual(output["content"], content)
+                    elif index == 3:
+                        self.assertEqual(output["error"]["code"], "file_exists")
+                    else:
+                        self.assertTrue(output["ok"])
                 if index < len(steps):
                     step = {**steps[index], "id": f"call-{index}"}
                     message = {
@@ -640,7 +749,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     workspace=workspace, provider="compatible", model_id="test"
                 )
                 tools = create_tools(approval=approve_change).select(
-                    ["read_file", "apply_patch"]
+                    ["read_file", "write_file", "apply_patch"]
                 )
                 result = await Agent(
                     client=client,
@@ -652,13 +761,12 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     tools=tools,
                     events=events,
-                ).run(session=state, prompt="read, create, modify")
+                ).run(session=state, prompt="create, read, try to overwrite, then patch")
             self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
-            self.assertEqual(result.tool_calls, 3)
+            self.assertEqual(result.tool_calls, 4)
             self.assertEqual(len(approvals), 2)
             self.assertEqual(len(requested_events), 2)
-            self.assertEqual((workspace / "result.txt").read_text(), "modified\n")
-            self.assertEqual(len(state.messages), 8)
+            self.assertEqual(target.read_bytes(), updated.encode())
 
 
 if __name__ == "__main__":
