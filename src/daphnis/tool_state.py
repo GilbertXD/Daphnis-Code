@@ -8,6 +8,7 @@ from saturnus import Messages
 TOOL_STATE = "daphnis_tool_state"
 PENDING = "PENDING"
 RUNNING = "RUNNING"
+TERMINATED_SKIP_MESSAGE = "任务已终止，工具未执行。"
 _UNKNOWN = "execution_result_unknown"
 
 
@@ -49,7 +50,7 @@ def resolve_tool_placeholders(
         elif state == PENDING and (terminate or unknown):
             content = _recovery_result(
                 "execution_skipped",
-                "任务已终止，工具未执行。" if terminate else "前序工具结果未知，此工具未执行，需要重新规划。",
+                TERMINATED_SKIP_MESSAGE if terminate else "前序工具结果未知，此工具未执行，需要重新规划。",
             )
         else:
             continue

@@ -138,19 +138,38 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(removed[2:], original[5:])
                 self.assertEqual(history.snapshot(), original)
 
-    def test_terminated_turn_keeps_existing_recovery_results(self):
+    def test_terminated_turn_deduplicates_only_explicit_user_termination(self):
         calls = [tool_call("a"), tool_call("b")]
-        for code in ("execution_skipped", "execution_result_unknown"):
-            with self.subTest(code=code):
+
+        def recovery_result(code, message):
+            return {"ok": False, "source": "daphnis_recovery", "error": {"code": code, "message": message}}
+
+        success = {"ok": True}
+        unknown = recovery_result("execution_result_unknown", "执行中断，工具可能已经产生副作用，请检查实际环境。")
+        terminated_skip = recovery_result("execution_skipped", "任务已终止，工具未执行。")
+        unknown_skip = recovery_result("execution_skipped", "前序工具结果未知，此工具未执行，需要重新规划。")
+        for state, first, last, annotate in (
+            (TERMINATED, success, unknown, True),
+            (TERMINATED, terminated_skip, success, False),
+            (TERMINATED, unknown, unknown_skip, True),
+            (CONTINUE, unknown, unknown_skip, False),
+        ):
+            with self.subTest(state=state, first=first, last=last):
                 history = Messages()
-                history.add_user("terminated", extra={TURN_STATE: TERMINATED})
+                history.add_user("task", extra={TURN_STATE: state})
                 history.add_assistant(extra={"tool_calls": calls})
-                history.add_tool_result(tool_call_id="a", content=json.dumps({
-                    "ok": False, "source": "daphnis_recovery", "error": {"code": code},
-                }))
-                history.add_tool_result(tool_call_id="b", content='{"ok": true}')
+                history.add_tool_result(tool_call_id="a", content=json.dumps(first))
+                history.add_tool_result(tool_call_id="b", content=json.dumps(last))
                 original = history.snapshot()
-                self.assertEqual(Context().build(history)[1:], original[1:])
+                expected = {**last, "_daphnis_runtime": {"turn_terminated_by_user": True}} if annotate else last
+                working = Context().build(history)
+                self.assertEqual(working[1:-1], original[1:-1])
+                self.assertEqual(json.loads(working[-1]["content"]), expected)
+                snapshot = history.snapshot()
+                projected = project_terminated_turns(snapshot)
+                self.assertEqual(project_terminated_turns(projected), projected)
+                self.assertEqual(snapshot, original)
+                self.assertEqual(history.snapshot(), original)
 
     async def test_retry_reuses_user_and_new_prompt_abandons_failed_user(self):
         requests = []

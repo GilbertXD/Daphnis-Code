@@ -6,7 +6,7 @@ from enum import StrEnum
 from itertools import pairwise
 from typing import Any
 
-from .tool_state import TOOL_STATE
+from .tool_state import TERMINATED_SKIP_MESSAGE, TOOL_STATE
 
 TURN_STATE = "daphnis_turn_state"
 TURN_ATTEMPT = "daphnis_turn_attempt"
@@ -60,12 +60,18 @@ def _result_object(content: Any) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _reports_interruption(value: dict[str, Any] | None) -> bool:
+def _reports_termination(value: dict[str, Any] | None) -> bool:
+    if value is None:
+        return False
+    runtime = value.get(_RUNTIME_KEY)
+    if isinstance(runtime, dict) and runtime.get(_TERMINATED_KEY) is True:
+        return True
+    # Both recovery paths use execution_skipped. The saved message identifies the cause.
     return (
-        value is not None
-        and value.get("source") == "daphnis_recovery"
+        value.get("source") == "daphnis_recovery"
         and isinstance(error := value.get("error"), dict)
-        and error.get("code") in ("execution_skipped", "execution_result_unknown")
+        and error.get("code") == "execution_skipped"
+        and error.get("message") == TERMINATED_SKIP_MESSAGE
     )
 
 
@@ -73,8 +79,6 @@ def _with_termination(content: str | list, value: dict[str, Any] | None) -> str 
     if value is not None:
         runtime = value.get(_RUNTIME_KEY, {})
         if isinstance(runtime, dict):
-            if runtime.get(_TERMINATED_KEY) is True:
-                return content
             return json.dumps({**value, _RUNTIME_KEY: {**runtime, _TERMINATED_KEY: True}}, ensure_ascii=False)
     if isinstance(content, list):
         note = {"type": "text", "text": _TERMINATION_NOTE}
@@ -109,7 +113,7 @@ def project_terminated_turns(messages: list[dict[str, Any]]) -> list[dict[str, A
         if len(call_ids) != len(calls) or len(result_ids) != len(results) or call_ids != result_ids:
             continue
         values = [_result_object(result["content"]) for result in results]
-        if any(_reports_interruption(value) for value in values):
+        if any(_reports_termination(value) for value in values):
             continue
         last = results[-1]
         content = _with_termination(last["content"], values[-1])
