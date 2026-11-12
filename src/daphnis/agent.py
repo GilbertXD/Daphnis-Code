@@ -282,13 +282,13 @@ class Agent:
             ids.add(call_id)
 
     def _model_context(
-        self, working: Messages, checkpoint: CompactionCheckpoint | None,
+        self, history: Messages, checkpoint: CompactionCheckpoint | None,
         *, history_lookup: bool = False,
     ) -> list[dict[str, Any]]:
         if checkpoint is None:
-            return self.context.build(working)
+            return self.context.build(history)
         return self.context.build(
-            working, checkpoint, summary_reasoning=self._provider == "deepseek",
+            history, checkpoint, summary_reasoning=self._provider == "deepseek",
             history_lookup=history_lookup,
         )
 
@@ -382,7 +382,7 @@ class Agent:
     async def _compact_request(
         self,
         *,
-        working: Messages,
+        history: Messages,
         checkpoint: CompactionCheckpoint | None,
         messages: list[dict[str, Any]],
         body: dict[str, Any],
@@ -404,7 +404,7 @@ class Agent:
             budget = self._request_budget(pruned, body, compactor)
             messages = pruned
             if overflow or budget.needs_compaction:
-                raw = working.snapshot()
+                raw = history.snapshot()
                 available = budget.compaction_threshold
                 if available is not None:
                     privileged = Messages([
@@ -427,7 +427,7 @@ class Agent:
                             failure_reason = exc.reason
                     else:
                         projected = compactor.prune(self._model_context(
-                            working, candidate, history_lookup=history_lookup,
+                            history, candidate, history_lookup=history_lookup,
                         ))
                         after = self._request_budget(projected, body, compactor)
                         if after.input_tokens < budget.input_tokens:
@@ -507,11 +507,9 @@ class Agent:
                 if prompt is not None or recovery is None or recovery.kind is not kind or recovery.key != recovery_key:
                     raise ValueError("恢复状态已变化，请刷新后再操作。")
             interrupted = interrupted_tool_group(committed)
-            tools = (
-                self.tools.bind(session=session, events=self.events, turn_id=turn_id)
-                if isinstance(self.tools, ToolExecutor)
-                else self.tools
-            )
+            tools = None if recovery_action is RecoveryAction.TERMINATE else self.tools
+            if isinstance(tools, ToolExecutor):
+                tools = tools.bind(session=session, events=self.events, turn_id=turn_id)
             definitions = tools.definitions() if tools is not None else []
             if definitions:
                 require_tools(model)
@@ -669,12 +667,11 @@ class Agent:
             if recovery_action is None:
                 if committed and len(committed) not in safe_boundaries(committed):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
-                working = Messages(committed)
+                snapshot = [*committed, {"role": "user", "content": prompt}]
                 if recovery is not None:
                     index = recovery.message_index
-                    working.replace(index, {**committed[index], TURN_STATE: ABANDONED})
-                working.add_user(prompt)
-                await commit(working.snapshot())
+                    snapshot[index] = {**committed[index], TURN_STATE: ABANDONED}
+                await commit(snapshot)
             else:
                 snapshot = committed.copy()
                 terminating = recovery_action is RecoveryAction.TERMINATE
@@ -716,18 +713,16 @@ class Agent:
                 extra_body=extra_body,
                 custom_compatibility=self._custom_compatibility,
             )
-            if recovery_action is not None:
-                for call, index in pending:
-                    await process_tool(call, index, {**fields, "request_number": 0})
-                working = Messages(committed)
+            for call, index in pending:
+                await process_tool(call, index, {**fields, "request_number": 0})
             while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
-                messages = self._model_context(working, checkpoint, history_lookup=history_lookup)
+                messages = self._model_context(session.messages, checkpoint, history_lookup=history_lookup)
                 budget = self._request_budget(messages, body, compactor)
                 if budget.needs_compaction:
                     checkpoint, messages = await self._compact_request(
-                        working=working, checkpoint=checkpoint, messages=messages,
+                        history=session.messages, checkpoint=checkpoint, messages=messages,
                         body=body, compactor=compactor, summarize=summarize, fields=fields,
                         history_lookup=history_lookup,
                     )
@@ -752,7 +747,7 @@ class Agent:
                         if reason is None:
                             before = budget.input_tokens
                             checkpoint, reduced = await self._compact_request(
-                                working=working, checkpoint=checkpoint, messages=messages,
+                                history=session.messages, checkpoint=checkpoint, messages=messages,
                                 body=body, compactor=compactor, summarize=summarize,
                                 fields=failure_fields, trigger="overflow",
                                 history_lookup=history_lookup,
@@ -786,9 +781,8 @@ class Agent:
                 if reason not in ("stop", "tool_calls"):
                     raise ValueError(f"Model did not finish normally: {reason!r}.")
                 if reason == "stop":
-                    working.add(message)
                     await _checkpoint()
-                    snapshot = working.snapshot()
+                    snapshot = [*committed, message]
                     try:
                         await commit(snapshot)
                     except asyncio.CancelledError:
@@ -804,11 +798,10 @@ class Agent:
                 calls = message["tool_calls"]
                 if calls_executed + len(calls) > self.max_tool_calls:
                     raise RuntimeError("Maximum tool-call count exceeded.")
-                first_result = len(working) + 1
-                await commit(stage_tool_group(working, message).snapshot())
+                first_result = len(committed) + 1
+                await commit(stage_tool_group(session.messages, message).snapshot())
                 for index, call in enumerate(calls, start=first_result):
                     await process_tool(call, index, request_fields)
-                working = Messages(committed)
             if status is not TurnStatus.COMPLETED:
                 await _checkpoint()
                 status = TurnStatus.PAUSED_LIMIT
@@ -818,7 +811,13 @@ class Agent:
                     limit_reason = f"达到模型总请求上限（{requests}/{self.max_total_requests}）"
                 else:
                     limit_reason = "可用于上下文压缩的请求额度不足"
-                notice = f"本轮{limit_reason}，进度已保存。请选择继续或终止。"
+                pending_recovery = recovery_state(committed, session_id)
+                action_hint = (
+                    "可重试原消息或发送新消息。"
+                    if pending_recovery and pending_recovery.kind is RecoveryKind.FAILED_USER
+                    else "请选择继续或终止。"
+                )
+                notice = f"本轮{limit_reason}，进度已保存。{action_hint}"
         except asyncio.CancelledError:
             status = TurnStatus.CANCELLED
             error = "Turn cancelled; executed tool side effects are not rolled back."

@@ -106,6 +106,7 @@ type State = {
   model: Model
   models: Model[]
   thinking: string | null
+  system_prompt: string
   all_tools: string[]
   enabled_tools: string[]
   effective_tools: string[]

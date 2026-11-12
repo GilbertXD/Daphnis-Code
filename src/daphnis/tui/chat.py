@@ -18,7 +18,7 @@ from ..events import Event
 from ..mcp import TOOL_PREFIX
 from ..terminal_commands import sanitize_terminal
 from ..tool_state import PENDING, RUNNING, TOOL_STATE
-from ..turn_state import ABANDONED, TURN_STATE, RecoveryKind, RecoveryState
+from ..turn_state import ABANDONED, TERMINATED, TURN_STATE, RecoveryKind, RecoveryState
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -283,18 +283,18 @@ class ChatView(VerticalScroll):
                 try:
                     result = json.loads(message.get("content") or "{}")
                     if isinstance(result, dict) and "ok" in result:
+                        error = result.get("error")
                         if result.get("source") == "daphnis_recovery":
-                            row.outcome = "结果未知"
+                            code = error.get("code") if isinstance(error, dict) else None
+                            row.outcome = "未执行" if code == "execution_skipped" else "结果未知"
                         else:
                             row.outcome = "COMPLETED" if result["ok"] else "ERROR"
-                        if isinstance(result.get("error"), dict):
-                            row.outcome += (
-                                " · " + str(result["error"].get("message", ""))[:300]
-                            )
+                        if isinstance(error, dict):
+                            row.outcome += " · " + str(error.get("message", ""))[:300]
                 except (TypeError, ValueError):
                     pass
                 row.dirty = True
-                if row.output or row.outcome.startswith(("ERROR", "结果未知", "等待恢复")):
+                if row.output or row.outcome.startswith(("ERROR", "结果未知", "等待恢复", "未执行")):
                     row.tool_group.reveal()
             else:
                 content = assistant_text(message) if role == "assistant" else message.get("content")
@@ -313,6 +313,8 @@ class ChatView(VerticalScroll):
                 row.reasoning = message.get("reasoning_content") or ""
                 if message.get(TURN_STATE) == ABANDONED:
                     row.outcome = "已作废"
+                elif message.get(TURN_STATE) == TERMINATED:
+                    row.outcome = "任务已终止"
                 elif recovery and recovery.kind is RecoveryKind.FAILED_USER and recovery.message_index == index:
                     row.outcome = "! 尚无已保存回复 · /retry 重试"
                 row.dirty = True

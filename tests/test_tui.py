@@ -8,14 +8,21 @@ from unittest.mock import patch
 import httpx
 from rich.markdown import Markdown
 from rich.syntax import Syntax
-from textual.widgets import Button, Checkbox, OptionList, SelectionList, Static
+from textual.widgets import (
+    Button,
+    Checkbox,
+    OptionList,
+    SelectionList,
+    Static,
+    TextArea,
+)
 
 from daphnis import Event, History, Operations, Session
 from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.tools import ApprovalDecision, ApprovalRequest
-from daphnis.tui.app import ChoiceScreen, DaphnisApp, ToolsScreen
+from daphnis.tui.app import ChoiceScreen, DaphnisApp, SystemPromptScreen, ToolsScreen
 from daphnis.tui.approval import ApprovalScreen
 from daphnis.tui.chat import ChatRow, ChatView, ToolGroup, patch_counts
 from daphnis.tui.input import PromptInput
@@ -82,6 +89,21 @@ async def submit(ui, pilot, text):
 
 
 class TUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_system_prompt_dialog_saves_multiline_text_and_reset_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = controller(Path(temporary), lambda request: self.fail("Unexpected model call"))
+            ops = Operations(app)
+            default = ops.get_system_prompt()
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "/system")
+                await until(pilot, lambda: isinstance(ui.screen, SystemPromptScreen))
+                ui.screen.query_one(TextArea).load_text("First line\nSecond line")
+                await pilot.click("#system-save")
+                await until(pilot, lambda: ops.get_system_prompt() == "First line\nSecond line")
+                await submit(ui, pilot, "/system reset")
+                await until(pilot, lambda: ops.get_system_prompt() == default)
+
     async def test_compact_command_updates_status_without_rendering_summary_as_chat(self):
         summary = json.dumps({
             "goals": "keep the release tag", "progress": "tag recorded",

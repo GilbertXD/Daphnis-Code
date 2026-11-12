@@ -13,7 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Button, OptionList, SelectionList, Static
+from textual.widgets import Button, OptionList, SelectionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from ..agent import TurnStatus
@@ -149,6 +149,42 @@ class ToolsScreen(ModalScreen[tuple[str, ...] | None]):
             if event.button.id == "tools-apply"
             else None
         )
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class SystemPromptScreen(ModalScreen[str | None]):
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "close", "返回")]
+    DEFAULT_CSS = """
+    SystemPromptScreen { align: center middle; }
+    #system-box { width: 80; max-width: 95%; height: 70%; padding: 1;
+        background: $background; border: solid $primary; }
+    #system-editor { height: 1fr; }
+    #system-actions { height: auto; align-horizontal: right; }
+    """
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="system-box"):
+            yield Static("会话系统提示词", markup=False)
+            yield TextArea(self.prompt, id="system-editor", show_line_numbers=False)
+            with Horizontal(id="system-actions"):
+                yield Button("恢复默认", id="system-reset")
+                yield Button("保存", id="system-save")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "system-reset":
+            self.dismiss("")
+        elif event.button.id == "system-save":
+            value = self.query_one(TextArea).text
+            if value.strip():
+                self.dismiss(value)
+            else:
+                self.notify("系统提示词必须包含文字。", severity="warning")
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -440,6 +476,9 @@ class DaphnisApp(App[None]):
             elif result.action == "tools":
                 self.push_screen(ToolsScreen(self.ops), self._tools_selected)
                 show_text = False
+            elif result.action == "system":
+                self.push_screen(SystemPromptScreen(result.text), self._system_selected)
+                show_text = False
             elif result.action == "sessions":
                 items = self.ops.list_sessions()
                 if items:
@@ -493,6 +532,19 @@ class DaphnisApp(App[None]):
                 self.update_status()
             except (OSError, SaturnusError, RuntimeError, TypeError, ValueError) as exc:
                 self.notify(sanitize_terminal(safe_error(exc)), severity="error")
+
+    async def _system_selected(self, value: str | None) -> None:
+        if value is None:
+            return
+
+        async def select() -> CommandResult:
+            if not value:
+                await self.ops.reset_system_prompt()
+                return CommandResult(text="已恢复默认系统提示词。")
+            await self.ops.set_system_prompt(value)
+            return CommandResult(text="已保存会话系统提示词。")
+
+        await self._perform_command(select)
 
     async def _session_selected(self, value: str | None) -> None:
         if value is None:

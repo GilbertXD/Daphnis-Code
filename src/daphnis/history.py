@@ -222,6 +222,7 @@ class History:
             enabled_tools=session.enabled_tools,
             title=session.title,
             compaction=session.compaction,
+            system_prompt=session.system_prompt,
         )
         data = {
             "version": 2,
@@ -239,6 +240,8 @@ class History:
             data["title"] = validated.title
         if validated.compaction is not None:
             data["compaction"] = asdict(validated.compaction)
+        if validated.system_prompt is not None:
+            data["system_prompt"] = validated.system_prompt
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())
@@ -308,4 +311,5 @@ class History:
             _saved_revision=(session_id, sha256(raw).hexdigest()),
             title=data.get("title"),
             compaction=checkpoint,
+            system_prompt=data.get("system_prompt"),
         )

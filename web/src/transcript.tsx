@@ -137,12 +137,13 @@ function AssistantMessage({ text, thinking }: { text: string; thinking?: string 
 
 type Retry = { index: number; disabled: boolean; run: () => void }
 
-function UserMessage({ text, abandoned, retry }: { text: string; abandoned?: boolean; retry?: Retry }) {
-  return <article className={`user-message${abandoned ? ' abandoned' : ''}`}>
+function UserMessage({ text, state, retry }: { text: string; state?: Message['daphnis_turn_state']; retry?: Retry }) {
+  return <article className={`user-message${state === 'ABANDONED' ? ' abandoned' : ''}`}>
     {retry && <button type="button" className="retry-mark" disabled={retry.disabled}
       aria-label="重试此消息" title="尚无已保存回复，点击重试" onClick={retry.run}>!</button>}
     <RichText text={text} />
-    {abandoned && <small>已作废</small>}
+    {state === 'ABANDONED' && <small>已作废</small>}
+    {state === 'TERMINATED' && <small>任务已终止</small>}
   </article>
 }
 
@@ -151,7 +152,9 @@ function savedResult(message: Message): { status: string; error?: unknown } {
   if (message.daphnis_tool_state === 'RUNNING') return { status: '结果未知' }
   try {
     const value = JSON.parse(typeof message.content === 'string' ? message.content : '')
-    if (value?.source === 'daphnis_recovery') return { status: '结果未知', error: value.error }
+    if (value?.source === 'daphnis_recovery') {
+      return { status: value.error?.code === 'execution_skipped' ? '未执行' : '结果未知', error: value.error }
+    }
     if (value?.ok === false || value?.error) return { status: 'ERROR', error: value.error }
     if (value?.ok === true) return { status: 'COMPLETED' }
   } catch { /* Plain-text results are supported. */ }
@@ -172,7 +175,7 @@ const Committed = memo(function Committed({ messages, tools, turns, retry, recov
       request = 0
       calls = null
       return <UserMessage key={index} text={messageText(message)}
-        abandoned={message.daphnis_turn_state === 'ABANDONED'} retry={retry?.index === index ? retry : undefined} />
+        state={message.daphnis_turn_state} retry={retry?.index === index ? retry : undefined} />
     }
     if (message.role === 'assistant') {
       request += 1

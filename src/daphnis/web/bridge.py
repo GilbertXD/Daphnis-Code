@@ -147,6 +147,7 @@ class Bridge:
                 for provider, models in ops.list_models().items() for model in models
             ],
             "thinking": ops.thinking,
+            "system_prompt": ops.get_system_prompt(),
             "all_tools": ops.all_tools,
             "enabled_tools": ops.enabled_tools,
             "effective_tools": ops.effective_tools,

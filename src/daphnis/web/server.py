@@ -24,6 +24,7 @@ _FIELDS = {
     "delete": {"id": str},
     "model": {"provider": str, "model_id": str},
     "thinking": {"mode": (str, type(None))},
+    "system": {"prompt": (str, type(None))},
     "tools": {"names": list},
     "send": {"prompt": str},
     "retry": {"key": str},
@@ -114,6 +115,11 @@ async def _execute(bridge, action, session, args):
             return await ops.set_model(args["provider"], args["model_id"])
         case "thinking":
             await ops.set_thinking(args["mode"])
+        case "system":
+            if args["prompt"] is None:
+                await ops.reset_system_prompt()
+            else:
+                await ops.set_system_prompt(args["prompt"])
         case "tools":
             await ops.set_tools(args["names"])
         case "send":

@@ -26,6 +26,7 @@ APPROVAL_MODE_TEXT = {
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
+/system [reset]  编辑会话系统提示词，或恢复默认
 /tools [all|none|on 工具名...|off 工具名...]  查看或选择工具
 /approval [ask|auto|full]  查看或切换工具审批模式
 /mcp [reconnect|disconnect|refresh Server名]  查看 MCP 状态或管理连接
@@ -110,6 +111,13 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
                 raise ValueError("用法：/mcp [reconnect|disconnect|refresh Server名]")
     if ops.running:
         raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
+    if name == "/system":
+        if not args:
+            return CommandResult("system", ops.get_system_prompt())
+        if args == ["reset"]:
+            await ops.reset_system_prompt()
+            return CommandResult(text="已恢复默认系统提示词。")
+        raise ValueError("用法：/system [reset]")
     if name == "/compact" and not args:
         checkpoint = await ops.compact()
         return CommandResult(text=(

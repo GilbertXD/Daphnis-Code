@@ -26,7 +26,7 @@ class Context:
         self, working_messages: Messages, checkpoint: CompactionCheckpoint | None = None,
         *, summary_reasoning: bool = False, history_lookup: bool = False,
     ) -> list[dict[str, Any]]:
-        """Project protocol-ready Working messages into a model request."""
+        """Build the protocol-ready Working view from committed messages."""
         messages = working_messages.snapshot()
         if messages and len(messages) not in safe_boundaries(messages):
             raise ValueError("Cannot request a model with an incomplete tool exchange.")

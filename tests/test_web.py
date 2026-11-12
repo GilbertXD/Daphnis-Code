@@ -376,6 +376,19 @@ class WebTests(unittest.TestCase):
         result = json.loads(terminated["state"]["messages"][-1]["content"])
         self.assertEqual(result["error"]["code"], "execution_skipped")
 
+    def test_system_prompt_can_be_saved_and_reset(self):
+        initial = self.snapshot()
+        session_id = initial["session_id"]
+        default = initial["state"]["system_prompt"]
+        custom = "First line\nSecond line"
+        self.command("system", session_id, prompt=custom)
+        self.assertEqual(self.snapshot()["state"]["system_prompt"], custom)
+        self.assertEqual(self.history.load(session_id).system_prompt, custom)
+        self.command("system", session_id, 409, prompt=" ")
+        self.command("system", session_id, prompt=None)
+        self.assertEqual(self.snapshot()["state"]["system_prompt"], default)
+        self.assertIsNone(self.history.load(session_id).system_prompt)
+
     def test_stream_redaction_stop_and_provider_error(self):
         session_id = self.snapshot()["session_id"]
         self.command("send", session_id, 202, prompt="pause")

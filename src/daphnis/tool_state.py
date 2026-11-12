@@ -57,8 +57,8 @@ def resolve_tool_placeholders(
     return messages, unknown
 
 
-def stage_tool_group(working: Messages, assistant: dict[str, Any]) -> Messages:
-    group = Messages(working.snapshot())
+def stage_tool_group(history: Messages, assistant: dict[str, Any]) -> Messages:
+    group = Messages(history.snapshot())
     group.add(assistant)
     for call in assistant["tool_calls"]:
         group.add_tool_result(tool_call_id=call["id"], content=None, extra={TOOL_STATE: PENDING})

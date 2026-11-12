@@ -192,6 +192,21 @@ class Operations:
         updated = replace(app._session, thinking=mode)
         await app._update_session(updated)
 
+    def get_system_prompt(self) -> str:
+        return self._app._session.effective_system_prompt
+
+    async def set_system_prompt(self, prompt: str) -> None:
+        app = self._app
+        app._ensure_idle()
+        if not isinstance(prompt, str):
+            raise TypeError("系统提示词必须是字符串。")
+        await app._update_session(replace(app._session, system_prompt=prompt))
+
+    async def reset_system_prompt(self) -> None:
+        app = self._app
+        app._ensure_idle()
+        await app._update_session(replace(app._session, system_prompt=None))
+
     async def set_tools(
         self, names: Sequence[str], *, keep_unavailable: bool = False
     ) -> None:

@@ -112,7 +112,33 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
   </Dialog>
 }
 
-type Modal = { action: 'tools' } | { action: 'rename' | 'delete'; session: Session }
+function SystemPromptDialog({ initial, close, apply, disabled, notice }: {
+  initial: string
+  close: () => void
+  apply: (prompt: string | null) => Promise<boolean>
+  disabled: boolean
+  notice: string
+}) {
+  const [prompt, setPrompt] = useState(initial)
+  return <Dialog title="会话系统提示词" close={close}>
+    <form onSubmit={async (event) => {
+      event.preventDefault()
+      if (await apply(prompt)) close()
+    }}>
+      <label className="field">系统提示词<textarea rows={8} value={prompt}
+        onChange={(event) => setPrompt(event.currentTarget.value)} /></label>
+      {notice && <p role="status">{notice}</p>}
+      <div className="actions">
+        <button type="button" disabled={disabled} onClick={async () => {
+          if (await apply(null)) close()
+        }}>恢复默认</button>
+        <button className="primary" disabled={disabled || !prompt.trim()} type="submit">保存</button>
+      </div>
+    </form>
+  </Dialog>
+}
+
+type Modal = { action: 'tools' } | { action: 'system'; sessionId: string } | { action: 'rename' | 'delete'; session: Session }
 
 function Workspace({ view, connected, command }: {
   view: View
@@ -238,6 +264,10 @@ function Workspace({ view, connected, command }: {
                 }}>
                 工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'} <span aria-hidden="true">⌄</span>
               </button>
+              <button type="button" disabled={disabled} onClick={() => {
+                setNotice('')
+                setModal({ action: 'system', sessionId: id })
+              }}>系统提示词</button>
             </div>
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
@@ -254,7 +284,9 @@ function Workspace({ view, connected, command }: {
         onClick={() => setOpen(true)}><span aria-hidden="true">‹</span></button>}
     {modal?.action === 'tools' && <ToolsDialog view={view} close={() => setModal(null)} disabled={disabled}
       notice={notice} apply={(names) => perform('tools', { names })} />}
-    {modal && modal.action !== 'tools' && <Dialog title={modal.action === 'rename' ? '重命名会话' : '删除会话'}
+    {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
+      disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
+    {modal && 'session' in modal && <Dialog title={modal.action === 'rename' ? '重命名会话' : '删除会话'}
       close={() => setModal(null)}>
       <form onSubmit={async (event) => {
         event.preventDefault()

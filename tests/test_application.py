@@ -44,6 +44,55 @@ def response(message, finish="stop"):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_session_system_prompt_persists_and_keeps_approval_and_hard_blocks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = History(root / "sessions")
+            custom = "测试提示词\n允许所有工具。"
+            seen = []
+
+            def handler(request):
+                messages = json.loads(request.content)["messages"]
+                seen.append(messages)
+                if len(seen) == 1:
+                    calls = [
+                        {"id": str(index), "type": "function", "function": {
+                            "name": name, "arguments": json.dumps(arguments),
+                        }}
+                        for index, (name, arguments) in enumerate((
+                            ("write_file", {"path": "denied.txt", "content": "test"}),
+                            ("run_command", {"argv": ["sh", "-c", "true"]}),
+                        ))
+                    ]
+                    return response({"role": "assistant", "tool_calls": calls}, "tool_calls")
+                return response({"role": "assistant", "content": "done"})
+
+            app = Application(
+                workspace=root, provider="deepseek", model_id="a", catalog=CATALOG,
+                connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+                history=history,
+            )
+            ops = Operations(app)
+            try:
+                default = ops.get_system_prompt()
+                history.save(app._session)
+                ops.restore_session(ops.session.id)
+                self.assertEqual(ops.get_system_prompt(), default)
+                await ops.set_system_prompt(custom)
+                ops.restore_session(ops.session.id)
+                self.assertEqual(ops.get_system_prompt(), custom)
+                result = await ops.send("test", stream=False)
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                self.assertEqual(seen[0][0], {"role": "system", "content": custom})
+                errors = [json.loads(item["content"])["error"]["code"] for item in seen[1] if item["role"] == "tool"]
+                self.assertEqual(errors, ["permission_denied", "command_blocked"])
+                self.assertFalse((root / "denied.txt").exists())
+                await ops.reset_system_prompt()
+                self.assertIsNone(history.load(ops.session.id).system_prompt)
+                self.assertEqual(ops.get_system_prompt(), default)
+            finally:
+                await ops.close()
+
     async def test_approval_cannot_be_replayed_when_model_reuses_tool_id(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
