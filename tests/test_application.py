@@ -21,6 +21,7 @@ from daphnis.app import Application
 from daphnis.config import environment_connections
 from daphnis.models import CapabilityError, ModelInfo
 from daphnis.tool_state import PENDING, TOOL_STATE
+from daphnis.turn_state import RecoveryKind, RecoveryState
 
 CATALOG = (
     ModelInfo(
@@ -819,11 +820,25 @@ class ConfigTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_interrupted_tool_turn_requires_an_explicit_cli_action(self):
+        from daphnis import cli
+
+        ops = Mock(spec=Operations)
+        ops.recovery = RecoveryState(RecoveryKind.INTERRUPTED_TURN, 0, "saved-key")
+        ops.continue_interrupted_turn.return_value = TurnResult("session", "turn", TurnStatus.COMPLETED)
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(asyncio.run(cli.execute(ops, "继续")), 3)
+        self.assertIn("/continue", stderr.getvalue())
+        ops.send.assert_not_called()
+        self.assertEqual(asyncio.run(cli.execute(ops, "/continue")), 0)
+        ops.continue_interrupted_turn.assert_awaited_once_with("saved-key", stream=False)
+
     def test_budget_pause_prints_notice_with_distinct_exit_code(self):
         from daphnis import cli
 
         stdout, stderr = io.StringIO(), io.StringIO()
         ops = Mock(spec=Operations)
+        ops.recovery = None
         paused = TurnResult("session", "turn", TurnStatus.PAUSED_LIMIT, notice="进度已保存。发送「继续」可接着处理。")
         ops.send.return_value = paused
         with (

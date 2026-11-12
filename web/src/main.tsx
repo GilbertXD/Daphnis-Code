@@ -131,6 +131,8 @@ function Workspace({ view, connected, command }: {
   const [notice, setNotice] = useState('')
   const { state, status, session_id: id } = view
   const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
+  const recovery = state.recovery
+  const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
   const draft = drafts[id] ?? ''
   const tools = useMemo(() => collectTools(view.events), [view.events])
   const sessions = state.sessions.some((session) => session.id === id)
@@ -160,7 +162,7 @@ function Workspace({ view, connected, command }: {
   }
 
   async function send() {
-    if (!disabled && draft.trim() && await perform('send', { prompt: draft })) {
+    if (!disabled && !interrupted && draft.trim() && await perform('send', { prompt: draft })) {
       setDrafts((current) => current[id] === draft ? { ...current, [id]: '' } : current)
     }
   }
@@ -184,12 +186,21 @@ function Workspace({ view, connected, command }: {
         setModal({ action, session })
       }} />
     <main className="conversation" aria-label="Agent 对话">
-      <Transcript key={id} view={view} tools={tools} />
+      <Transcript key={id} view={view} tools={tools} retry={recovery?.kind === 'FAILED_USER'
+        ? { index: recovery.message_index, disabled, run: () => void perform('retry', { key: recovery.key }) }
+        : undefined} />
       <div className="composer-zone">
         {status.approval && <ApprovalCard key={status.approval.request_id} request={status.approval}
           disabled={busy || !connected} choose={(decision) => void perform('approve', {
             request_id: status.approval?.request_id, decision,
           })} />}
+        {interrupted && !status.running && <div className="recovery" role="group" aria-label="未完成任务">
+          <span>未完成任务</span>
+          <div className="actions">
+            <button type="button" disabled={disabled} onClick={() => void perform('continue', { key: recovery.key })}>继续</button>
+            <button type="button" disabled={disabled} onClick={() => void perform('terminate', { key: recovery.key })}>终止</button>
+          </div>
+        </div>}
         {!modal && notice && <p className="notice" role="status">{notice}</p>}
         <form className="composer" onSubmit={(event) => { event.preventDefault(); void send() }}>
           <textarea aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
@@ -231,7 +242,7 @@ function Workspace({ view, connected, command }: {
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
                 onClick={() => void perform('cancel', { run_id: view.run?.id })} aria-label="停止" title="停止">■</button>
-              : <button className="primary send" type="submit" disabled={disabled || !draft.trim()}
+              : <button className="primary send" type="submit" disabled={disabled || interrupted || !draft.trim()}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
         </form>

@@ -16,17 +16,20 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, SelectionList, Static
 from textual.widgets.option_list import Option
 
-from ..app import SessionSaveError
+from ..agent import TurnStatus
 from ..events import Event, EventBus
 from ..operations import Operations
 from ..terminal_commands import (
     APPROVAL_MODE_TEXT,
+    RECOVERY_COMMANDS,
     CommandResult,
+    recover_turn,
     safe_error,
     sanitize_terminal,
     terminal_command,
 )
 from ..tools import ApprovalDecision, ApprovalMode
+from ..turn_state import RecoveryKind
 from .approval import ApprovalScreen
 from .chat import ChatView
 from .input import PromptInput
@@ -231,7 +234,7 @@ class DaphnisApp(App[None]):
         ):
             self._subscriptions.append(self.events.on(name, self._forward))
         messages = self.ops.message_snapshot()
-        await self.query_one(ChatView).restore(messages)
+        await self._restore_chat()
         if not messages:
             await self.query_one(ChatView).add(
                 "从一个任务开始",
@@ -245,6 +248,13 @@ class DaphnisApp(App[None]):
     def _forward(self, event: Event) -> None:
         if not self._shutting_down:
             self.post_message(CoreNotification(event))
+
+    async def _restore_chat(self) -> None:
+        chat = self.query_one(ChatView)
+        recovery = self.ops.recovery
+        await chat.restore(self.ops.message_snapshot(), recovery)
+        if recovery and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+            await chat.add("未完成任务", "/continue 继续 · /terminate 终止", classes="notice")
 
     def update_status(self) -> None:
         ops = self.ops
@@ -338,7 +348,8 @@ class DaphnisApp(App[None]):
         text = message.text
         prompt.load_text("")
         await self.query_one(ChatView).query(".welcome").remove()
-        if text.startswith("/"):
+        recovery_action = RECOVERY_COMMANDS.get(text.strip())
+        if text.startswith("/") and recovery_action is None:
             await self.query_one(ChatView).add("你", text, classes="user command")
             self.run_worker(
                 self._command(text),
@@ -350,42 +361,47 @@ class DaphnisApp(App[None]):
         self._sending = True
         prompt.disabled = True
         chat = self.query_one(ChatView)
-        chat.pending_user = await chat.add("你", text, classes="user")
+        if recovery_action is None:
+            chat.pending_user = await chat.add("你", text, classes="user")
         self.update_status()
         self.run_worker(self._send(text), group="turn", exit_on_error=False)
 
     async def _send(self, text: str) -> None:
+        reconcile = self.ops.recovery is not None
+        message = None
         try:
-            result = await self.ops.send(text, stream=True)
-            if (message := result.notice or result.error) and not self._shutting_down:
-                await self.query_one(ChatView).add(
-                    "运行结果", safe_error(message), classes="notice"
-                )
-        except SessionSaveError as exc:
-            if not self._shutting_down:
-                await self.query_one(ChatView).add(
-                    "保存失败", safe_error(exc), classes="notice"
-                )
+            action = RECOVERY_COMMANDS.get(text.strip())
+            result = await (
+                recover_turn(self.ops, action, stream=True) if action is not None
+                else self.ops.send(text, stream=True)
+            )
+            reconcile |= result.status is not TurnStatus.COMPLETED
+            message = result.notice or result.error
+            if result.status is TurnStatus.TERMINATED:
+                message = "任务已终止。"
+            if result.status is TurnStatus.FAILED and result.external_side_effects_possible:
+                message = (message or "") + "\n工具可能已产生外部副作用。"
         except (Exception, asyncio.CancelledError) as exc:  # noqa: BLE001 - Restore the UI after any worker failure.
-            if not self._shutting_down:
-                chat = self.query_one(ChatView)
-                if chat.pending_user is not None:
-                    chat.pending_user.outcome = "已取消/失败 · 未提交"
-                    chat.pending_user.dirty = True
-                    chat.pending_user = None
-                await chat.add(
-                    "运行结果",
-                    "本轮已取消。已保存的消息仍可查看。"
-                    if isinstance(exc, asyncio.CancelledError)
-                    else safe_error(exc),
-                    classes="notice",
-                )
+            reconcile = True
+            message = (
+                "本轮已取消。工具可能已产生外部副作用。"
+                if isinstance(exc, asyncio.CancelledError) else safe_error(exc)
+            )
         finally:
-            self._sending = False
             if not self._shutting_down:
-                self.query_one(PromptInput).disabled = False
-                self.query_one(PromptInput).focus()
-                self.update_status()
+                self.call_later(self._present_turn, reconcile, message)
+
+    async def _present_turn(self, reconcile: bool, message: str | None) -> None:
+        if self._shutting_down:
+            return
+        if reconcile:
+            await self._restore_chat()
+        if message:
+            await self.query_one(ChatView).add("运行结果", safe_error(message), classes="notice")
+        self._sending = False
+        self.query_one(PromptInput).disabled = False
+        self.query_one(PromptInput).focus()
+        self.update_status()
 
     async def _command(self, text: str) -> None:
         await self._perform_command(lambda: terminal_command(self.ops, text))
@@ -402,7 +418,7 @@ class DaphnisApp(App[None]):
             if result.action == "clear":
                 await chat.clear_display()
             elif result.action == "reload":
-                await chat.restore(self.ops.message_snapshot())
+                await self._restore_chat()
             elif result.action == "models":
                 await chat.query(ModelPicker).remove()
                 await chat.mount(ModelPicker(self.ops))

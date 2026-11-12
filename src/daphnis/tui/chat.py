@@ -18,6 +18,7 @@ from ..events import Event
 from ..mcp import TOOL_PREFIX
 from ..terminal_commands import sanitize_terminal
 from ..tool_state import PENDING, RUNNING, TOOL_STATE
+from ..turn_state import ABANDONED, TURN_STATE, RecoveryKind, RecoveryState
 from .theme import ACCENT, BORDER, ERROR, MUTED, SUCCESS, SURFACE, TEXT, WARNING
 
 
@@ -257,10 +258,10 @@ class ChatView(VerticalScroll):
         self.pending_user = None
         self._tool_group = None
 
-    async def restore(self, messages: list[dict[str, Any]]) -> None:
+    async def restore(self, messages: list[dict[str, Any]], recovery: RecoveryState | None = None) -> None:
         await self.clear_display()
         calls = {}
-        for message in messages:
+        for index, message in enumerate(messages):
             role = message["role"]
             if role == "assistant":
                 calls = {call["id"]: call["function"] for call in message.get("tool_calls") or ()}
@@ -310,6 +311,10 @@ class ChatView(VerticalScroll):
                     classes="user" if role == "user" else "",
                 )
                 row.reasoning = message.get("reasoning_content") or ""
+                if message.get(TURN_STATE) == ABANDONED:
+                    row.outcome = "已作废"
+                elif recovery and recovery.kind is RecoveryKind.FAILED_USER and recovery.message_index == index:
+                    row.outcome = "! 尚无已保存回复 · /retry 重试"
                 row.dirty = True
         self.refresh_rows()
 

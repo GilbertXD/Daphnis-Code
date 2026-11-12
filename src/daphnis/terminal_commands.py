@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .operations import Operations
 from .terminal_text import sanitize_terminal
 from .tools import ApprovalMode
+from .turn_state import RecoveryAction, RecoveryKind
 
 __all__ = [
     "APPROVAL_MODE_TEXT",
@@ -31,6 +32,8 @@ HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型�
 /session [会话ID]  列出或恢复会话
 /new  新建会话，保留旧会话
 /compact  压缩旧上下文，保留原始历史
+/retry  重试已保存但未得到回复的用户消息
+/continue、/terminate  继续或终止未完成的工具任务
 /clear  仅清理屏幕，保留历史
 /help  显示帮助
 Enter 发送；Shift+Enter 换行；Alt+Enter / F2 为换行备用键。
@@ -41,6 +44,25 @@ Esc 中断当前轮；Ctrl+C 运行时取消、空闲时退出；Ctrl+Q 取消�
 class CommandResult:
     action: str = "message"
     text: str = ""
+
+
+RECOVERY_COMMANDS = {
+    "/retry": RecoveryAction.RETRY,
+    "/continue": RecoveryAction.CONTINUE,
+    "/terminate": RecoveryAction.TERMINATE,
+}
+
+
+async def recover_turn(ops: Operations, action: RecoveryAction, *, stream: bool):
+    state = ops.recovery
+    expected = RecoveryKind.FAILED_USER if action is RecoveryAction.RETRY else RecoveryKind.INTERRUPTED_TURN
+    if state is None or state.kind is not expected:
+        raise ValueError("当前会话没有适用此操作的未完成任务。")
+    if action is RecoveryAction.RETRY:
+        return await ops.retry_failed_user(state.key, stream=stream)
+    if action is RecoveryAction.CONTINUE:
+        return await ops.continue_interrupted_turn(state.key, stream=stream)
+    return await ops.terminate_interrupted_turn(state.key)
 
 
 def safe_error(error: object) -> str:

@@ -21,6 +21,7 @@ from daphnis.tui.chat import ChatRow, ChatView, ToolGroup, patch_counts
 from daphnis.tui.input import PromptInput
 from daphnis.tui.model_picker import ModelPicker
 from daphnis.tui.status import UsageView
+from daphnis.turn_state import ABANDONED, TURN_STATE
 
 CATALOG = (
     ModelInfo(
@@ -166,6 +167,8 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
         def handler(request):
             body = json.loads(request.content)
             self.assertIn("tools", body)
+            if body["messages"][-1]["role"] == "tool":
+                return sse({"role": "assistant", "content": "已恢复任务"})
             self.assertEqual(body["messages"][-1]["role"], "user")
             return sse({"role": "assistant", "tool_calls": [{
                 "id": "list-1", "type": "function",
@@ -182,6 +185,11 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await until(pilot, lambda: any("主请求上限（1/1）" in row.text for row in ui.query(ChatRow)))
                 self.assertEqual([item["role"] for item in ops.message_snapshot()], ["user", "assistant", "tool"])
                 self.assertFalse(ui.query_one(PromptInput).disabled)
+                self.assertTrue(any("/continue" in row.text for row in ui.query(ChatRow)))
+                await submit(ui, pilot, "/continue")
+                await until(pilot, lambda: not ui._sending)
+                self.assertEqual([item["role"] for item in ops.message_snapshot()], ["user", "assistant", "tool", "assistant"])
+                self.assertTrue(any(row.text == "已恢复任务" for row in ui.query(ChatRow)))
 
     async def test_input_stream_clear_new_and_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -613,6 +621,7 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 await until(pilot, lambda: not ui._sending)
                 self.assertEqual(ops.message_snapshot(), [{"role": "user", "content": "wait"}])
+                self.assertTrue(any("/retry" in row.outcome for row in ui.query(ChatRow)))
                 self.assertFalse(app._closed)
                 self.assertFalse(ui.query_one(PromptInput).disabled)
                 await pilot.press("escape")
@@ -625,6 +634,6 @@ class TUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app._closed)
                 self.assertFalse(ops.running)
                 self.assertEqual(ops.message_snapshot(), [
-                    {"role": "user", "content": "wait"},
+                    {"role": "user", "content": "wait", TURN_STATE: ABANDONED},
                     {"role": "user", "content": "wait then quit"},
                 ])

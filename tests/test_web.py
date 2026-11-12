@@ -340,12 +340,41 @@ class WebTests(unittest.TestCase):
 
         self.command("new", session_id)
         self.command("restore", self.snapshot()["session_id"], id=session_id)
-        self.command("send", session_id, 202, prompt="继续")
+        recovery = self.snapshot()["state"]["recovery"]
+        self.assertEqual(recovery["kind"], "INTERRUPTED_TURN")
+        self.command("send", session_id, 409, prompt="继续")
+        self.command("continue", session_id, 202, key=recovery["key"])
         done = self.wait_for(lambda frame: not frame["status"]["running"])
         self.assertEqual(done["events"][-1]["data"]["status"], "COMPLETED")
         self.assertEqual(len(self.requests), 2)
-        self.assertEqual(self.requests[-1]["messages"][1:-1], messages)
+        self.assertEqual(self.requests[-1]["messages"][1:], messages)
         self.assertIn("tools", self.requests[-1])
+        self.command("terminate", session_id, 409, key=recovery["key"])
+
+    def test_failed_user_retry_and_terminate_actions_use_the_current_recovery_key(self):
+        session_id = self.snapshot()["session_id"]
+        self.command("send", session_id, 202, prompt="force-error")
+        failed = self.wait_for(lambda frame: frame["state"]["recovery"] and not frame["status"]["running"])
+        recovery = failed["state"]["recovery"]
+        self.assertEqual((recovery["kind"], recovery["message_index"]), ("FAILED_USER", 0))
+        self.command("retry", session_id, 202, key=recovery["key"])
+        retry = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(len(retry["state"]["messages"]), 1)
+        self.assertEqual(self.requests[0]["messages"], self.requests[1]["messages"])
+        self.command("retry", session_id, 409, key=recovery["key"])
+
+        self.command("send", session_id, 202, prompt="test patch")
+        waiting = self.wait_for(lambda frame: frame["status"]["approval"])
+        self.command("cancel", session_id, run_id=waiting["run"]["id"])
+        paused = self.wait_for(lambda frame: not frame["status"]["running"])
+        recovery = paused["state"]["recovery"]
+        self.command("terminate", session_id, 202, key=recovery["key"])
+        terminated = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertIsNone(terminated["state"]["recovery"])
+        self.assertEqual(terminated["events"][-1]["data"]["status"], "TERMINATED")
+        self.assertEqual(len(self.requests), 3)
+        result = json.loads(terminated["state"]["messages"][-1]["content"])
+        self.assertEqual(result["error"]["code"], "execution_skipped")
 
     def test_stream_redaction_stop_and_provider_error(self):
         session_id = self.snapshot()["session_id"]

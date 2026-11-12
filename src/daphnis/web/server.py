@@ -14,6 +14,8 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ..turn_state import RecoveryKind
+
 _MAX_BODY_BYTES = 256 * 1024
 _FIELDS = {
     "new": {},
@@ -24,9 +26,13 @@ _FIELDS = {
     "thinking": {"mode": (str, type(None))},
     "tools": {"names": list},
     "send": {"prompt": str},
+    "retry": {"key": str},
+    "continue": {"key": str},
+    "terminate": {"key": str},
     "cancel": {"run_id": str},
     "approve": {"request_id": str, "decision": str},
 }
+_RUN_ACTIONS = {"send", "retry", "continue", "terminate"}
 
 
 class RequestError(ValueError):
@@ -111,7 +117,20 @@ async def _execute(bridge, action, session, args):
         case "tools":
             await ops.set_tools(args["names"])
         case "send":
+            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+                raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
             bridge.start(args["prompt"])
+        case "retry" | "continue" | "terminate":
+            recovery = ops.recovery
+            kind = RecoveryKind.FAILED_USER if action == "retry" else RecoveryKind.INTERRUPTED_TURN
+            if recovery is None or recovery.kind is not kind or recovery.key != args["key"]:
+                raise RequestError("恢复状态已变化，请刷新后再操作。", 409)
+            operation = {
+                "retry": ops.retry_failed_user,
+                "continue": ops.continue_interrupted_turn,
+                "terminate": ops.terminate_interrupted_turn,
+            }[action]
+            bridge.start(None, operation=lambda: operation(recovery.key))
     return None
 
 
@@ -152,10 +171,10 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
                     raise RequestError("正在更新会话，请稍后重试。", 409)
                 async with bridge.lock:
                     notice = await _execute(bridge, action, session, args)
-            bridge._notify(state=action not in {"send", "cancel", "approve"})
+            bridge._notify(state=action not in _RUN_ACTIONS | {"cancel", "approve"})
             return JSONResponse(
                 {"notice": bridge.redactor.json(notice), "revision": bridge.revision},
-                202 if action == "send" else 200,
+                202 if action in _RUN_ACTIONS else 200,
             )
         except RequestError as exc:
             return JSONResponse({"error": str(exc)}, exc.status)

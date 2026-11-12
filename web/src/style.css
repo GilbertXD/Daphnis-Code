@@ -76,6 +76,8 @@ a { color: inherit; text-underline-offset: 3px; }
 .empty p:last-child { color: var(--muted); }
 .user-message, .assistant-message { line-height: 1.65; overflow-wrap: anywhere; }
 .user-message { margin: 0 0 24px; padding: 13px 16px; background: #ededed; border-radius: 4px; }
+.user-message.abandoned { color: #555; background: #f6f6f6; }
+.retry-mark { float: right; min-width: 24px; margin-left: 8px; padding: 0 5px; font-weight: 700; }
 .user-message > :first-child, .assistant-message > :first-child { margin-top: 0; }
 .user-message > :last-child, .assistant-message > :last-child { margin-bottom: 0; }
 .assistant-message { margin: 0 0 19px; }
@@ -130,6 +132,9 @@ th, td { border: 1px solid var(--line); padding: 4px 8px; }
 .tool-control { white-space: nowrap; }
 .send { width: 38px; height: 38px; padding: 0; flex-shrink: 0; border-radius: 2px; font-size: 1.23rem; }
 .notice { margin: 0 0 8px; font-size: .85rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.recovery { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px;
+  border-top: 1px solid var(--line); padding: 6px 0; font-size: .85rem; }
+.recovery .actions { margin: 0; }
 .approval { border: 1px solid var(--ink); padding: 10px 12px; margin-bottom: 8px; max-height: min(34dvh, 300px); overflow: auto; }
 .approval-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px; }
 .approval p, .approval details { font-size: .87rem; margin-top: 6px; }

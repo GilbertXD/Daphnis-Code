@@ -30,7 +30,10 @@ export type Message = {
   tool_calls?: ToolCall[] | null
   tool_call_id?: string
   daphnis_tool_state?: 'PENDING' | 'RUNNING'
+  daphnis_turn_state?: 'ABANDONED' | 'CONTINUE' | 'TERMINATED'
 }
+
+export type Recovery = { kind: 'FAILED_USER' | 'INTERRUPTED_TURN'; key: string; message_index: number }
 
 export type Approval = {
   request_id: string
@@ -99,6 +102,7 @@ type State = {
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
+  recovery: Recovery | null
   model: Model
   models: Model[]
   thinking: string | null
@@ -115,7 +119,7 @@ type Frame = {
   reset: boolean
   state?: State
   status: Status
-  run: { id: string; turn_id: string; session_id: string; prompt: string; base_count: number } | null
+  run: { id: string; turn_id: string; session_id: string; prompt: string | null; base_count: number } | null
   live: Record<string, LiveText>
   events: AgentEvent[]
 }

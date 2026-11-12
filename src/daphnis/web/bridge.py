@@ -140,6 +140,7 @@ class Bridge:
             "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
             "messages": ops.message_snapshot(),
+            "recovery": asdict(recovery) if (recovery := ops.recovery) else None,
             "model": _model_view(ops.model),
             "models": [
                 {**_model_view(model), "configured": ops.configured(provider)}
@@ -189,18 +190,18 @@ class Bridge:
             frame["state"] = self.state()
         return frame
 
-    def start(self, prompt):
+    def start(self, prompt, *, operation=None):
         session_id = self.ops.session.id
         self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
                     "base_count": len(self.ops.message_snapshot())}
         self.live.clear()
-        self.task = asyncio.create_task(self._send(prompt, session_id))
+        self.task = asyncio.create_task(self._send(prompt, session_id, operation))
         self._notify()
 
-    async def _send(self, prompt, session_id):
+    async def _send(self, prompt, session_id, operation):
         result = {"status": "FAILED", "error": "本轮未完成。"}
         try:
-            turn = await self.ops.send(prompt, stream=True)
+            turn = await (operation() if operation is not None else self.ops.send(prompt, stream=True))
             result = {
                 "status": turn.status,
                 "error": turn.error,

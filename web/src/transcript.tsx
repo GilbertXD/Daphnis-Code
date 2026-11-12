@@ -87,7 +87,7 @@ export function collectTools(events: AgentEvent[]) {
 }
 
 const states: Record<string, string> = {
-  COMPLETED: '完成', ERROR: '出错', FAILED: '失败', CANCELLED: '已停止', PAUSED_LIMIT: '预算暂停',
+  COMPLETED: '完成', ERROR: '出错', FAILED: '失败', CANCELLED: '已停止', PAUSED_LIMIT: '预算暂停', TERMINATED: '已终止',
 }
 
 export function ToolRow({ tool, locate, inspect }: {
@@ -135,8 +135,15 @@ function AssistantMessage({ text, thinking }: { text: string; thinking?: string 
   </article>
 }
 
-function UserMessage({ text }: { text: string }) {
-  return <article className="user-message"><RichText text={text} /></article>
+type Retry = { index: number; disabled: boolean; run: () => void }
+
+function UserMessage({ text, abandoned, retry }: { text: string; abandoned?: boolean; retry?: Retry }) {
+  return <article className={`user-message${abandoned ? ' abandoned' : ''}`}>
+    {retry && <button type="button" className="retry-mark" disabled={retry.disabled}
+      aria-label="重试此消息" title="尚无已保存回复，点击重试" onClick={retry.run}>!</button>}
+    <RichText text={text} />
+    {abandoned && <small>已作废</small>}
+  </article>
 }
 
 function savedResult(message: Message): { status: string; error?: unknown } {
@@ -151,10 +158,12 @@ function savedResult(message: Message): { status: string; error?: unknown } {
   return { status: '已保存' }
 }
 
-const Committed = memo(function Committed({ messages, tools, turns }: {
+const Committed = memo(function Committed({ messages, tools, turns, retry, recoveryTurn }: {
   messages: Message[]
   tools: TraceTool[]
   turns: { id: string; start: number; end: number }[]
+  retry?: Retry
+  recoveryTurn?: string
 }) {
   let calls: Message['tool_calls'] = null
   let request = 0
@@ -162,7 +171,8 @@ const Committed = memo(function Committed({ messages, tools, turns }: {
     if (message.role === 'user') {
       request = 0
       calls = null
-      return <UserMessage key={index} text={messageText(message)} />
+      return <UserMessage key={index} text={messageText(message)}
+        abandoned={message.daphnis_turn_state === 'ABANDONED'} retry={retry?.index === index ? retry : undefined} />
     }
     if (message.role === 'assistant') {
       request += 1
@@ -172,13 +182,16 @@ const Committed = memo(function Committed({ messages, tools, turns }: {
     if (message.role !== 'tool') return null
     const call = calls?.find(({ id }) => id === message.tool_call_id)
     const turn = turns.find(({ start, end }) => index >= start && index < end)
-    const observed = tools.find((tool) => tool.turn === turn?.id && tool.number === request && tool.id === message.tool_call_id)
+    const resumed = message.daphnis_tool_state && recoveryTurn
+      ? tools.find((tool) => tool.turn === recoveryTurn && tool.number === 0 && tool.id === message.tool_call_id)
+      : undefined
+    const observed = resumed ?? tools.find((tool) => tool.turn === turn?.id && tool.number === request && tool.id === message.tool_call_id)
     const id = message.tool_call_id ?? String(index)
     const saved = savedResult(message)
     const tool: TraceTool = {
       key: observed?.key ?? `saved-${index}`, id, turn: turn?.id ?? '', number: request,
       name: call?.function.name ?? '工具结果', ...saved,
-      events: [], ...observed, status: observed?.end != null ? observed.status : saved.status,
+      events: [], ...observed, status: resumed?.status ?? (observed?.end != null ? observed.status : saved.status),
       arguments: call?.function.arguments ?? observed?.arguments,
       content: typeof message.content === 'string' ? message.content : observed?.content,
     }
@@ -186,7 +199,7 @@ const Committed = memo(function Committed({ messages, tools, turns }: {
   })
 })
 
-export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) {
+export function Transcript({ view, tools, retry }: { view: View; tools: TraceTool[]; retry?: Retry }) {
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   useEffect(() => {
@@ -201,7 +214,7 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
   })
   const { run, live, events } = view
   const committed = run ? view.state.messages.slice(0, run.base_count) : view.state.messages
-  const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id) : []
+  const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id && tool.number > 0) : []
   const finished = run?.turn_id
     ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
     : []
@@ -220,9 +233,10 @@ export function Transcript({ view, tools }: { view: View; tools: TraceTool[] }) 
         <h2>今天要处理什么？</h2>
         <p>描述任务，或让 Agent 检查当前工作区。</p>
       </div>}
-      <Committed messages={committed} tools={tools} turns={turns} />
+      <Committed messages={committed} tools={tools} turns={turns} retry={retry}
+        recoveryTurn={run?.prompt === null ? run.turn_id : undefined} />
       {run && <>
-        <UserMessage text={run.prompt} />
+        {run.prompt !== null && <UserMessage text={run.prompt} />}
         {requests.map((number) => {
           const message = finished.find((event) => event.data.request_number === number)?.data.response?.choices?.[0]?.message
           return <div key={number}>

@@ -14,20 +14,36 @@ from .agent import TurnStatus, assistant_text
 from .app import Application
 from .config import environment_catalog, environment_connections, load_mcp_config
 from .operations import Operations
-from .terminal_commands import safe_error, sanitize_terminal, terminal_command
+from .terminal_commands import (
+    RECOVERY_COMMANDS,
+    recover_turn,
+    safe_error,
+    sanitize_terminal,
+    terminal_command,
+)
+from .turn_state import RecoveryKind
 
 
 async def execute(ops: Operations, prompt: str) -> int:
-    if prompt.lstrip().startswith("/"):
+    if action := RECOVERY_COMMANDS.get(prompt.strip()):
+        result = await recover_turn(ops, action, stream=False)
+    elif prompt.lstrip().startswith("/"):
         print(sanitize_terminal((await terminal_command(ops, prompt)).text))
         return 0
-    result = await ops.send(prompt, stream=False)
+    elif (recovery := ops.recovery) is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+        print("上轮任务未完成。请通过 -p /continue 继续，或 -p /terminate 终止。", file=sys.stderr)
+        return 3
+    else:
+        result = await ops.send(prompt, stream=False)
     if result.message is not None:
         print(sanitize_terminal(assistant_text(result.message)))
     if result.status == TurnStatus.COMPLETED:
         return 0
     if result.status == TurnStatus.PAUSED_LIMIT:
         print(sanitize_terminal(result.notice or result.status))
+        return 3
+    if result.status == TurnStatus.TERMINATED:
+        print("任务已终止。")
         return 3
     print(sanitize_terminal(safe_error(result.error or result.status)), file=sys.stderr)
     return 1
