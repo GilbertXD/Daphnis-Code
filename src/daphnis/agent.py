@@ -51,9 +51,9 @@ from .token_budget import TokenBudget, request_budget
 from .tool_state import (
     PENDING,
     RESUME_PROMPT,
-    RUNNING,
     TOOL_STATE,
     interrupted_tool_group,
+    resolve_tool_placeholders,
     stage_tool_group,
     update_tool_result,
 )
@@ -665,23 +665,14 @@ class Agent:
                 prefix = committed[:min(indices.values()) - 1]
                 if prefix and len(prefix) not in safe_boundaries(prefix):
                     raise ValueError("Cannot recover a tool group after an incomplete exchange.")
-                for call_id, index in indices.items():
-                    if committed[index].get(TOOL_STATE) == RUNNING:
-                        side_effects = True
-                        unknown = json.dumps({
-                            "ok": False,
-                            "source": "daphnis_recovery",
-                            "error": {
-                                "code": "execution_result_unknown",
-                                "message": "执行中断，工具可能已经产生副作用，请检查实际环境。",
-                            },
-                        }, ensure_ascii=False)
-                        await commit(update_tool_result(committed, index, call_id, content=unknown))
+                if not resuming and any(committed[index].get(TOOL_STATE) == PENDING for index in indices.values()):
+                    raise ValueError("上轮有尚未执行的工具调用。请发送「继续」以恢复。")
+                resolved, side_effects = resolve_tool_placeholders(committed, indices, terminate=False)
+                if resolved != committed:
+                    await commit(resolved)
                 pending = [
                     call for call in calls if committed[indices[call["id"]]].get(TOOL_STATE) == PENDING
                 ]
-                if pending and not resuming:
-                    raise ValueError("上轮有尚未执行的工具调用。请发送「继续」以恢复。")
                 if len(pending) > self.max_tool_calls:
                     raise RuntimeError("Maximum tool-call count exceeded.")
                 for call in pending:

@@ -5,6 +5,7 @@ from typing import Any
 from saturnus import Messages
 
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boundaries
+from .turn_state import project_turn_messages
 
 
 def history_range_hint(through: int) -> str:
@@ -37,4 +38,4 @@ class Context:
                 prompt += "\n\n" + history_range_hint(checkpoint.through)
         if prompt is not None:
             messages.insert(0, {"role": "system", "content": prompt})
-        return messages
+        return project_turn_messages(messages)

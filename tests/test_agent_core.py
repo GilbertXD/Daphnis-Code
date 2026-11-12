@@ -20,6 +20,13 @@ from daphnis import (
 )
 from daphnis.models import ModelInfo, provider_compatibility
 from daphnis.tool_state import RUNNING, TOOL_STATE
+from daphnis.turn_state import (
+    ABANDONED,
+    CONTINUE,
+    TURN_ATTEMPT,
+    TURN_STATE,
+    RecoveryKind,
+)
 from daphnis.usage import UsageTotals
 
 CATALOG = tuple(
@@ -92,6 +99,22 @@ def registry(handler=None):
 
 
 class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_v2_recovery_metadata_keeps_history_indices_and_filters_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(directory)
+            state = session()
+            state.messages.add_user("failed")
+            history.save(state)
+            restored = history.load(state.id)
+            self.assertEqual(restored.recovery.kind, RecoveryKind.FAILED_USER)
+            restored.messages.replace(0, {**restored.messages.get(0), TURN_STATE: ABANDONED})
+            restored.messages.add_user("retry", extra={TURN_STATE: CONTINUE, TURN_ATTEMPT: "attempt"})
+            history.save(restored)
+            restored = history.load(state.id)
+            self.assertEqual(restored.messages.get(0)["content"], "failed")
+            self.assertEqual(restored.recovery.message_index, 1)
+            self.assertEqual(Context().build(restored.messages), [{"role": "user", "content": "retry"}])
+
     async def test_conversation_commits_user_before_request_and_context_is_independent(self):
         requests = []
         state = session()

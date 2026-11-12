@@ -7,6 +7,7 @@ from uuid import uuid4
 from saturnus import Messages
 
 from .compaction import CompactionCheckpoint
+from .turn_state import RecoveryState, recovery_state
 from .usage import UsageTotals
 
 
@@ -23,6 +24,10 @@ class Session:
     _saved_revision: tuple[str, str] | None = field(default=None, repr=False, compare=False)
     title: str | None = None
     compaction: CompactionCheckpoint | None = None
+
+    @property
+    def recovery(self) -> RecoveryState | None:
+        return recovery_state(self.messages.snapshot(), self.id)
 
     def __post_init__(self) -> None:
         for name in ("id", "provider", "model_id"):

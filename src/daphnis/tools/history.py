@@ -9,6 +9,7 @@ from typing import Any
 from saturnus import Messages
 
 from ..redaction import Redactor
+from ..turn_state import ABANDONED, TURN_STATE
 from .approval import Decision, Operation, ToolError
 from .files import is_credential_path
 
@@ -65,6 +66,8 @@ def _tool_text(messages: Messages, index: int, message: dict[str, Any]) -> str |
 
 def _visible(messages: Messages, index: int, redactor: Redactor) -> tuple[str, str] | None:
     message = messages.get(index)
+    if message.get(TURN_STATE) == ABANDONED:
+        return None
     role = message["role"]
     if role == "tool":
         content = _tool_text(messages, index, message)

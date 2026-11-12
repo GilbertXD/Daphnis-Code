@@ -9,6 +9,7 @@ from typing import Any
 
 from .token_budget import DEFAULT_COUNTER, TokenCounter, request_budget
 from .tool_state import TOOL_STATE
+from .turn_state import ABANDONED, TURN_STATE, project_turn_messages
 
 Message = dict[str, Any]
 _SUMMARY_FIELDS = ("goals", "progress", "files", "next_steps")
@@ -132,7 +133,7 @@ def _retained_user(messages: list[Message], through: int) -> int | None:
     if through < len(messages) and messages[through]["role"] == "assistant":
         return next(
             (index for index in range(through - 1, -1, -1)
-             if messages[index]["role"] == "user"),
+             if messages[index]["role"] == "user" and messages[index].get(TURN_STATE) != ABANDONED),
             None,
         )
     return None
@@ -179,7 +180,7 @@ class Compactor:
         previous_end = previous.through if previous else 0
         latest_user = next(
             (index for index in range(len(messages) - 1, -1, -1)
-             if messages[index]["role"] == "user"),
+             if messages[index]["role"] == "user" and messages[index].get(TURN_STATE) != ABANDONED),
             0,
         )
         cuts = [cut for cut in safe_boundaries(messages) if previous_end < cut < len(messages)]
@@ -197,12 +198,12 @@ class Compactor:
             tail = messages[cut:]
             if retained is not None:
                 tail = [messages[retained], *tail]
-            tail = self.prune(tail)
+            tail = self.prune(project_turn_messages(tail))
             return request_budget(tail, {}, None, counter=self.counter).input_tokens
 
         through = cuts[-1]
         for cut in reversed(cuts):
-            if messages[cut]["role"] != "user":
+            if messages[cut]["role"] != "user" or messages[cut].get(TURN_STATE) == ABANDONED:
                 continue
             size = tail_tokens(cut)
             if size <= target:
@@ -254,7 +255,10 @@ class Compactor:
             indices = chain((prior_user,), indices)
         for index in indices:
             message = messages[index]
-            if index == retained_user or message["role"] in _PRIVILEGED_ROLES:
+            if (
+                index == retained_user or message["role"] in _PRIVILEGED_ROLES
+                or message.get(TURN_STATE) == ABANDONED
+            ):
                 continue
             metadata = {"message_index": index, "role": message["role"]}
             if "tool_call_id" in message:

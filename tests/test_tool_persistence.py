@@ -146,7 +146,8 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         first, second = tool_results(self.saved(resumed))
         self.assertEqual(json.loads(first["content"])["error"]["code"], "execution_result_unknown")
-        self.assertTrue(json.loads(second["content"])["ok"])
+        self.assertEqual(json.loads(second["content"])["error"]["code"], "execution_skipped")
+        self.assertFalse((self.root / "b.txt").exists())
 
     async def test_reload_requires_explicit_resume_and_rechecks_approval_and_targets(self):
         self.calls.extend(write_call(name, path=f"{name}.txt", content=name) for name in "cd")
@@ -157,14 +158,14 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             if event.data["tool_call_id"] == "a":
                 asyncio.current_task().cancel()
 
-        ops.subscribe("tool.executing", interrupt)
+        ops.subscribe("tool.started", interrupt)
         task = asyncio.create_task(ops.send("write files", stream=False))
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(task, 3)
         await ops.close()
         interrupted = self.saved(ops)
         self.assertEqual([msg[TOOL_STATE] for msg in tool_results(interrupted)],
-                         [RUNNING, PENDING, PENDING, PENDING])
+                         [PENDING, PENDING, PENDING, PENDING])
         self.assertFalse((self.root / "a.txt").exists())
 
         resumed = self.application(interactive=True, restore=ops.session.id)
@@ -177,16 +178,14 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked.status, TurnStatus.FAILED)
         self.assertIn("继续", blocked.error)
         self.assertEqual(len(self.requests), 1)
-        unknown = json.loads(tool_results(self.saved(resumed))[0]["content"])
-        self.assertEqual(unknown["source"], "daphnis_recovery")
-        self.assertEqual(unknown["error"]["code"], "execution_result_unknown")
+        self.assertEqual(self.saved(resumed), interrupted)
 
         approvals, executed = asyncio.Queue(), []
         resumed.subscribe("tool.approval_requested", approvals.put_nowait)
         resumed.subscribe("tool.executing", lambda event: executed.append(event.data["tool_call_id"]))
         task = asyncio.create_task(resumed.send("继续", stream=False))
         try:
-            for name, decision in (("b", "deny"), ("c", "allow_once"), ("d", "allow_once")):
+            for name, decision in (("a", "deny"), ("b", "deny"), ("c", "allow_once"), ("d", "allow_once")):
                 event = await asyncio.wait_for(approvals.get(), 2)
                 self.assertEqual(event.data["tool_call_id"], name)
                 if name == "c":
@@ -205,7 +204,7 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.root / "d.txt").read_text(), "d")
         saved = self.saved(resumed)
         results = [json.loads(msg["content"]) for msg in tool_results(saved)]
-        self.assertEqual(results[0], unknown)
+        self.assertEqual(results[0]["error"]["code"], "permission_denied")
         self.assertEqual([value["error"]["code"] for value in results[1:3]],
                          ["permission_denied", "target_changed"])
         self.assertTrue(results[3]["ok"])
