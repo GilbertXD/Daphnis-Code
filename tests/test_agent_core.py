@@ -18,15 +18,18 @@ from daphnis import (
     Session,
     TurnStatus,
 )
+from daphnis.compaction import CompactionCheckpoint
 from daphnis.models import ModelInfo, provider_compatibility
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.turn_state import (
     ABANDONED,
     CONTINUE,
+    TERMINATED,
     TURN_ATTEMPT,
     TURN_STATE,
     RecoveryAction,
     RecoveryKind,
+    project_terminated_turns,
 )
 from daphnis.usage import UsageTotals
 
@@ -100,6 +103,55 @@ def registry(handler=None):
 
 
 class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
+    def test_context_projects_only_the_last_complete_group_of_a_terminated_turn(self):
+        call = tool_call()
+        for content in ("original text", '[1, 2]', [{"type": "text", "text": "original part"}]):
+            with self.subTest(content=content):
+                history = Messages()
+                history.add_user("terminated", extra={TURN_STATE: TERMINATED})
+                history.add_assistant(extra={"tool_calls": [call]})
+                history.add_tool_result(tool_call_id=call["id"], content="earlier group")
+                history.add_assistant(extra={"tool_calls": [call]})
+                history.add_tool_result(tool_call_id=call["id"], content=content)
+                history.add_user("new task")
+                history.add_assistant(extra={"tool_calls": [call]})
+                history.add_tool_result(tool_call_id=call["id"], content="later turn")
+                original = history.snapshot()
+
+                working = Context().build(history)
+                self.assertNotIn(TURN_STATE, working[0])
+                self.assertEqual(working[1:4], original[1:4])
+                self.assertEqual(working[5:], original[5:])
+                annotated = working[4]["content"]
+                if isinstance(content, list):
+                    self.assertEqual(annotated[:-1], content)
+                    self.assertIn("terminated", annotated[-1]["text"])
+                else:
+                    self.assertTrue(annotated.startswith(content + "\n\n"))
+                    self.assertIn("terminated", annotated)
+                projected = project_terminated_turns(original)
+                self.assertEqual(project_terminated_turns(projected), projected)
+                summary = '{"goals":"task","progress":"","files":"","next_steps":""}'
+                retained = Context().build(history, CompactionCheckpoint(3, summary))
+                self.assertEqual(retained[2:], working[:1] + working[3:])
+                removed = Context().build(history, CompactionCheckpoint(5, summary))
+                self.assertEqual(removed[2:], original[5:])
+                self.assertEqual(history.snapshot(), original)
+
+    def test_terminated_turn_keeps_existing_recovery_results(self):
+        calls = [tool_call("a"), tool_call("b")]
+        for code in ("execution_skipped", "execution_result_unknown"):
+            with self.subTest(code=code):
+                history = Messages()
+                history.add_user("terminated", extra={TURN_STATE: TERMINATED})
+                history.add_assistant(extra={"tool_calls": calls})
+                history.add_tool_result(tool_call_id="a", content=json.dumps({
+                    "ok": False, "source": "daphnis_recovery", "error": {"code": code},
+                }))
+                history.add_tool_result(tool_call_id="b", content='{"ok": true}')
+                original = history.snapshot()
+                self.assertEqual(Context().build(history)[1:], original[1:])
+
     async def test_retry_reuses_user_and_new_prompt_abandons_failed_user(self):
         requests = []
         state = session()

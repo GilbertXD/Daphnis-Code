@@ -74,8 +74,10 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         for terminate in (False, True):
             with self.subTest(terminate=terminate):
                 self.requests.clear()
-                ops = self.application(max_primary_requests=1)
-                paused = await ops.send("write files", stream=False)
+                ops = self.application(interactive=terminate, max_primary_requests=1)
+                if terminate:
+                    self.approve_writes(ops)
+                paused = await asyncio.wait_for(ops.send("write files", stream=False), 3)
                 self.assertEqual(paused.status, TurnStatus.PAUSED_LIMIT)
                 original = tool_results(self.saved(ops))
                 resumed = self.application(restore=ops.session.id)
@@ -87,6 +89,12 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     resumed.restore_session(ops.session.id)
                     self.assertIsNone(resumed.recovery)
                     self.assertEqual((await resumed.send("new task", stream=False)).status, TurnStatus.COMPLETED)
+                    projected = tool_results(self.requests[-1])
+                    self.assertEqual(projected[:-1], original[:-1])
+                    last = json.loads(projected[-1]["content"])
+                    self.assertEqual(last.pop("_daphnis_runtime"), {"turn_terminated_by_user": True})
+                    self.assertTrue(last["ok"])
+                    self.assertEqual(last, json.loads(original[-1]["content"]))
                 else:
                     result = await resumed.continue_interrupted_turn(key, stream=False)
                     self.assertEqual(result.status, TurnStatus.COMPLETED)
