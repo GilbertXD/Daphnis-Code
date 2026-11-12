@@ -25,6 +25,7 @@ from daphnis.turn_state import (
     CONTINUE,
     TURN_ATTEMPT,
     TURN_STATE,
+    RecoveryAction,
     RecoveryKind,
 )
 from daphnis.usage import UsageTotals
@@ -99,6 +100,55 @@ def registry(handler=None):
 
 
 class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_reuses_user_and_new_prompt_abandons_failed_user(self):
+        requests = []
+        state = session()
+
+        def handler(request):
+            requests.append(json.loads(request.content)["messages"])
+            return httpx.Response(500, json={"error": "unavailable"}) if len(requests) < 3 else httpx.Response(200, json=reply())
+
+        async with make_client(handler) as client:
+            agent = make_agent(client)
+            first = await agent.run(session=state, prompt="original")
+            self.assertEqual(first.status, TurnStatus.FAILED)
+            key = state.recovery.key
+            retry = await agent.run(session=state, recovery_action=RecoveryAction.RETRY, recovery_key=key)
+            self.assertEqual(retry.status, TurnStatus.FAILED)
+            self.assertEqual(requests[0], requests[1])
+            self.assertEqual(len(state.messages), 1)
+            self.assertNotEqual(state.recovery.key, key)
+            stale = await agent.run(session=state, recovery_action=RecoveryAction.RETRY, recovery_key=key)
+            self.assertEqual(stale.status, TurnStatus.FAILED)
+            self.assertEqual(len(requests), 2)
+            new = await agent.run(session=state, prompt="replacement")
+        self.assertEqual(new.status, TurnStatus.COMPLETED)
+        self.assertEqual(requests[2], [{"role": "user", "content": "replacement"}])
+        self.assertEqual(state.messages.get(0)["content"], "original")
+        self.assertEqual(state.messages.get(0)[TURN_STATE], ABANDONED)
+        self.assertIsNone(state.recovery)
+
+    async def test_cancellation_during_final_save_uses_the_committed_reply(self):
+        state = session()
+        entered, release = asyncio.Event(), asyncio.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(directory)
+
+            async def persist(candidate):
+                if candidate.messages.get(-1)["role"] == "assistant":
+                    entered.set()
+                    await release.wait()
+                await history.save_async(candidate)
+
+            async with make_client(lambda _: httpx.Response(200, json=reply())) as client:
+                task = asyncio.create_task(make_agent(client).run(session=state, prompt="request", persist=persist))
+                await asyncio.wait_for(entered.wait(), 2)
+                task.cancel()
+                release.set()
+                result = await asyncio.wait_for(task, 2)
+            self.assertEqual(result.status, TurnStatus.COMPLETED)
+            self.assertIsNone(history.load(state.id).recovery)
+
     def test_v2_recovery_metadata_keeps_history_indices_and_filters_context(self):
         with tempfile.TemporaryDirectory() as directory:
             history = History(directory)
@@ -673,7 +723,10 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(finished[-1].data["status"], "CANCELLED")
             self.assertTrue(finished[-1].data["external_side_effects_possible"])
             self.assertEqual([event.data["tool_call_id"] for event in tool_finished], ["call-1"])
-            result = await agent.run(session=state, prompt="继续", persist=history.save_async)
+            result = await agent.run(
+                session=state, recovery_action=RecoveryAction.CONTINUE,
+                recovery_key=state.recovery.key, persist=history.save_async,
+            )
             self.assertEqual(result.status, TurnStatus.COMPLETED)
             self.assertEqual(
                 json.loads(state.messages.get(-2)["content"])["error"]["code"],
@@ -757,7 +810,7 @@ class AgentCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("Session changed", result.error)
         self.assertTrue(result.external_side_effects_possible)
-        self.assertEqual(state.messages.snapshot()[:-2], [*original, {"role": "user", "content": "use tool"}])
+        self.assertEqual(state.messages.snapshot()[:-2], [{**original[0], TURN_STATE: ABANDONED}, {"role": "user", "content": "use tool"}])
         self.assertEqual(state.messages.get(-1)[TOOL_STATE], RUNNING)
 
     async def test_provider_and_tool_capabilities_are_checked_before_request(self):

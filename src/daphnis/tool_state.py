@@ -8,7 +8,6 @@ from saturnus import Messages
 TOOL_STATE = "daphnis_tool_state"
 PENDING = "PENDING"
 RUNNING = "RUNNING"
-RESUME_PROMPT = "继续"
 _UNKNOWN = "execution_result_unknown"
 
 

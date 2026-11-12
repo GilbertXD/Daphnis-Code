@@ -386,7 +386,7 @@ asyncio.run(main())
                 self.assertEqual(saved.usage.total_tokens, 5)
                 peer.restore_session(seed.id)
                 self.assertEqual((await peer.send("retry", stream=False)).status, TurnStatus.FAILED)
-                self.assertEqual((await peer.send("继续", stream=False)).status, TurnStatus.COMPLETED)
+                self.assertEqual((await peer.continue_interrupted_turn(peer.recovery.key, stream=False)).status, TurnStatus.COMPLETED)
                 self.assertFalse((root / "effect").exists())
             finally:
                 if process is not None and process.returncode is None:

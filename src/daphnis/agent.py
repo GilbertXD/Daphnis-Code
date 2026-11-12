@@ -50,7 +50,6 @@ from .session import Session
 from .token_budget import TokenBudget, request_budget
 from .tool_state import (
     PENDING,
-    RESUME_PROMPT,
     TOOL_STATE,
     interrupted_tool_group,
     resolve_tool_placeholders,
@@ -58,6 +57,16 @@ from .tool_state import (
     update_tool_result,
 )
 from .tools import ToolExecutor
+from .turn_state import (
+    ABANDONED,
+    CONTINUE,
+    TERMINATED,
+    TURN_ATTEMPT,
+    TURN_STATE,
+    RecoveryAction,
+    RecoveryKind,
+    recovery_state,
+)
 
 _ACTIVE_SESSIONS: set[str] = set()
 
@@ -65,6 +74,7 @@ _ACTIVE_SESSIONS: set[str] = set()
 class TurnStatus(StrEnum):
     COMPLETED = "COMPLETED"
     PAUSED_LIMIT = "PAUSED_LIMIT"
+    TERMINATED = "TERMINATED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
 
@@ -244,7 +254,8 @@ class Agent:
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             Agent._validate_tool_calls(calls)
-        message.pop(TOOL_STATE, None)
+        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT):
+            message.pop(field, None)
         return message, reason
 
     @staticmethod
@@ -332,7 +343,7 @@ class Agent:
         )
         raw = session.messages.snapshot()
         if raw and len(raw) not in safe_boundaries(raw):
-            raise ValueError("工具交换尚未完成。请先发送「继续」。")
+            raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
         through = compactor.cut(raw, previous)
         if through is None:
@@ -446,7 +457,9 @@ class Agent:
         self,
         *,
         session: Session,
-        prompt: str,
+        prompt: str | None = None,
+        recovery_action: RecoveryAction | None = None,
+        recovery_key: str | None = None,
         stream: bool = False,
         thinking_mode: str | None = None,
         output_limit: int | None = None,
@@ -483,8 +496,16 @@ class Agent:
                     "Session provider does not match the ChatClient connection."
                 )
             model = resolve_model(provider, model_id, catalog=self._catalog)
-            if not isinstance(prompt, str):
-                raise TypeError("prompt must be a string.")
+            recovery = recovery_state(committed, session_id)
+            if recovery_action is None:
+                if not isinstance(prompt, str):
+                    raise TypeError("prompt must be a string.")
+                if recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+                    raise ValueError("上轮任务未完成，请先选择继续或终止。")
+            else:
+                kind = RecoveryKind.FAILED_USER if recovery_action is RecoveryAction.RETRY else RecoveryKind.INTERRUPTED_TURN
+                if prompt is not None or recovery is None or recovery.kind is not kind or recovery.key != recovery_key:
+                    raise ValueError("恢复状态已变化，请刷新后再操作。")
             interrupted = interrupted_tool_group(committed)
             tools = (
                 self.tools.bind(session=session, events=self.events, turn_id=turn_id)
@@ -644,13 +665,49 @@ class Agent:
                 return response, request_fields
 
             await _checkpoint()
-            resuming = interrupted is not None and prompt.strip() == RESUME_PROMPT
-            if interrupted is None:
+            pending = []
+            if recovery_action is None:
                 if committed and len(committed) not in safe_boundaries(committed):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
                 working = Messages(committed)
+                if recovery is not None:
+                    index = recovery.message_index
+                    working.replace(index, {**committed[index], TURN_STATE: ABANDONED})
                 working.add_user(prompt)
                 await commit(working.snapshot())
+            else:
+                snapshot = committed.copy()
+                terminating = recovery_action is RecoveryAction.TERMINATE
+                if interrupted is not None:
+                    calls, indices = interrupted
+                    self._validate_tool_calls(calls)
+                    prefix = committed[:min(indices.values()) - 1]
+                    if prefix and len(prefix) not in safe_boundaries(prefix):
+                        raise ValueError("Cannot recover a tool group after an incomplete exchange.")
+                    snapshot, side_effects = resolve_tool_placeholders(snapshot, indices, terminate=terminating)
+                elif len(snapshot) not in safe_boundaries(snapshot):
+                    raise ValueError("Cannot recover an incomplete tool exchange.")
+                index = recovery.message_index
+                snapshot[index] = {
+                    **snapshot[index],
+                    TURN_STATE: TERMINATED if terminating else CONTINUE,
+                    TURN_ATTEMPT: turn_id,
+                }
+                if terminating:
+                    try:
+                        await commit(snapshot)
+                    except asyncio.CancelledError:
+                        if committed != snapshot:
+                            raise
+                    status = TurnStatus.TERMINATED
+                    return TurnResult(session_id, turn_id, status, external_side_effects_possible=side_effects)
+                pending = [] if interrupted is None else [
+                    (call, indices[call["id"]]) for call in calls
+                    if snapshot[indices[call["id"]]].get(TOOL_STATE) == PENDING
+                ]
+                if len(pending) > self.max_tool_calls:
+                    raise RuntimeError("Maximum tool-call count exceeded.")
+                await commit(snapshot)
             body = prepare_request_options(
                 model=model,
                 thinking_mode=thinking_mode,
@@ -659,28 +716,10 @@ class Agent:
                 extra_body=extra_body,
                 custom_compatibility=self._custom_compatibility,
             )
-            if interrupted is not None:
-                calls, indices = interrupted
-                self._validate_tool_calls(calls)
-                prefix = committed[:min(indices.values()) - 1]
-                if prefix and len(prefix) not in safe_boundaries(prefix):
-                    raise ValueError("Cannot recover a tool group after an incomplete exchange.")
-                if not resuming and any(committed[index].get(TOOL_STATE) == PENDING for index in indices.values()):
-                    raise ValueError("上轮有尚未执行的工具调用。请发送「继续」以恢复。")
-                resolved, side_effects = resolve_tool_placeholders(committed, indices, terminate=False)
-                if resolved != committed:
-                    await commit(resolved)
-                pending = [
-                    call for call in calls if committed[indices[call["id"]]].get(TOOL_STATE) == PENDING
-                ]
-                if len(pending) > self.max_tool_calls:
-                    raise RuntimeError("Maximum tool-call count exceeded.")
-                for call in pending:
-                    await process_tool(call, indices[call["id"]], {**fields, "request_number": 0})
+            if recovery_action is not None:
+                for call, index in pending:
+                    await process_tool(call, index, {**fields, "request_number": 0})
                 working = Messages(committed)
-                if not resuming:
-                    working.add_user(prompt)
-                    await commit(working.snapshot())
             while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
@@ -749,7 +788,12 @@ class Agent:
                 if reason == "stop":
                     working.add(message)
                     await _checkpoint()
-                    await commit(working.snapshot())
+                    snapshot = working.snapshot()
+                    try:
+                        await commit(snapshot)
+                    except asyncio.CancelledError:
+                        if committed != snapshot:
+                            raise
                     final_message = deepcopy(message)
                     status = TurnStatus.COMPLETED
                     break
@@ -774,7 +818,7 @@ class Agent:
                     limit_reason = f"达到模型总请求上限（{requests}/{self.max_total_requests}）"
                 else:
                     limit_reason = "可用于上下文压缩的请求额度不足"
-                notice = f"本轮{limit_reason}，进度已保存。发送「继续」可接着处理。"
+                notice = f"本轮{limit_reason}，进度已保存。请选择继续或终止。"
         except asyncio.CancelledError:
             status = TurnStatus.CANCELLED
             error = "Turn cancelled; executed tool side effects are not rolled back."

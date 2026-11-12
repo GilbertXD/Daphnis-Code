@@ -15,6 +15,7 @@ from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .session import Session
 from .tools import ApprovalDecision, ApprovalMode
+from .turn_state import RecoveryAction, RecoveryState
 
 if TYPE_CHECKING:
     from .agent import TurnResult
@@ -349,6 +350,19 @@ class Operations:
 
     async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream)
+
+    @property
+    def recovery(self) -> RecoveryState | None:
+        return self._app._session.recovery
+
+    async def retry_failed_user(self, key: str, *, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key)
+
+    async def continue_interrupted_turn(self, key: str, *, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(stream=stream, recovery_action=RecoveryAction.CONTINUE, recovery_key=key)
+
+    async def terminate_interrupted_turn(self, key: str) -> "TurnResult":
+        return await self._app._run_turn(recovery_action=RecoveryAction.TERMINATE, recovery_key=key)
 
     async def compact(self) -> CompactionCheckpoint | None:
         return await self._app._compact_session()

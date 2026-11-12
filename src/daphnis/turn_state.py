@@ -16,6 +16,12 @@ class RecoveryKind(StrEnum):
     INTERRUPTED_TURN = "INTERRUPTED_TURN"
 
 
+class RecoveryAction(StrEnum):
+    RETRY = "retry"
+    CONTINUE = "continue"
+    TERMINATE = "terminate"
+
+
 @dataclass(frozen=True)
 class RecoveryState:
     kind: RecoveryKind

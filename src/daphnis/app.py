@@ -42,6 +42,7 @@ from .tools import (
     ToolExecutor,
     create_tools,
 )
+from .turn_state import RecoveryAction
 from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
@@ -385,13 +386,18 @@ class Application:
         self._approval.set_result(decision)
         return True
 
-    async def _run_turn(self, prompt: str, *, stream: bool = True) -> TurnResult:
+    async def _run_turn(
+        self, prompt: str | None = None, *, stream: bool = True,
+        recovery_action: RecoveryAction | None = None, recovery_key: str | None = None,
+    ) -> TurnResult:
         self._ensure_idle()
+        session = self._session
         if self._mcp_pending:
             async with self._state_lock:
                 await self._refresh_pending_mcp()
-                self._ensure_open()
-        session = self._session
+                self._ensure_idle()
+                if self._session is not session:
+                    raise RuntimeError("会话已变化，请刷新后再操作。")
         thinking = session.thinking
         available = set(self._all_tools)
         enabled_tools = [name for name in session.enabled_tools if name in available]
@@ -436,6 +442,8 @@ class Application:
                     result = await agent.run(
                         session=session,
                         prompt=prompt,
+                        recovery_action=recovery_action,
+                        recovery_key=recovery_key,
                         stream=stream,
                         thinking_mode=thinking,
                         persist=persist,
