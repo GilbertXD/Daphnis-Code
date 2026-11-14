@@ -374,7 +374,10 @@ class Compactor:
         return through
 
     @staticmethod
-    def prune(messages: list[Message], *, include_latest: bool = False) -> list[Message]:
+    def prune(
+        messages: list[Message], *, include_latest: bool = False,
+        history_tool_ids: dict[str, int] | None = None,
+    ) -> list[Message]:
         """Replace long tool payloads only in this detached request view."""
         end = len(messages)
         if not include_latest:
@@ -389,7 +392,10 @@ class Compactor:
                 content = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
             if len(content) <= 640:
                 continue
-            preview = content[:256] + "\n[Tool output excerpt. Full result retained in session history.]\n" + content[-256:]
+            note = "[Tool output excerpt. Full result retained in session history.]"
+            if history_tool_ids and (message_id := history_tool_ids.get(message["tool_call_id"])) is not None:
+                note = f"[Tool output excerpt. Use history_read with message_id={message_id} and page via next_start.]"
+            preview = content[:256] + "\n" + note + "\n" + content[-256:]
             pruned[index] = {**message, "content": preview}
         return pruned
 

@@ -12,7 +12,9 @@ def history_range_hint(through: int) -> str:
     return (
         "Earlier session messages have been compacted. Original visible records may be "
         "retrieved using history_search and history_read. "
-        f"Compacted message range: [0, {through})."
+        f"Compacted message range: [0, {through}). "
+        "Use history_read with a cited message_id. history_search matches a single contiguous "
+        "substring, so search an exact error code or identifier by itself."
     )
 
 

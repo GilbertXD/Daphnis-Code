@@ -28,6 +28,7 @@ from daphnis.compaction import (
 )
 from daphnis.compaction_settings import CompactionSettings
 from daphnis.models import ModelInfo
+from daphnis.redaction import Redactor
 from daphnis.terminal_commands import terminal_command
 from daphnis.token_budget import TokenCounter, request_budget
 from daphnis.tools import create_tools
@@ -493,6 +494,52 @@ SMALL_MODEL = ModelInfo("model-a", "compatible", context_window=1200, supports_t
 
 
 class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_preview_reads_omitted_text_by_original_message_id(self):
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        state = Session(directory, "compatible", "model-a")
+        secret = "synthetic-connection-value"
+        content = json.dumps({"content": "a" * 300 + secret + " critical middle " + "b" * 400})
+        state.messages.add_user("Earlier request")
+        for call_id, path in (("visible", "notes.txt"), ("protected", ".env"),
+                              ("duplicate", "first.txt"), ("duplicate", "second.txt")):
+            state.messages.add_assistant(extra={"tool_calls": [
+                tool_call(call_id, name="read_file", arguments=json.dumps({"path": path})),
+            ]})
+            state.messages.add_tool_result(tool_call_id=call_id, content=content)
+        state.messages.add_assistant("Earlier answer")
+        original = state.messages.snapshot()
+        requests = []
+
+        def handler(request):
+            messages = json.loads(request.content)["messages"]
+            requests.append(messages)
+            if len(requests) == 1:
+                return httpx.Response(400, json={"error": {"code": "context_window_exceeded"}})
+            if len(requests) == 2:
+                previews = [m["content"] for m in messages if m["role"] == "tool"]
+                self.assertIn("message_id=2", previews[0])
+                self.assertNotIn("critical middle", previews[0])
+                self.assertTrue(all("history_read" not in preview for preview in previews[1:]))
+                return httpx.Response(200, json=reply(None, finish="tool_calls", calls=[
+                    tool_call("lookup", name="history_read", arguments='{"message_id":2}'),
+                ]))
+            page = json.loads(messages[-1]["content"])
+            self.assertIn("[REDACTED] critical middle", page["content"])
+            self.assertNotIn(secret, page["content"])
+            return httpx.Response(200, json=reply())
+
+        tools = create_tools(redactor=Redactor([secret])).select(["history_search", "history_read"])
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=CATALOG, tools=tools,
+                compaction_settings=CompactionSettings(auto_enabled=False),
+            )
+            result = await agent.run(session=state, prompt="Read the omitted text")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(state.messages.snapshot()[:len(original)], original)
+
     async def test_fixed_threshold_triggers_summary_without_shrinking_maintenance_window(self):
         state = session()
         state.messages.add_user("past data " * 160)

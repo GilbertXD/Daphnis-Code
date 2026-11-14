@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -59,6 +60,7 @@ from .tool_state import (
     update_tool_result,
 )
 from .tools import ToolExecutor
+from .tools.history import can_read_tool_history
 from .turn_state import (
     ABANDONED,
     CONTINUE,
@@ -452,7 +454,17 @@ class Agent:
         error = None
         failure_reason = None
         try:
-            pruned = compactor.prune(messages)
+            raw = history.snapshot() if history_lookup or self.compaction_settings.auto_enabled else []
+            history_tool_ids = {}
+            if history_lookup:
+                counts = Counter(message["tool_call_id"] for message in raw if message["role"] == "tool")
+                history_tool_ids = {
+                    message["tool_call_id"]: index
+                    for index, message in enumerate(raw)
+                    if message["role"] == "tool" and counts[message["tool_call_id"]] == 1
+                    and can_read_tool_history(history, index, message)
+                }
+            pruned = compactor.prune(messages, history_tool_ids=history_tool_ids)
             budget = self._request_budget(pruned, body, model)
             messages = pruned
             if self.compaction_settings.auto_enabled and (
@@ -462,7 +474,6 @@ class Agent:
                     budget.compaction_threshold if budget.needs_compaction
                     else budget.hard_input_limit
                 )
-                raw = history.snapshot()
                 input_target = available
                 if available is not None:
                     privileged = Messages([
@@ -485,9 +496,10 @@ class Agent:
                     attempted_cuts.add(cut_key)
 
                     def project_candidate(candidate: CompactionCheckpoint) -> list[dict[str, Any]]:
-                        return compactor.prune(self._model_context(
-                            history, candidate, history_lookup=history_lookup,
-                        ))
+                        return compactor.prune(
+                            self._model_context(history, candidate, history_lookup=history_lookup),
+                            history_tool_ids=history_tool_ids,
+                        )
 
                     try:
                         candidate = await self._shorter_checkpoint(
@@ -508,7 +520,7 @@ class Agent:
                             status = "staged"
             if overflow or budget.needs_compaction or budget.needs_safety_compaction:
                 # The latest exchange can itself be oversized. Keep its IDs and excerpts.
-                messages = compactor.prune(messages, include_latest=True)
+                messages = compactor.prune(messages, include_latest=True, history_tool_ids=history_tool_ids)
             return checkpoint, messages
         except asyncio.CancelledError:
             status = "cancelled"

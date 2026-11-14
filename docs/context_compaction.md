@@ -64,7 +64,7 @@ context_window = 64000
 
 ## 历史回查
 
-在支持工具的会话中可启用 `history_search`、`history_read` 和 `history_operations`。需要为已有会话增加工具时，可用终端命令 `/tools on history_search history_read history_operations`。主模型请求存在压缩检查点，且同时启用了搜索和读取工具时，上下文说明会提示可回查的范围 `[0, through)`。该提示只描述消息范围。
+在支持工具的会话中可启用 `history_search`、`history_read` 和 `history_operations`。需要为已有会话增加工具时，可用终端命令 `/tools on history_search history_read history_operations`。主模型请求存在压缩检查点，且同时启用了搜索和读取工具时，上下文说明会提示可回查的范围 `[0, through)`。符合回查规则的工具结果预览会提示原始 `message_id`。用该 ID 从第一页读取，再按 `next_start` 翻页。
 
 ```text
 history_search({"query":"发布标记","limit":5})

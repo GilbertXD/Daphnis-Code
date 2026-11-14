@@ -64,6 +64,10 @@ def _tool_text(messages: Messages, index: int, message: dict[str, Any]) -> str |
     return message["content"]
 
 
+def can_read_tool_history(messages: Messages, index: int, message: dict[str, Any]) -> bool:
+    return message.get(TURN_STATE) != ABANDONED and _tool_text(messages, index, message) is not None
+
+
 def _visible(messages: Messages, index: int, redactor: Redactor) -> tuple[str, str] | None:
     message = messages.get(index)
     if message.get(TURN_STATE) == ABANDONED:
