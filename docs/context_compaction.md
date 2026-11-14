@@ -79,6 +79,14 @@ history_operations({"start":0,"limit":10})
 
 可回查用户和助手的可见文本，以及来源可核对的内置工具结果。系统和开发者消息、私有推理、工具参数、受保护凭据文件的结果、外部工具及历史回查工具自身的结果在可见范围外。回查不访问其他会话，所有返回内容只作历史数据使用。工具执行继续遵循当前审批模式和硬编码权限规则。
 
+### 可选 Retrieval / RAG
+
+在 CLI 或 Web 的服务端环境设置 `DAPHNIS_RETRIEVAL=bm25`、`semantic` 或 `hybrid`。未设置时使用 `history_search`。启用后由 `retrieval` 提供搜索，`history_read` 和 `history_operations` 继续可用。恢复会话时，原来选择的搜索工具会映射为当前配置提供的搜索工具。
+
+`retrieval` 按相关性返回当前会话的脱敏片段，附原始 `message_id` 和可直接传给 `history_read` 的字符区间。BM25 在本地运行。Semantic 用向量相似度排序，Hybrid 融合 BM25 和向量排名。模型通过工具调用获取片段，压缩检查点无需重建。
+
+向量检索使用 OpenAI 兼容的 Embedding 服务。设置完整端点 `DAPHNIS_EMBEDDING_URL`、模型 `DAPHNIS_EMBEDDING_MODEL`，以及可选的 `DAPHNIS_EMBEDDING_DIMENSIONS` 和 `DAPHNIS_EMBEDDING_API_KEY`。配置的服务会收到脱敏后的查询和当前会话可回查的文本片段。服务不可用、未配置或索引超过向量上限时，工具回退到 BM25，并返回 `fallback` 原因。
+
 ## 提交、取消与持久化
 
 自动压缩在轮内暂存检查点，并在下一次消息提交时与原始消息一起保存。暂停、失败或取消后，最近一次成功保存的历史和检查点继续生效。未完成的工具组可以保存在原始历史末尾。主请求和手动压缩都必须等该工具组补齐，历史回查只索引有可见结果的调用。恢复方式见[工具状态与中断恢复](architecture.md#工具状态与中断恢复)。

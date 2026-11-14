@@ -8,7 +8,12 @@ from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boun
 from .turn_state import project_terminated_turns, project_turn_messages
 
 
-def history_range_hint(through: int) -> str:
+def history_range_hint(through: int, *, retrieval: bool = False) -> str:
+    if retrieval:
+        return (
+            "Earlier session messages have been compacted. Use retrieval to find original visible evidence "
+            f"in this Session and history_read to read exact pages. Compacted message range: [0, {through})."
+        )
     return (
         "Earlier session messages have been compacted. Original visible records may be "
         "retrieved using history_search and history_read. "
@@ -26,7 +31,7 @@ class Context:
 
     def build(
         self, working_messages: Messages, checkpoint: CompactionCheckpoint | None = None,
-        *, summary_reasoning: bool = False, history_lookup: bool = False,
+        *, summary_reasoning: bool = False, history_lookup: bool | str = False,
     ) -> list[dict[str, Any]]:
         """Build the protocol-ready Working view from committed messages."""
         messages = working_messages.snapshot()
@@ -37,7 +42,7 @@ class Context:
             messages = project(messages, checkpoint, summary_reasoning=summary_reasoning)
             prompt = f"{prompt}\n\n{SUMMARY_POLICY}" if prompt is not None else SUMMARY_POLICY
             if history_lookup:
-                prompt += "\n\n" + history_range_hint(checkpoint.through)
+                prompt += "\n\n" + history_range_hint(checkpoint.through, retrieval=history_lookup == "retrieval")
         if prompt is not None:
             messages.insert(0, {"role": "system", "content": prompt})
         return project_turn_messages(project_terminated_turns(messages))

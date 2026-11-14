@@ -11,6 +11,7 @@ from .compaction_settings import CompactionSettings
 from .models import MODELS, ModelInfo
 from .models.models import validate_catalog
 from .models.tokenizer import verified_tokenizer
+from .tools.retrieval import environment_retrieval
 
 _DEEPSEEK_V4_PRO_TOKENIZER_SHA256 = "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
 
@@ -104,7 +105,10 @@ def load_context_options(
 def environment_context_options() -> dict[str, Any]:
     catalog = environment_catalog()
     path = os.getenv("DAPHNIS_CONFIG")
-    return load_context_options(Path(path).expanduser(), catalog=catalog) if path else {"catalog": catalog}
+    options = load_context_options(Path(path).expanduser(), catalog=catalog) if path else {"catalog": catalog}
+    if (retrieval := environment_retrieval()) is not None:
+        options["retrieval"] = retrieval
+    return options
 
 
 def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:

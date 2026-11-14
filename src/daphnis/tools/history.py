@@ -68,7 +68,7 @@ def can_read_tool_history(messages: Messages, index: int, message: dict[str, Any
     return message.get(TURN_STATE) != ABANDONED and _tool_text(messages, index, message) is not None
 
 
-def _visible(messages: Messages, index: int, redactor: Redactor) -> tuple[str, str] | None:
+def visible_history_text(messages: Messages, index: int, redactor: Redactor) -> tuple[str, str] | None:
     message = messages.get(index)
     if message.get(TURN_STATE) == ABANDONED:
         return None
@@ -137,7 +137,7 @@ def prepare_history(
             for index in range(len(messages) - 1, -1, -1):
                 if index % 64 == 0:
                     await asyncio.sleep(0)
-                entry = _visible(messages, index, redactor)
+                entry = visible_history_text(messages, index, redactor)
                 if entry is None:
                     continue
                 role, content = entry
@@ -154,7 +154,7 @@ def prepare_history(
             return {"ok": True, "notice": HISTORY_NOTICE, "matches": hits}
 
         index = arguments["message_id"]
-        entry = _visible(messages, index, redactor) if index < len(messages) else None
+        entry = visible_history_text(messages, index, redactor) if index < len(messages) else None
         if entry is None:
             raise ToolError("history_unavailable", "No exposed text at this Session message ID.")
         role, content = entry
