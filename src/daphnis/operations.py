@@ -297,15 +297,15 @@ class Operations:
             thinking=current.thinking,
             enabled_tools=current.enabled_tools,
         )
-        async def save_and_switch() -> None:
-            await app._save_session(current)
-            await app._history.save_async(fresh)
+        async def switch() -> None:
+            if app._has_usage_to_save():
+                await app._save_session(current)
             app._session = fresh
             app._approval_mode = ApprovalMode.AUTO
             app._usage.select_session(fresh.id, fresh.usage)
 
         async with app._state_lock:
-            await finish_io(save_and_switch())
+            await finish_io(switch())
         return self.session
 
     def restore_session(self, session_id: str) -> None:

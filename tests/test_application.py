@@ -252,6 +252,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             a = Operations(Application(**options, history=history))
             b = Operations(Application(**options, history=History(history.directory)))
             try:
+                history.save(a._app._session)
                 await a.set_thinking("high")
                 b.restore_session(a.session.id)
                 await a.send("first writer", stream=False)
@@ -577,7 +578,8 @@ asyncio.run(main())
                 self.assertEqual(peer.model.id, "plain")
                 self.assertEqual(ops.thinking, "high")
                 self.assertEqual(ops.enabled_tools, ())
-                self.assertEqual(history.load(fresh.id).enabled_tools, ())
+                with self.assertRaises(FileNotFoundError):
+                    history.load(fresh.id)
                 with self.assertRaisesRegex(CapabilityError, "unsupported"):
                     await ops.set_tools(("read_file",))
                 self.assertEqual(
@@ -667,8 +669,8 @@ asyncio.run(main())
             try:
                 session_a = ops.session
                 await ops.set_thinking("high")
-                self.assertEqual(history.load(session_a.id).thinking, "high")
                 await ops.set_tools(("read_file",))
+                history.save(ops._app._session)
                 saved_a = history.load(session_a.id)
                 self.assertEqual((saved_a.thinking, saved_a.enabled_tools), expected)
 

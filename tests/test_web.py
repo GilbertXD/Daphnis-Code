@@ -190,13 +190,15 @@ class WebTests(unittest.TestCase):
         self.command("set_approval_mode", first, 400, mode="invalid")
         self.assertEqual(self.snapshot()["state"]["approval_mode"], "full")
         self.command("tools", first, 400, names=[{}])
+        self.command("send", first, 202, prompt="Save this session")
+        self.wait_for(lambda frame: not frame["status"]["running"])
         self.command("rename", first, id=first, title="Original")
         self.command("new", first)
         frame = self.snapshot()
         second = frame["session_id"]
         self.assertNotEqual(first, second)
         self.assertEqual(frame["state"]["approval_mode"], "auto")
-        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first, second})
+        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first})
         self.assertEqual(frame["state"]["history_issues"], [])
         self.command("send", first, 409, prompt="stale")
         self.command("rename", second, id=first, title="Inactive")
@@ -217,7 +219,7 @@ class WebTests(unittest.TestCase):
         state = self.snapshot()["state"]
         self.assertNotEqual(state["session"]["id"], first)
         self.assertEqual(state["approval_mode"], "auto")
-        self.assertEqual([row["id"] for row in state["sessions"]], [second])
+        self.assertEqual(state["sessions"], [])
         with self.assertRaises(FileNotFoundError):
             self.history.load(first)
 
@@ -278,7 +280,7 @@ class WebTests(unittest.TestCase):
         frame = self.snapshot()
         fresh = frame["session_id"]
         self.assertNotEqual(fresh, first)
-        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {fresh, first, archived.id})
+        self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first, archived.id})
         self.command("restore", fresh, 409, id="legacy")
         self.assertEqual(self.snapshot()["session_id"], fresh)
         self.command("restore", fresh, id=first)
@@ -400,14 +402,27 @@ class WebTests(unittest.TestCase):
         result = json.loads(terminated["state"]["messages"][-1]["content"])
         self.assertEqual(result["error"]["code"], "execution_skipped")
 
-    def test_system_prompt_can_be_saved_and_reset(self):
+    def test_new_session_settings_are_saved_with_first_message(self):
         initial = self.snapshot()
         session_id = initial["session_id"]
         default = initial["state"]["system_prompt"]
         custom = "First line\nSecond line"
+        self.command("model", session_id, provider="mimo", model_id="mimo-v2.6-pro")
+        self.command("thinking", session_id, mode="on")
+        self.command("tools", session_id, names=["read_file"])
         self.command("system", session_id, prompt=custom)
-        self.assertEqual(self.snapshot()["state"]["system_prompt"], custom)
-        self.assertEqual(self.history.load(session_id).system_prompt, custom)
+        state = self.snapshot()["state"]
+        self.assertEqual(state["system_prompt"], custom)
+        self.assertEqual(state["sessions"], [])
+        self.assertEqual(self.history.list_sessions(), ())
+        self.command("send", session_id, 202, prompt="First message")
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        saved = self.history.load(session_id)
+        self.assertEqual((saved.provider, saved.model_id), ("mimo", "mimo-v2.6-pro"))
+        self.assertEqual(saved.thinking, "on")
+        self.assertEqual(saved.enabled_tools, ("read_file",))
+        self.assertEqual(saved.system_prompt, custom)
+        self.assertEqual(saved.messages.snapshot()[0]["content"], "First message")
         self.command("system", session_id, 409, prompt=" ")
         self.command("system", session_id, prompt=None)
         self.assertEqual(self.snapshot()["state"]["system_prompt"], default)

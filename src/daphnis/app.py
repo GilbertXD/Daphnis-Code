@@ -545,7 +545,8 @@ class Application:
         await self._history.save_async(session, lease=lease)
 
     async def _save_and_publish_session(self, session: Session) -> None:
-        await self._save_session(session)
+        if session._saved_revision is not None or len(session.messages) or self._has_usage_to_save():
+            await self._save_session(session)
         self._session = session
 
     async def _update_session(self, session: Session) -> None:
