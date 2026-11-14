@@ -4,12 +4,16 @@ import { createRoot } from 'react-dom/client'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, ApprovalMode, Command, Model, Session, View } from './protocol'
+import type { Approval, ApprovalMode, Command, Model, Project, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
 const tokenKey = 'daphnis.access'
 const modelKey = (model: Model) => JSON.stringify([model.provider, model.id])
+const sessionActions = [
+  ['rename', '重命名'], ['move', '移动到项目'], ['delete', '删除'],
+] as const
+type SessionAction = (typeof sessionActions)[number][0]
 const approvalModeText: Record<ApprovalMode, string> = {
   ask: '每次工具调用都需确认。',
   auto: '低风险操作自动执行，其余按规则审批，可授予会话信任。',
@@ -25,43 +29,97 @@ function Dialog({ title, close, children }: { title: string; close: () => void; 
   </dialog>
 }
 
-function Sidebar({ sessions, selected, disabled, visible, historyError, historyIssueCount, onNew, onSelect, onEdit }: {
+function Sidebar({ projects, sessions, selected, disabled, visible, projectsError, historyError, historyIssueCount,
+  onCreateProject, onRemoveProject, onNew, onSelect, onEdit }: {
+  projects: Project[]
   sessions: Session[]
   selected: string
   disabled: boolean
   visible: boolean
+  projectsError: string | null
   historyError: string | null
   historyIssueCount: number
-  onNew: () => void
+  onCreateProject: () => void
+  onRemoveProject: (id: string, name: string) => void
+  onNew: (projectId: string | null) => void
   onSelect: (id: string) => void
-  onEdit: (action: 'rename' | 'delete', session: Session) => void
+  onEdit: (action: SessionAction, session: Session) => void
 }) {
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set())
+  const selectedRow = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    selectedRow.current?.scrollIntoView({ block: 'nearest' })
+  }, [selected, visible])
+  const groups: { id?: string | null; name: string; workspace?: string; sessions: Session[] }[] = [
+    { id: null, name: '无项目', sessions: sessions.filter((session) => session.project_id === null) },
+    ...projects.map((project) => ({
+      ...project, sessions: sessions.filter((session) => session.project_id === project.id),
+    })),
+  ]
+  const projectIds = new Set(projects.map((project) => project.id))
+  const unlisted = sessions.filter((session) => session.project_id !== null && !projectIds.has(session.project_id))
+  if (unlisted.length) groups.push({ name: '未登记项目', sessions: unlisted })
+
+  function toggleGroup(key: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
   return <aside className={`sidebar ${visible ? 'sidebar-visible' : ''}`} aria-label="会话历史">
     <div className="section-heading"><h2>历史会话</h2>
-      <button className="icon" onClick={onNew} disabled={disabled} aria-label="新建会话" title="新建会话">＋</button>
+      <button className="project-create" onClick={onCreateProject} disabled={disabled}>新建项目</button>
     </div>
+    {projectsError && <p className="history-notice" role="alert">{projectsError}</p>}
     {historyError && <p className="history-notice" role="alert">{historyError}</p>}
     {historyIssueCount > 0 && <p className="history-notice muted" role="status">{historyIssueCount} 个历史会话无法加载。</p>}
     <nav>
-      {sessions.map((session) => <div className={`session-row ${session.id === selected ? 'selected' : ''}`} key={session.id}>
-      <button className="session-select" aria-current={session.id === selected ? 'page' : undefined}
-        disabled={disabled && session.id !== selected} onClick={() => onSelect(session.id)}>
-        <strong>{sessionTitle(session)}</strong>
-        <span className="muted">{session.updated_at
-          ? new Date(session.updated_at * 1000).toLocaleString('zh-CN', {
-            month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-          }) : '当前工作区'}</span>
-      </button>
-      <details className="session-menu">
-        <summary aria-label={`管理 ${sessionTitle(session)}`} aria-disabled={disabled}
-          onClick={(event) => { if (disabled) event.preventDefault() }}>⋯</summary>
-        <div>{(['rename', 'delete'] as const).map((action) =>
-          <button key={action} disabled={disabled} onClick={(event) => {
-            event.currentTarget.closest('details')?.removeAttribute('open')
-            onEdit(action, session)
-          }}>{action === 'rename' ? '重命名' : '删除'}</button>)}</div>
-      </details>
-    </div>)}</nav>
+      {groups.map(({ id, name, workspace, sessions }) => {
+        const key = id === null ? 'personal' : id ?? 'unlisted'
+        const expanded = !collapsedGroups.has(key)
+        return <section className="session-group" key={key} aria-label={name}>
+          <div className="session-group-heading">
+            <h3><button className="session-group-toggle" type="button" title={workspace}
+              aria-expanded={expanded} onClick={() => {
+                toggleGroup(key)
+                if (!expanded && typeof id === 'string' && !disabled) onNew(id)
+              }}>
+              <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>{name}</span>
+            </button></h3>
+            {id !== undefined && <button className="icon" type="button" onClick={() => {
+              if (!expanded) toggleGroup(key)
+              onNew(id)
+            }} disabled={disabled}
+              aria-label={`在${name}中新建会话`} title={`在${name}中新建会话`}>＋</button>}
+            {typeof id === 'string' && <button className="icon" type="button" disabled={disabled}
+              onClick={() => onRemoveProject(id, name)} aria-label={`移除项目 ${name}`} title="移除项目">×</button>}
+          </div>
+          {expanded && sessions.map((session) => <div className={`session-row ${session.id === selected ? 'selected' : ''}`}
+            key={session.id} ref={session.id === selected ? selectedRow : undefined}>
+            <button className="session-select" aria-current={session.id === selected ? 'page' : undefined}
+              disabled={disabled && session.id !== selected} onClick={() => onSelect(session.id)}>
+              <strong>{sessionTitle(session)}</strong>
+              <span className="muted">{session.updated_at
+                ? new Date(session.updated_at * 1000).toLocaleString('zh-CN', {
+                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+                }) : '当前工作区'}</span>
+            </button>
+            <details className="session-menu">
+              <summary aria-label={`管理 ${sessionTitle(session)}`} aria-disabled={disabled}
+                onClick={(event) => { if (disabled) event.preventDefault() }}>⋯</summary>
+              <div>{sessionActions.map(([action, label]) =>
+                <button key={action} disabled={disabled} onClick={(event) => {
+                  event.currentTarget.closest('details')?.removeAttribute('open')
+                  onEdit(action, session)
+                }}>{label}</button>)}</div>
+            </details>
+          </div>)}
+        </section>
+      })}
+    </nav>
     <div className="sidebar-footer"><span className="mono">DAPHNIS</span><span>本地工作区</span></div>
   </aside>
 }
@@ -143,7 +201,71 @@ function SystemPromptDialog({ initial, close, apply, disabled, notice }: {
   </Dialog>
 }
 
-type Modal = { action: 'tools' } | { action: 'system'; sessionId: string } | { action: 'rename' | 'delete'; session: Session }
+function ProjectDialog({ close, create, disabled, notice }: {
+  close: () => void
+  create: (name: string, workspace: string | null) => Promise<boolean>
+  disabled: boolean
+  notice: string
+}) {
+  const [name, setName] = useState('')
+  const [workspace, setWorkspace] = useState('')
+  return <Dialog title="新建项目" close={close}>
+    <form onSubmit={async (event) => {
+      event.preventDefault()
+      if (await create(name.trim(), workspace.trim() || null)) close()
+    }}>
+      <label className="field">项目名称<input autoFocus value={name} maxLength={120} required
+        onChange={(event) => setName(event.currentTarget.value)} /></label>
+      <label className="field">工作区路径<input value={workspace} placeholder="留空使用当前工作区"
+        onChange={(event) => setWorkspace(event.currentTarget.value)} /></label>
+      {notice && <p role="status">{notice}</p>}
+      <div className="actions">
+        <button type="button" onClick={close}>取消</button>
+        <button className="primary" disabled={disabled || !name.trim()} type="submit">创建</button>
+      </div>
+    </form>
+  </Dialog>
+}
+
+function MoveSessionDialog({ session, projects, close, move, disabled, notice }: {
+  session: Session
+  projects: Project[]
+  close: () => void
+  move: (projectId: string | null, workspace: string | null) => Promise<boolean>
+  disabled: boolean
+  notice: string
+}) {
+  const [targetId, setTargetId] = useState(session.project_id ?? '')
+  const target = projects.find((project) => project.id === targetId)
+  const workspace = target?.workspace ?? session.workspace
+  const changesWorkspace = workspace !== session.workspace
+  const blocked = changesWorkspace && session.recovery_kind === 'INTERRUPTED_TURN'
+  const canMove = !disabled && !blocked && targetId !== (session.project_id ?? '') && (!targetId || !!target)
+  return <Dialog title="移动到项目" close={close}>
+    <form onSubmit={async (event) => {
+      event.preventDefault()
+      if (canMove && await move(target?.id ?? null, target?.workspace ?? null)) close()
+    }}>
+      <p>移动「{sessionTitle(session)}」</p>
+      <label className="field">目标项目<select value={targetId} onChange={(event) => setTargetId(event.currentTarget.value)}>
+        <option value="">无项目</option>
+        {projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}
+      </select></label>
+      <p>{changesWorkspace ? '后续工具操作将使用工作目录：' : '工作目录：'}<code>{workspace}</code></p>
+      {blocked && <p role="status">请先打开该会话，继续或终止未完成的工具任务，再更换工作目录。</p>}
+      {notice && <p role="status">{notice}</p>}
+      <div className="actions">
+        <button type="button" onClick={close}>取消</button>
+        <button className="primary" disabled={!canMove} type="submit">确认移动</button>
+      </div>
+    </form>
+  </Dialog>
+}
+
+type Modal = { action: 'tools' | 'project' } | { action: 'system'; sessionId: string }
+  | { action: 'rename' | 'delete'; session: Session }
+  | { action: 'move'; session: Session }
+  | { action: 'remove_project'; projectId: string; name: string }
 
 function Workspace({ view, connected, command }: {
   view: View
@@ -168,6 +290,11 @@ function Workspace({ view, connected, command }: {
   const tools = useMemo(() => collectTools(view.events), [view.events])
   const sessions = state.sessions.some((session) => session.id === id)
     ? state.sessions : [state.session, ...state.sessions]
+  const sessionToMove = modal?.action === 'move' && (
+    modal.session.id === id
+      ? { ...state.session, recovery_kind: recovery?.kind }
+      : state.sessions.find((session) => session.id === modal.session.id)
+  )
 
   async function perform(action: string, fields?: Record<string, unknown>) {
     if (inFlight.current) return false
@@ -207,9 +334,18 @@ function Workspace({ view, connected, command }: {
         <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
       </span>
     </header>
-    <Sidebar sessions={sessions} selected={id} disabled={disabled} visible={sidebar} historyError={state.history_error}
+    <Sidebar projects={state.projects} sessions={sessions} selected={id} disabled={disabled} visible={sidebar}
+      projectsError={state.projects_error} historyError={state.history_error}
       historyIssueCount={state.history_issues.length}
-      onNew={async () => { if (await perform('new')) setSidebar(false) }}
+      onCreateProject={() => {
+        setNotice('')
+        setModal({ action: 'project' })
+      }}
+      onRemoveProject={(projectId, name) => {
+        setNotice('')
+        setModal({ action: 'remove_project', projectId, name })
+      }}
+      onNew={(projectId) => void perform('project_open', { project_id: projectId })}
       onSelect={async (target) => { if (target === id || await perform('restore', { id: target })) setSidebar(false) }}
       onEdit={(action, session) => {
         setNotice('')
@@ -299,7 +435,25 @@ function Workspace({ view, connected, command }: {
       notice={notice} apply={(names) => perform('tools', { names })} />}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
-    {modal && 'session' in modal && <Dialog title={modal.action === 'rename' ? '重命名会话' : '删除会话'}
+    {modal?.action === 'project' && <ProjectDialog close={() => setModal(null)} disabled={disabled}
+      notice={notice} create={(name, workspace) => perform('project_create', { name, workspace })} />}
+    {modal?.action === 'remove_project' && <Dialog title="移除项目" close={() => setModal(null)}>
+      <form onSubmit={async (event) => {
+        event.preventDefault()
+        if (await perform('project_remove', { project_id: modal.projectId })) setModal(null)
+      }}>
+        <p>移除「{modal.name}」？该项目的会话会移到「无项目」，工作目录和文件会保留。</p>
+        {notice && <p role="status">{notice}</p>}
+        <div className="actions">
+          <button type="button" onClick={() => setModal(null)}>取消</button>
+          <button className="primary" disabled={disabled} type="submit">移除</button>
+        </div>
+      </form>
+    </Dialog>}
+    {sessionToMove && <MoveSessionDialog session={sessionToMove} projects={state.projects}
+      close={() => setModal(null)} disabled={disabled} notice={notice}
+      move={(projectId, workspace) => perform('move', { id: sessionToMove.id, project_id: projectId, workspace })} />}
+    {(modal?.action === 'rename' || modal?.action === 'delete') && <Dialog title={modal.action === 'rename' ? '重命名会话' : '删除会话'}
       close={() => setModal(null)}>
       <form onSubmit={async (event) => {
         event.preventDefault()

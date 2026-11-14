@@ -7,6 +7,7 @@ from uuid import uuid4
 from saturnus import Messages
 
 from .compaction import CompactionCheckpoint
+from .project import validate_project_id
 from .turn_state import RecoveryState, recovery_state
 from .usage import UsageTotals
 
@@ -33,6 +34,7 @@ class Session:
     title: str | None = None
     compaction: CompactionCheckpoint | None = None
     system_prompt: str | None = None
+    project_id: str | None = None
 
     @property
     def recovery(self) -> RecoveryState | None:
@@ -53,6 +55,8 @@ class Session:
         ):
             raise ValueError("workspace must be a non-empty path.")
         self.workspace = Path(self.workspace).expanduser().resolve()
+        if self.project_id is not None:
+            validate_project_id(self.project_id)
         if not isinstance(self.messages, Messages):
             raise TypeError("messages must be a Saturnus Messages instance.")
         if not isinstance(self.usage, UsageTotals):

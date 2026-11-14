@@ -14,8 +14,10 @@ from typing import Self, TypeVar
 from saturnus import Messages, ValidationError
 
 from .compaction import CompactionCheckpoint
+from .project import Project, validate_project_id
 from .session import Session
 from .tool_state import interrupted_tool_group
+from .turn_state import RecoveryKind
 from .usage import UsageTotals
 
 if os.name == "posix":
@@ -94,6 +96,8 @@ class SessionInfo:
     message_count: int
     updated_at: float
     title: str | None = None
+    project_id: str | None = None
+    recovery_kind: RecoveryKind | None = None
 
 
 @dataclass(frozen=True)
@@ -143,12 +147,67 @@ class History:
                         len(session.messages),
                         path.stat().st_mtime,
                         session.title,
+                        session.project_id,
+                        recovery.kind if (recovery := session.recovery) else None,
                     )
                 )
             except (OSError, RuntimeError, TypeError, ValueError, ValidationError) as exc:
                 issues.append(SessionIssue(path.name, type(exc).__name__))
         items.sort(key=lambda item: item.updated_at, reverse=True)
         return SessionScan(tuple(items), tuple(issues))
+
+    def _project_path(self, project_id: str) -> Path:
+        validate_project_id(project_id)
+        return self.directory / "projects" / f"{project_id}.json"
+
+    def resolve_project_id(self, project_id: str | None, workspace: Path) -> str | None:
+        if project_id is None:
+            return None
+        try:
+            project = self.load_project(project_id)
+        except (OSError, ValueError):
+            return None
+        return project.id if project.workspace == workspace else None
+
+    def load_project(self, project_id: str) -> Project:
+        data = json.loads(self._project_path(project_id).read_bytes())
+        if (
+            not isinstance(data, dict)
+            or data.keys() != {"id", "name", "workspace"}
+            or data["id"] != project_id
+            or not isinstance(data["workspace"], str)
+            or not Path(data["workspace"]).is_absolute()
+        ):
+            raise ValueError("项目记录无效。")
+        return Project(data["name"], Path(data["workspace"]), project_id)
+
+    def list_projects(self) -> tuple[Project, ...]:
+        try:
+            paths = list((self.directory / "projects").iterdir())
+        except FileNotFoundError:
+            return ()
+        projects = []
+        for path in paths:
+            if path.suffix != ".json":
+                continue
+            try:
+                projects.append(self.load_project(path.stem))
+            except (OSError, ValueError):
+                continue
+        return tuple(sorted(projects, key=lambda project: (project.name.casefold(), project.id)))
+
+    def create_project(self, name: str, workspace: Path) -> Project:
+        project = Project(name, workspace.resolve())
+        if not project.workspace.is_dir():
+            raise ValueError("项目工作区必须是现有目录。")
+        destination = self._project_path(project.id)
+        destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        data = {"id": project.id, "name": project.name, "workspace": str(project.workspace)}
+        self._replace(destination, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode())
+        return project
+
+    def remove_project(self, project_id: str) -> None:
+        self._project_path(project_id).unlink()
 
     def _path(self, session_id: str) -> Path:
         if (
@@ -223,6 +282,7 @@ class History:
             title=session.title,
             compaction=session.compaction,
             system_prompt=session.system_prompt,
+            project_id=session.project_id,
         )
         data = {
             "version": 2,
@@ -242,6 +302,8 @@ class History:
             data["compaction"] = asdict(validated.compaction)
         if validated.system_prompt is not None:
             data["system_prompt"] = validated.system_prompt
+        if validated.project_id is not None:
+            data["project_id"] = validated.project_id
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())
@@ -251,7 +313,7 @@ class History:
         try:
             with NamedTemporaryFile(
                 mode="wb",
-                dir=self.directory,
+                dir=destination.parent,
                 prefix=f".{destination.stem}.",
                 suffix=".tmp",
                 delete=False,
@@ -299,7 +361,7 @@ class History:
             checkpoint = CompactionCheckpoint(**checkpoint)
         messages = Messages(data["messages"])
         interrupted_tool_group(data["messages"])
-        return Session(
+        session = Session(
             id=data["id"],
             workspace=data["workspace"],
             provider=data["provider"],
@@ -313,3 +375,5 @@ class History:
             compaction=checkpoint,
             system_prompt=data.get("system_prompt"),
         )
+        session.project_id = self.resolve_project_id(data.get("project_id"), Path(session.workspace))
+        return session

@@ -239,6 +239,147 @@ class WebTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.history.load(first)
 
+    def test_project_sidebar_commands_keep_session_scope_and_workspace(self):
+        first = self.snapshot()["session_id"]
+        project_root = self.workspace / "other work"
+        project_root.mkdir()
+        self.command("project_create", first, 409, name="Missing", workspace="missing")
+        self.command("project_open", first, 404, project_id="0" * 32)
+        self.command("project_create", first, name="Other work", workspace="other work")
+        frame = self.snapshot()
+        self.assertEqual(frame["session_id"], first)
+        self.assertIsNone(frame["state"]["session"]["project_id"])
+        [project] = frame["state"]["projects"]
+        self.assertEqual(project["name"], "Other work")
+        self.assertEqual(Path(project["workspace"]), project_root.resolve())
+
+        self.command("set_approval_mode", first, mode="full")
+        self.command("project_open", first, project_id=project["id"])
+        state = self.snapshot()["state"]
+        opened = state["session"]
+        self.assertNotEqual(opened["id"], first)
+        self.assertEqual(opened["project_id"], project["id"])
+        self.assertEqual(Path(opened["workspace"]), project_root.resolve())
+        self.assertEqual(state["approval_mode"], "auto")
+        self.assertEqual(state["sessions"], [])
+        self.assertEqual(state["messages"], [])
+        self.assertIsNone(opened["title"])
+        self.command("new", opened["id"])
+        fresh = self.snapshot()["state"]["session"]
+        self.assertEqual(fresh["project_id"], project["id"])
+
+        self.command("project_open", fresh["id"], project_id=None)
+        unscoped = self.snapshot()["state"]["session"]
+        self.assertIsNone(unscoped["project_id"])
+        self.assertEqual(unscoped["workspace"], opened["workspace"])
+        self.assertEqual(self.snapshot()["state"]["sessions"], [])
+        self.command("project_open", unscoped["id"], project_id=project["id"])
+        session_id = self.snapshot()["session_id"]
+        self.command("send", session_id, 202, prompt="First project message")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual({row["id"]: row["project_id"] for row in done["state"]["sessions"]}, {
+            session_id: project["id"],
+        })
+        self.assertEqual(self.history.load(session_id).workspace, project_root.resolve())
+        self.command("delete", session_id, id=session_id)
+        self.assertEqual(self.snapshot()["state"]["session"]["project_id"], project["id"])
+
+    def test_remove_project_keeps_active_and_saved_sessions(self):
+        first = self.snapshot()["session_id"]
+        project_root = self.workspace / "project"
+        project_root.mkdir()
+        file = project_root / "keep.txt"
+        file.write_text("keep")
+        self.command("project_create", first, name="Project", workspace="project")
+        [project] = self.snapshot()["state"]["projects"]
+        project_id = project["id"]
+        self.command("project_open", first, project_id=project_id)
+        saved_id = self.snapshot()["session_id"]
+        self.command("send", saved_id, 202, prompt="Keep this conversation")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        messages = done["state"]["messages"]
+        self.command("new", saved_id)
+        active_id = self.snapshot()["session_id"]
+
+        self.command("project_remove", active_id, project_id=project_id)
+        state = self.snapshot()["state"]
+        self.assertEqual(state["projects"], [])
+        self.assertEqual(state["session"]["id"], active_id)
+        self.assertIsNone(state["session"]["project_id"])
+        self.assertTrue(all(row["project_id"] is None for row in state["sessions"]))
+        self.assertEqual(file.read_text(), "keep")
+        self.command("project_remove", active_id, 404, project_id=project_id)
+
+        self.command("restore", active_id, id=saved_id)
+        state = self.snapshot()["state"]
+        self.assertEqual(state["messages"], messages)
+        self.assertIsNone(state["session"]["project_id"])
+        self.assertEqual(Path(state["session"]["workspace"]), project_root.resolve())
+
+    def test_move_session_updates_workspace_and_preserves_history(self):
+        session_id = self.snapshot()["session_id"]
+        other = self.workspace / "other project"
+        other.mkdir()
+        self.command("project_create", session_id, name="Local", workspace=None)
+        self.command("project_create", session_id, name="Other", workspace=other.name)
+        local, target = self.snapshot()["state"]["projects"]
+
+        self.command("move", session_id, id=session_id, project_id=local["id"], workspace=local["workspace"])
+        state = self.snapshot()["state"]
+        self.assertEqual(state["session"]["project_id"], local["id"])
+        self.assertEqual(state["sessions"], [])
+        self.command("send", session_id, 202, prompt="Keep this conversation")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        saved = self.history.load(session_id)
+
+        self.command("move", session_id, 409, id=session_id, project_id=target["id"], workspace=local["workspace"])
+        self.assertEqual(self.history.load(session_id).project_id, local["id"])
+        self.command("new", session_id)
+        current_id = self.snapshot()["session_id"]
+        with SessionLease(self.history.directory / f"{session_id}.json"):
+            self.command("move", current_id, 409, id=session_id, project_id=target["id"], workspace=target["workspace"])
+        self.command("move", current_id, id=session_id, project_id=target["id"], workspace=target["workspace"])
+        self.assertEqual(self.snapshot()["session_id"], current_id)
+        self.command("restore", current_id, id=session_id)
+        frame = self.snapshot()
+        self.assertEqual(frame["state"]["session"]["project_id"], target["id"])
+        self.assertEqual(Path(frame["state"]["session"]["workspace"]), other.resolve())
+        self.assertEqual(frame["state"]["messages"], done["state"]["messages"])
+
+        self.command("move", session_id, id=session_id, project_id=None, workspace=None)
+        moved = self.history.load(session_id)
+        self.assertIsNone(moved.project_id)
+        self.assertEqual(moved.workspace, other.resolve())
+        self.assertEqual(moved.title, saved.title)
+        self.assertEqual(moved.messages.snapshot(), saved.messages.snapshot())
+        self.assertEqual(moved.usage, saved.usage)
+
+    def test_project_metadata_does_not_block_session_restore(self):
+        first = self.snapshot()["session_id"]
+        project_root = self.workspace / "project"
+        project_root.mkdir()
+        self.command("project_create", first, name="Project", workspace="project")
+        [project] = self.snapshot()["state"]["projects"]
+        self.command("project_open", first, project_id=project["id"])
+        saved_id = self.snapshot()["session_id"]
+        self.command("send", saved_id, 202, prompt="Keep this conversation")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        messages = done["state"]["messages"]
+        path = self.history.directory / "projects" / f"{project['id']}.json"
+
+        for metadata in ("{", json.dumps({**project, "workspace": str(self.workspace)})):
+            with self.subTest(metadata=metadata):
+                path.write_text(metadata)
+                state = self.snapshot()["state"]
+                self.assertIsNone(state["session"]["project_id"])
+                self.assertIsNone(state["sessions"][0]["project_id"])
+                self.command("project_open", saved_id, project_id=None)
+                self.command("restore", self.snapshot()["session_id"], id=saved_id)
+                state = self.snapshot()["state"]
+                self.assertEqual(state["messages"], messages)
+                self.assertIsNone(state["session"]["project_id"])
+                self.assertEqual(Path(state["session"]["workspace"]), project_root.resolve())
+
     def test_history_lists_and_restores_valid_sessions_alongside_invalid_files(self):
         self.history.directory.mkdir()
         invalid_files = {
@@ -361,6 +502,11 @@ class WebTests(unittest.TestCase):
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
         session_id = self.snapshot()["session_id"]
+        project_root = self.workspace / "different workspace"
+        project_root.mkdir()
+        self.command("project_create", session_id, name="Other", workspace=project_root.name)
+        [project] = self.snapshot()["state"]["projects"]
+        move = {"id": session_id, "project_id": project["id"], "workspace": project["workspace"]}
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
         self.assertEqual(waiting["run"]["base_count"], 0)
@@ -379,9 +525,14 @@ class WebTests(unittest.TestCase):
         self.assertEqual(messages, self.history.load(session_id).messages.snapshot())
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool"])
         self.assertTrue(json.loads(messages[-1]["content"])["ok"])
+        self.assertEqual(paused["state"]["sessions"][0]["recovery_kind"], "INTERRUPTED_TURN")
+        self.command("move", session_id, 409, **move)
 
         self.command("new", session_id)
-        self.command("restore", self.snapshot()["session_id"], id=session_id)
+        fresh = self.snapshot()["session_id"]
+        self.command("move", fresh, 409, **move)
+        self.assertEqual(self.history.load(session_id).workspace, self.workspace.resolve())
+        self.command("restore", fresh, id=session_id)
         recovery = self.snapshot()["state"]["recovery"]
         self.assertEqual(recovery["kind"], "INTERRUPTED_TURN")
         self.command("send", session_id, 409, prompt="继续")
@@ -392,6 +543,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.requests[-1]["messages"][1:], messages)
         self.assertIn("tools", self.requests[-1])
         self.command("terminate", session_id, 409, key=recovery["key"])
+        self.command("move", session_id, **move)
+        self.assertEqual(self.history.load(session_id).workspace, project_root.resolve())
 
     def test_failed_user_retry_and_terminate_actions_use_the_current_recovery_key(self):
         session_id = self.snapshot()["session_id"]

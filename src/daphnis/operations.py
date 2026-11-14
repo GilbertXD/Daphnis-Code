@@ -1,5 +1,6 @@
 """Public business operations and read-only views of an Application."""
 
+import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -13,9 +14,10 @@ from .events import Callback
 from .history import finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
 from .models import CapabilityError, ModelInfo, list_models, require_tools
+from .project import Project
 from .session import Session
 from .tools import ApprovalDecision, ApprovalMode
-from .turn_state import RecoveryAction, RecoveryState
+from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
 
 if TYPE_CHECKING:
     from .agent import TurnResult
@@ -33,6 +35,7 @@ class SessionSnapshot:
     provider: str
     model_id: str
     title: str | None = None
+    project_id: str | None = None
 
 
 class Operations:
@@ -44,9 +47,11 @@ class Operations:
     @property
     def session(self) -> SessionSnapshot:
         session = self._app._session
+        workspace = Path(session.workspace)
+        project_id = self._app._history.resolve_project_id(session.project_id, workspace)
         return SessionSnapshot(
-            session.id, Path(session.workspace), session.provider, session.model_id,
-            session.title,
+            session.id, workspace, session.provider, session.model_id,
+            session.title, project_id,
         )
 
     def message_snapshot(self) -> list[dict[str, Any]]:
@@ -286,16 +291,61 @@ class Operations:
     def scan_sessions(self) -> "SessionScan":
         return self._app._history.scan_sessions()
 
-    async def new_session(self) -> SessionSnapshot:
+    def list_projects(self) -> tuple[Project, ...]:
+        return self._app._history.list_projects()
+
+    async def create_project(self, name: str, workspace: Path | str | None = None) -> Project:
         app = self._app
         app._ensure_idle()
+        root = Path(app._session.workspace)
+        if workspace is not None:
+            if not str(workspace).strip():
+                raise ValueError("项目需要一个工作区目录。")
+            root = root / Path(workspace).expanduser()
+        async with app._state_lock:
+            return await finish_io(asyncio.to_thread(app._history.create_project, name, root))
+
+    async def remove_project(self, project_id: str) -> None:
+        app = self._app
+        app._ensure_idle()
+
+        async def remove() -> None:
+            await asyncio.to_thread(app._history.remove_project, project_id)
+            if app._session.project_id == project_id:
+                app._session.project_id = None
+
+        async with app._state_lock:
+            await finish_io(remove())
+
+    def _project_for_workspace(self, project_id: str) -> Project:
+        project = self._app._history.load_project(project_id)
+        if not project.workspace.is_dir() or project.workspace.resolve() != project.workspace:
+            raise ValueError("该项目的工作区已移动或不存在。")
+        return project
+
+    async def open_project(self, project_id: str | None) -> SessionSnapshot:
+        app = self._app
+        app._ensure_idle()
+        if project_id is None:
+            return await self._new_session(app._session.workspace, None)
+        project = self._project_for_workspace(project_id)
+        return await self._new_session(project.workspace, project.id)
+
+    async def new_session(self) -> SessionSnapshot:
+        self._app._ensure_idle()
+        current = self.session
+        return await self._new_session(current.workspace, current.project_id)
+
+    async def _new_session(self, workspace: Path | str, project_id: str | None) -> SessionSnapshot:
+        app = self._app
         current = app._session
         fresh = Session(
-            workspace=current.workspace,
+            workspace=workspace,
             provider=current.provider,
             model_id=current.model_id,
             thinking=current.thinking,
             enabled_tools=current.enabled_tools,
+            project_id=project_id,
         )
         async def switch() -> None:
             if app._has_usage_to_save():
@@ -343,6 +393,41 @@ class Operations:
             async with app._state_lock:
                 await app._history.rename(session_id, title)
 
+    async def move_session(
+        self, session_id: str, project_id: str | None, *, expected_workspace: Path | str | None = None,
+    ) -> None:
+        app = self._app
+        app._ensure_idle()
+
+        async def move() -> None:
+            active = session_id == app._session.id
+            session = app._session if active else await asyncio.to_thread(app._history.load, session_id)
+            workspace = session.workspace
+            if project_id is not None:
+                try:
+                    project = self._project_for_workspace(project_id)
+                except FileNotFoundError as exc:
+                    raise ValueError("项目不存在。") from exc
+                if expected_workspace is not None and Path(expected_workspace) != project.workspace:
+                    raise ValueError("目标工作目录已变化，请重新确认。")
+                workspace = project.workspace
+            if session.project_id == project_id and session.workspace == workspace:
+                return
+            workspace_changed = session.workspace != workspace
+            recovery = session.recovery
+            if workspace_changed and recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+                raise ValueError("请先继续或终止未完成的工具任务，再更换工作目录。")
+            updated = replace(session, project_id=project_id, workspace=workspace)
+            if active:
+                await app._save_and_publish_session(updated)
+            else:
+                await app._history.save_async(updated)
+            if workspace_changed:
+                app._trusted_tools.difference_update({key for key in app._trusted_tools if key[0] == session_id})
+
+        async with app._state_lock:
+            await finish_io(move())
+
     async def delete_session(self, session_id: str) -> SessionSnapshot:
         """Delete under the history lease; replace an active session with a blank one."""
         app = self._app
@@ -359,6 +444,7 @@ class Operations:
                 model_id=current.model_id,
                 thinking=current.thinking,
                 enabled_tools=current.enabled_tools,
+                project_id=self.session.project_id,
             )
             await app._history.delete(current)
             app._session = fresh

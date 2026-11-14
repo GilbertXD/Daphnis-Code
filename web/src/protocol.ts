@@ -15,9 +15,13 @@ export type Session = {
   provider: string
   model_id: string
   title: string | null
+  project_id: string | null
   updated_at?: number
   message_count?: number
+  recovery_kind?: Recovery['kind'] | null
 }
+
+export type Project = { id: string; name: string; workspace: string }
 
 type HistoryIssue = { filename: string; error: string }
 
@@ -106,6 +110,8 @@ export type LiveText = { content: string; reasoning: string; count: number }
 type State = {
   session: Session
   sessions: Session[]
+  projects: Project[]
+  projects_error: string | null
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]

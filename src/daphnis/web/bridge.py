@@ -139,9 +139,17 @@ class Bridge:
         except OSError as exc:
             history = SessionScan((), ())
             history_error = f"无法读取历史会话目录（{type(exc).__name__}）。"
+        projects_error = None
+        try:
+            projects = ops.list_projects()
+        except OSError as exc:
+            projects = ()
+            projects_error = f"无法读取项目目录（{type(exc).__name__}）。"
         return self.redactor.json({
             "session": asdict(ops.session),
             "sessions": [asdict(session) for session in history.sessions],
+            "projects": [asdict(project) for project in projects],
+            "projects_error": projects_error,
             "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
             "messages": ops.message_snapshot(),

@@ -52,6 +52,13 @@ a { color: inherit; text-underline-offset: 3px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; padding: 13px 14px 10px 22px; }
 .section-heading h2, .debug-heading h2 { font-size: 1.04rem; }
 .sidebar nav { flex: 1; overflow: auto; padding: 0 13px 18px 2px; }
+.project-create { font-size: .78rem; padding: 4px 8px; }
+.session-group + .session-group { margin-top: 14px; }
+.session-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 2px 0 20px; }
+.session-group-heading h3 { flex: 1; min-width: 0; font-size: .8rem; color: var(--muted); }
+.session-group-toggle { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 26px; border: 0; padding: 0; background: transparent; text-align: left; }
+.session-group-toggle span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-group-heading .icon { flex: none; width: 26px; height: 26px; }
 .history-notice { margin: 0 14px 12px 22px; font-size: .82rem; overflow-wrap: anywhere; }
 .session-row { display: flex; align-items: center; border-left: 5px solid transparent; position: relative; min-width: 0; }
 .session-row + .session-row { margin-top: 5px; }

@@ -20,8 +20,12 @@ from ..turn_state import RecoveryKind
 _MAX_BODY_BYTES = 256 * 1024
 _FIELDS = {
     "new": {},
+    "project_create": {"name": str, "workspace": (str, type(None))},
+    "project_open": {"project_id": (str, type(None))},
+    "project_remove": {"project_id": str},
     "restore": {"id": str},
     "rename": {"id": str, "title": str},
+    "move": {"id": str, "project_id": (str, type(None)), "workspace": (str, type(None))},
     "delete": {"id": str},
     "model": {"provider": str, "model_id": str},
     "thinking": {"mode": (str, type(None))},
@@ -77,6 +81,8 @@ async def _command(request: Request):
         raise RequestError("工具列表无效。")
     if action == "send" and not value["prompt"].strip():
         raise RequestError("请输入消息。")
+    if action == "move" and (value["project_id"] is None) != (value["workspace"] is None):
+        raise RequestError("目标项目与工作目录必须同时提供。")
     if action == "approve" and value["decision"] not in {"deny", "allow_once", "trust_session"}:
         raise RequestError("审批选项无效。")
     if action == "set_approval_mode" and value["mode"] not in tuple(ApprovalMode):
@@ -107,11 +113,23 @@ async def _execute(bridge, action, session, args):
     match action:
         case "new":
             await ops.new_session()
+        case "project_create":
+            await ops.create_project(args["name"], workspace=args["workspace"])
+        case "project_open" | "project_remove":
+            try:
+                if action == "project_remove":
+                    await ops.remove_project(args["project_id"])
+                else:
+                    await ops.open_project(args["project_id"])
+            except FileNotFoundError as exc:
+                raise RequestError("项目不存在。", 404) from exc
         case "restore":
             if args["id"] != session:
                 ops.restore_session(args["id"])
         case "rename":
             await ops.rename_session(args["id"], args["title"])
+        case "move":
+            await ops.move_session(args["id"], args["project_id"], expected_workspace=args["workspace"])
         case "delete":
             await ops.delete_session(args["id"])
             bridge.journals.pop(args["id"], None)
