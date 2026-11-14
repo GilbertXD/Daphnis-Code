@@ -8,6 +8,7 @@ from saturnus import Messages
 from test_agent_core import CATALOG, reply, tool_call
 
 from daphnis import History, Operations, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction import CompactionCheckpoint
 from daphnis.events import EventBus
@@ -25,8 +26,10 @@ class RetrievalTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request):
             body = json.loads(request.content)
-            requests.append(body)
             messages = body["messages"]
+            if messages[0]["content"] == TITLE_PROMPT:
+                return httpx.Response(200, json=reply("Orchid budget"))
+            requests.append(body)
             if len(requests) == 1:
                 self.assertIn("use retrieval", messages[0]["content"])
                 names = {tool["function"]["name"] for tool in body["tools"]}

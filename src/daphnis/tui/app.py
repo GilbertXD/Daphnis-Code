@@ -354,7 +354,7 @@ class DaphnisApp(App[None]):
             return
         if event.name == "context.overflow" and event.data["retrying"]:
             self.notify("上下文超限，已缩短请求并重试。")
-        if event.data.get("purpose") != "compaction":
+        if event.data.get("purpose") not in {"compaction", "title"}:
             await self.query_one(ChatView).event(event)
         if event.name == "tool.approval_requested":
             request = self.ops.pending_approval

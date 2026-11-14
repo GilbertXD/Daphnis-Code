@@ -72,7 +72,7 @@ class UsageTracker:
         self.turn: UsageTotals | None = None
         self.session = UsageTotals()
         self._base = UsageTotals()
-        self._requests: dict[int, UsageTotals | None] = {}
+        self._requests: dict[tuple[bool, int], UsageTotals | None] = {}
         self._subscriptions = [
             events.on(name, self._on_event)
             for name in (
@@ -98,24 +98,29 @@ class UsageTracker:
             self.turn = UsageTotals()
             self._requests.clear()
             return
+        is_title = event.data.get("purpose") == "title"
         maintenance = event.data.get("maintenance") is True
         if maintenance and event.name == "model.started" and event.turn_id != self.turn_id:
             self._base = self.session
             self.turn_id = event.turn_id
             self._requests.clear()
-        if event.turn_id != self.turn_id:
+        if not is_title and event.turn_id != self.turn_id:
             return
-        number = event.data["request_number"]
-        self._requests.setdefault(number, None)
+        key = (is_title, event.data["request_number"])
+        self._requests.setdefault(key, None)
         # Null/missing usage is not a new snapshot; an empty object is.
         if event.name == "model.usage" and event.data.get("usage") is not None:
-            self._requests[number] = _reported_usage(event.data["usage"])
-        totals = UsageTotals()
-        for usage in self._requests.values():
-            totals = totals.plus(usage or UsageTotals(requests=1))
+            self._requests[key] = _reported_usage(event.data["usage"])
+        totals = title_totals = UsageTotals()
+        for (is_title, _), usage in self._requests.items():
+            usage = usage or UsageTotals(requests=1)
+            if is_title:
+                title_totals = title_totals.plus(usage)
+            else:
+                totals = totals.plus(usage)
         if not maintenance:
             self.turn = totals
-        self.session = self._base.plus(totals)
+        self.session = self._base.plus(totals).plus(title_totals)
 
     def close(self) -> None:
         for unsubscribe in self._subscriptions:

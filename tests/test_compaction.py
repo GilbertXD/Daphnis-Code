@@ -18,6 +18,7 @@ from test_agent_core import (
 )
 
 from daphnis import Agent, Context, History, Operations, Session, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction import (
     CompactionCheckpoint,
@@ -374,6 +375,8 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
 
         def handler(request):
             body = json.loads(request.content)
+            if body["messages"][0]["content"] == TITLE_PROMPT:
+                return httpx.Response(200, json=reply("Original task"))
             bodies.append(body)
             if "Summarize" in body["messages"][0]["content"]:
                 self.assertNotIn("tools", body)

@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 
 from daphnis import EventBus, History, Operations, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.models import ModelInfo
 from daphnis.usage import UsageTotals, UsageTracker
@@ -26,6 +27,15 @@ def counts(prompt, completion):
 
 
 def application(root, handler):
+    def respond(request):
+        messages = json.loads(request.content)["messages"]
+        if messages[0]["content"] == TITLE_PROMPT:
+            return httpx.Response(200, json={"choices": [{
+                "index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "测试用量"},
+            }]})
+        return handler(request)
+
     return Application(
         workspace=root,
         provider="deepseek",
@@ -34,7 +44,7 @@ def application(root, handler):
         connections={
             name: {
                 "base_url": f"https://{name}.test",
-                "transport": httpx.MockTransport(handler),
+                "transport": httpx.MockTransport(respond),
             }
             for name in ("deepseek", "mimo")
         },
@@ -140,10 +150,10 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ops.turn_usage, UsageTotals(300, 30, 330, 2, 2))
                 await ops.send("again", stream=False)
                 self.assertEqual(ops.turn_usage, UsageTotals(50, 5, 55, 1, 1))
-                self.assertEqual(ops.session_usage, UsageTotals(350, 35, 385, 3, 3))
+                self.assertEqual(ops.session_usage, UsageTotals(350, 35, 385, 4, 3))
                 await ops.send("missing usage", stream=False)
                 self.assertEqual(ops.turn_usage, UsageTotals(requests=1))
-                totals = UsageTotals(350, 35, 385, 4, 3)
+                totals = UsageTotals(350, 35, 385, 5, 3)
                 old = ops.session.id
                 await ops.set_model("mimo", "b")
                 self.assertEqual(ops.session_usage, totals)

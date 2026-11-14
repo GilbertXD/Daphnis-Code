@@ -117,14 +117,19 @@ class Bridge:
             if event.name == "turn.started" and self.run and self.run["session_id"] == event.session_id:
                 self.run["turn_id"] = event.turn_id
                 data = {**data, "base_count": self.run["base_count"]}
-            if event.name == "model.finished":
+            if event.name == "model.finished" and self.run and event.turn_id == self.run["turn_id"]:
                 item = self.live.get(data["request_number"])
                 if item is not None:
                     data = {**data, "chunks": item["count"]}
             if event.name == "turn.finished":
                 data = {**data, "committed_count": len(self.ops.message_snapshot())}
             self._record(event.name, event.session_id, event.turn_id, data)
-        self._notify(state=event.name in {"mcp.error", "mcp.tools_changed"})
+        first_request = (
+            event.name == "model.started" and data["request_number"] == 1
+            and data.get("purpose") != "title"
+            and self.run is not None
+        )
+        self._notify(state=first_request or event.name in {"mcp.error", "mcp.tools_changed"})
 
     def state(self):
         ops = self.ops

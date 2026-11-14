@@ -17,9 +17,11 @@ import httpx
 from saturnus import Compatibility, ValidationError
 
 from daphnis import History, Operations, TurnResult, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction_settings import CompactionSettings
 from daphnis.config import environment_connections
+from daphnis.history import SessionBusyError, SessionLease
 from daphnis.models import CapabilityError, ModelInfo
 from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.turn_state import RecoveryKind, RecoveryState
@@ -49,7 +51,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         bodies = []
 
         def handler(request):
-            bodies.append(json.loads(request.content))
+            body = json.loads(request.content)
+            if body["messages"][0]["content"] != TITLE_PROMPT:
+                bodies.append(body)
             return response({"role": "assistant", "content": "done"})
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -90,6 +94,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
             def handler(request):
                 messages = json.loads(request.content)["messages"]
+                if messages[0]["content"] == TITLE_PROMPT:
+                    return response({"role": "assistant", "content": "检查工具权限"})
                 seen.append(messages)
                 if len(seen) == 1:
                     calls = [
@@ -258,7 +264,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 await a.send("first writer", stream=False)
                 with self.assertRaisesRegex(RuntimeError, "Session write conflict"):
                     await b.send("stale writer", stream=False)
-                self.assertEqual(len(model_calls), 1)
+                self.assertEqual(len(model_calls), 2)
                 saved = history.load(a.session.id).messages.snapshot()
                 self.assertEqual(saved[0]["content"], "first writer")
                 self.assertEqual(len(saved), 2)
@@ -275,6 +281,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 requests = []
 
                 def handler(request):
+                    if json.loads(request.content)["messages"][0]["content"] == TITLE_PROMPT:
+                        return response({"role": "assistant", "content": "检查文件"})
                     saved = history.load(session_id).messages.snapshot()
                     requests.append(saved)
                     if len(requests) == 2 or scenario == "first_request":
@@ -332,6 +340,40 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         for scenario in ("first_request", "after_tools", "save_failure"):
             with self.subTest(scenario=scenario):
                 await check(scenario)
+
+    async def test_cancel_title_keeps_completed_reply_and_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            history = History(Path(temporary) / "sessions")
+            naming = asyncio.Event()
+
+            async def handler(request):
+                if json.loads(request.content)["messages"][0]["content"] == TITLE_PROMPT:
+                    naming.set()
+                    await asyncio.Future()
+                return response({"role": "assistant", "content": "done"})
+
+            ops = Operations(Application(
+                workspace=temporary, provider="deepseek", model_id="a", catalog=CATALOG,
+                connections={"deepseek": {
+                    "base_url": "https://model.test", "transport": httpx.MockTransport(handler),
+                }},
+                history=history,
+            ))
+            self.addAsyncCleanup(ops.close)
+            session_id = ops.session.id
+            path = history.directory / f"{session_id}.json"
+            task = asyncio.create_task(ops.send("first task", stream=False))
+            await asyncio.wait_for(naming.wait(), 2)
+            saved = history.load(session_id)
+            self.assertEqual(saved.title, "first task")
+            self.assertEqual(saved.messages.snapshot()[-1]["content"], "done")
+            with self.assertRaises(SessionBusyError), SessionLease(path):
+                self.fail("The title request should still hold the session lease.")
+
+            await ops.cancel()
+            self.assertEqual((await task).status, TurnStatus.COMPLETED)
+            self.assertEqual(history.load(session_id).title, "first task")
+            self.assertIsNone(ops.recovery)
 
     async def test_cancel_during_background_save_keeps_session_busy(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -391,6 +433,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             }}
 
             def model(request):
+                if json.loads(request.content)["messages"][0]["content"] == TITLE_PROMPT:
+                    return response({"role": "assistant", "content": "等待工具审批"})
                 body = response({"role": "assistant", "tool_calls": [tool]}, "tool_calls").json()
                 body["usage"] = {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5}
                 return httpx.Response(200, json=body)
@@ -491,11 +535,14 @@ asyncio.run(main())
             received = []
 
             def handler(request):
+                body = json.loads(request.content)
+                if body["messages"][0]["content"] == TITLE_PROMPT:
+                    return response({"role": "assistant", "content": "测试模型"})
                 received.append(
                     (
                         request.url.host,
                         request.headers["authorization"],
-                        json.loads(request.content),
+                        body,
                     )
                 )
                 return response({"role": "assistant", "content": "hello"})
@@ -729,7 +776,9 @@ asyncio.run(main())
         requests = []
 
         def handler(request):
-            requests.append(json.loads(request.content))
+            body = json.loads(request.content)
+            if body["messages"][0]["content"] != TITLE_PROMPT:
+                requests.append(body)
             return response({"role": "assistant", "content": "done"})
 
         with tempfile.TemporaryDirectory() as temporary:

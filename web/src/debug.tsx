@@ -105,7 +105,7 @@ const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
     const first = items[0]
     return <details className="request-row" key={key}>
       <summary>请求 {first.data.request_number} <span className="muted">
-        {clock(first.time)}{first.data.purpose === 'compaction' ? ' · 历史摘要' : ''}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
+        {clock(first.time)}{first.data.purpose === 'compaction' ? ' · 历史摘要' : first.data.purpose === 'title' ? ' · 会话标题' : ''}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
       </span></summary>
       <h4>请求 JSON</h4>
       {request?.data.body
@@ -126,7 +126,7 @@ export function Debug({ view, tools, tab, select, close }: {
   select: (tab: Tab) => void
   close: () => void
 }) {
-  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && event.data.purpose !== 'compaction' && event.data.body?.messages)
+  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && !event.data.purpose && event.data.body?.messages)
   return <aside className="debug" aria-label="调试详情">
     <div className="debug-heading">
       <button className="icon" aria-label="关闭调试面板" onClick={close}>›</button>

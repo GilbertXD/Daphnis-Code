@@ -8,6 +8,7 @@ from unittest.mock import patch
 import httpx
 
 from daphnis import History, Operations, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.tool_state import PENDING, RUNNING, TOOL_STATE
 from daphnis.turn_state import project_turn_messages
@@ -37,6 +38,11 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
     def application(self, *, interactive=False, restore=None, max_primary_requests=20):
         def model(request):
             messages = json.loads(request.content)["messages"]
+            if messages[0]["content"] == TITLE_PROMPT:
+                return httpx.Response(200, json={"choices": [{
+                    "index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "写入测试文件"},
+                }]})
             self.requests.append(messages)
             if len(self.requests) == 1:
                 message = {"role": "assistant", "tool_calls": self.calls}

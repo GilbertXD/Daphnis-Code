@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from daphnis import History, Operations, Session
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.history import SessionLease
 from daphnis.tool_state import PENDING, TOOL_STATE
@@ -50,11 +51,26 @@ class WebTests(unittest.TestCase):
         self.workspace.mkdir()
         self.history = History(root / "sessions")
         self.requests = []
+        self.title_requests = []
+        self.titles_at_reply = []
         self.overflowed = False
 
         async def provider(request):
             body = json.loads(request.content)
+            if body["messages"][0]["content"] == TITLE_PROMPT:
+                self.title_requests.append(body)
+                source = body["messages"][-1]["content"]
+                if source.startswith("[REDACTED]"):
+                    return httpx.Response(200, json={
+                        "choices": [{
+                            "index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "整理首条消息"},
+                        }],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+                    })
+                return httpx.Response(503, json={"error": {"message": "Title unavailable"}})
             self.requests.append(body)
+            self.titles_at_reply.append(self.history.load(self.bridge.ops.session.id).title)
             last = body["messages"][-1]
             if "Summarize the conversation" in body["messages"][0]["content"]:
                 return httpx.Response(200, json={"choices": [{
@@ -323,7 +339,7 @@ class WebTests(unittest.TestCase):
         events = done["events"]
         self.assertEqual([e["id"] for e in events], sorted({e["id"] for e in events}))
         self.assertEqual(
-            [e["data"]["body"] for e in events if e["name"] == "model.request"],
+            [e["data"]["body"] for e in events if e["name"] == "model.request" and e["data"].get("purpose") != "title"],
             self.requests,
         )
         self.assertEqual(self.requests[0]["reasoning_effort"], "high")
@@ -382,10 +398,12 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="force-error")
         failed = self.wait_for(lambda frame: frame["state"]["recovery"] and not frame["status"]["running"])
         recovery = failed["state"]["recovery"]
+        self.assertEqual(failed["state"]["session"]["title"], "force-error")
         self.assertEqual((recovery["kind"], recovery["message_index"]), ("FAILED_USER", 0))
         self.command("retry", session_id, 202, key=recovery["key"])
         retry = self.wait_for(lambda frame: not frame["status"]["running"])
         self.assertEqual(len(retry["state"]["messages"]), 1)
+        self.assertEqual(retry["state"]["session"]["title"], "force-error")
         self.assertEqual(self.requests[0]["messages"], self.requests[1]["messages"])
         self.command("retry", session_id, 409, key=recovery["key"])
 
@@ -401,6 +419,55 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 3)
         result = json.loads(terminated["state"]["messages"][-1]["content"])
         self.assertEqual(result["error"]["code"], "execution_skipped")
+
+    def test_session_title_uses_first_prompt_and_preserves_manual_names(self):
+        session_id = self.snapshot()["session_id"]
+        prompt = f"  {API_KEY}\n\t{'一' * 80}"
+        self.command("thinking", session_id, mode="high")
+        self.command("send", session_id, 202, prompt=prompt)
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        expected = "整理首条消息"
+        self.assertEqual(done["state"]["session"]["title"], expected)
+        self.assertEqual(done["state"]["sessions"][0]["title"], expected)
+        self.assertEqual(self.history.load(session_id).title, expected)
+        self.assertEqual(
+            [message["content"] for message in done["state"]["messages"]],
+            [prompt.replace(API_KEY, "[REDACTED]"), "done"],
+        )
+        [title_request] = self.title_requests
+        self.assertEqual(title_request["reasoning_effort"], "none")
+        self.assertNotIn("tools", title_request)
+        self.assertEqual(title_request["messages"][1]["content"], prompt.replace(API_KEY, "[REDACTED]").strip())
+        self.assertEqual(self.requests[0]["reasoning_effort"], "high")
+        self.assertEqual(self.titles_at_reply, ["[REDACTED] " + "一" * 28 + "…"])
+        self.assertNotIn(expected, json.dumps(self.requests[0], ensure_ascii=False))
+        started = [e for e in done["events"] if e["name"] == "model.started"]
+        self.assertEqual([e["data"].get("purpose") for e in started], [None, "title"])
+        finished = next(e for e in done["events"] if e["name"] == "turn.finished")
+        self.assertLess(finished["id"], started[1]["id"])
+        reply_finished, title_finished = [e["data"] for e in done["events"] if e["name"] == "model.finished"]
+        self.assertGreater(reply_finished["chunks"], 0)
+        self.assertNotIn("chunks", title_finished)
+        self.assertEqual(done["status"]["turn_usage"]["total_tokens"], 5)
+        self.assertEqual(done["status"]["session_usage"]["total_tokens"], 17)
+
+        self.command("new", session_id)
+        fresh = self.snapshot()["session_id"]
+        self.command("rename", fresh, id=fresh, title="手动命名")
+        self.command("send", fresh, 202, prompt="首条消息")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(done["state"]["session"]["title"], "手动命名")
+        self.assertEqual(self.history.load(fresh).title, "手动命名")
+        self.assertEqual(len(self.title_requests), 1)
+
+    def test_failed_title_request_keeps_truncated_first_prompt(self):
+        session_id = self.snapshot()["session_id"]
+        self.command("send", session_id, 202, prompt="  修复\n\t" + "字" * 60)
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        expected = "修复 " + "字" * 36 + "…"
+        self.assertEqual(done["state"]["session"]["title"], expected)
+        self.assertEqual(self.titles_at_reply, [expected])
+        self.assertEqual(done["state"]["messages"][-1]["content"], "done")
 
     def test_new_session_settings_are_saved_with_first_message(self):
         initial = self.snapshot()
@@ -433,11 +500,13 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="pause")
         partial = self.wait_for(lambda frame: frame["live"])
         self.assertEqual(partial["live"]["1"]["content"], "prefix ")
+        self.assertEqual(partial["state"]["session"]["title"], "pause")
         self.command("cancel", session_id, 409, run_id="old")
         self.command("cancel", session_id, run_id=partial["run"]["id"])
         stopped = self.snapshot()
         self.assertEqual(stopped["state"]["messages"], [{"role": "user", "content": "pause"}])
         self.assertEqual(stopped["events"][-1]["data"]["status"], "CANCELLED")
+        self.assertEqual(self.title_requests, [])
 
         self.command("send", session_id, 202, prompt="pause")
         self.wait_for(lambda frame: frame["live"])
@@ -448,7 +517,7 @@ class WebTests(unittest.TestCase):
 
         self.command("send", session_id, 202, prompt="force-error")
         failed = self.wait_for(lambda frame: not frame["status"]["running"])
-        response = next(e for e in failed["events"] if e["name"] == "model.response_error")
+        response = next(e for e in failed["events"] if e["name"] == "model.response_error" and e["data"].get("purpose") != "title")
         self.assertEqual(response["data"]["http_status"], 429)
         self.assertEqual(response["data"]["body"]["error"]["api_key"], "[REDACTED]")
         self.assertNotIn(API_KEY, json.dumps(failed))

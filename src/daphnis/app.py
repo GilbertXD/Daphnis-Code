@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from saturnus import ChatClient
 
-from .agent import Agent, TurnResult
+from .agent import Agent, TurnResult, TurnStatus, assistant_text
 from .compaction import CompactionCheckpoint, CompactionError
 from .compaction_settings import CompactionSettings
 from .context import Context
@@ -35,6 +35,7 @@ from .models import (
 from .models.models import validate_catalog
 from .redaction import Redactor
 from .session import Session
+from .terminal_text import sanitize_terminal
 from .token_budget import TokenBudget
 from .tools import (
     ApprovalDecision,
@@ -428,17 +429,33 @@ class Application:
         async def run():
             async with self._history.lease(session) as lease:
                 save_failed = False
+                title_source = None
 
                 async def persist(candidate: Session) -> None:
-                    nonlocal save_failed
+                    nonlocal save_failed, title_source
                     if self._session is not session:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
+                        if candidate.title is None:
+                            first_user = next(
+                                (message for message in candidate.messages.snapshot()
+                                 if message["role"] == "user"),
+                                {},
+                            )
+                            text = sanitize_terminal(assistant_text(first_user))
+                            source = self._history_redactor.text(text).strip()
+                            title = " ".join(source.split())
+                            if len(title) > 40:
+                                title = title[:39].rstrip() + "…"
+                            candidate.title = title or None
+                            if title:
+                                title_source = source
                         await self._save_session(candidate, lease=lease)
                     except Exception:
                         save_failed = True
                         raise
 
+                result: TurnResult | None = None
                 try:
                     result = await agent.run(
                         session=session,
@@ -450,6 +467,8 @@ class Application:
                         output_limit=self._output_limits.get((provider, session.model_id)),
                         persist=persist,
                     )
+                    if result.status is TurnStatus.COMPLETED and title_source is not None:
+                        await self._name_session(agent, session, title_source, lease=lease)
                 except asyncio.CancelledError:
                     # Reported usage can extend beyond the last saved message boundary.
                     try:
@@ -457,7 +476,10 @@ class Application:
                             await self._save_session(session, lease=lease)
                     except Exception:
                         logger.exception("本轮已取消，已报告的用量未能保存。")
-                    raise
+                    if result is None:
+                        raise
+                    # Stopping title generation does not undo the completed reply.
+                    return result
                 if not save_failed and self._has_usage_to_save():
                     try:
                         await self._save_session(session, lease=lease)
@@ -543,6 +565,30 @@ class Application:
     async def _save_session(self, session: Session, *, lease: SessionLease | None = None) -> None:
         session.usage = self._usage.session
         await self._history.save_async(session, lease=lease)
+
+    async def _name_session(self, agent: Agent, session: Session, source: str, *, lease: SessionLease) -> None:
+        title = session.title
+        try:
+            async with asyncio.timeout(5):
+                generated = await agent.generate_title(session=session, source=source)
+            if generated:
+                lines = sanitize_terminal(self._history_redactor.text(generated)).strip().splitlines()
+                if len(lines) == 1 and 0 < len(candidate := " ".join(lines[0].split())) <= 40:
+                    title = candidate
+        except Exception as exc:  # noqa: BLE001 - Title generation is optional.
+            logger.debug("会话标题生成失败：%s", type(exc).__name__)
+        if title != session.title:
+            async def save_title() -> None:
+                updated = replace(session, title=title)
+                await self._save_session(updated, lease=lease)
+                session.title = updated.title
+                session.usage = updated.usage
+                session._saved_revision = updated._saved_revision
+
+            try:
+                await finish_io(save_title())
+            except Exception as exc:  # noqa: BLE001 - Keep the persisted fallback title.
+                logger.debug("会话标题保存失败：%s", type(exc).__name__)
 
     async def _save_and_publish_session(self, session: Session) -> None:
         if session._saved_revision is not None or len(session.messages) or self._has_usage_to_save():
