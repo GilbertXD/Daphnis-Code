@@ -73,6 +73,22 @@ class UsageView(Static):
             self._context_line.stylize(WARNING)
         if compacted_through:
             self._context_line.append(f" · 摘要至 #{compacted_through}")
+        budget_detail = ""
+        if context_budget:
+            trigger = context_budget.trigger_tokens
+            threshold = f"{trigger:,} Token" if trigger is not None else "未知"
+            if not context_budget.auto_enabled:
+                threshold = "已关闭"
+            elif context_budget.threshold_blocked_by_reserve:
+                threshold = "不高于输出预留，未生效"
+            source = "本地分词" if context_budget.count_source == "local_tokenizer" else "长度估算"
+            hard_limit = context_budget.hard_limit
+            safety = f"{hard_limit:,} Token" if hard_limit is not None else "未知"
+            budget_detail = (
+                f"\n计数来源：{source} · 输出预留 {context_budget.output_reserve:,} Token"
+                f"\n自动压缩阈值（输入 + 预留）：{threshold}"
+                f"\n安全上限（输入 + 预留）：{safety}"
+            )
         self.tooltip = (
             str(self._line("本轮", turn, exact=True))
             + "\n"
@@ -80,10 +96,7 @@ class UsageView(Static):
             + "\n"
             + self._context_line.plain
             + "（最近主请求的输入估算）"
-            + (
-                f"\n输出预留 {context_budget.output_reserve:,} Token"
-                if context_budget else ""
-            )
+            + budget_detail
             + "\nin / out = 输入 / 输出 Token；* 表示仅含已报告部分。"
         )
         self._redraw()

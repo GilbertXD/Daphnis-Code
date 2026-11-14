@@ -309,13 +309,14 @@ def project(
 class Compactor:
     def __init__(
         self, context_window: int | None, *, counter: TokenCounter = DEFAULT_COUNTER,
-        recent_tokens: int = 4096,
+        recent_tokens: int = 4096, response_format: dict[str, str] | None = None,
     ) -> None:
         if type(recent_tokens) is not int or recent_tokens < 0:
             raise ValueError("recent_tokens must be a non-negative integer.")
         self.context_window = context_window
         self.counter = counter
         self.recent_tokens = recent_tokens
+        self.response_format = response_format
         self.output_limit = (
             2048 if context_window is None else min(2048, max(1, context_window // 8))
         )
@@ -446,14 +447,21 @@ class Compactor:
         previous: CompactionCheckpoint | None,
         through: int,
         request: Callable[[list[Message], int], Awaitable[str]],
+        *,
+        target_tokens: int | None = None,
     ) -> CompactionCheckpoint:
         """Roll bounded batches into one checkpoint, leaving the original untouched."""
         summary = previous.summary if previous else ""
         start = previous.through if previous else 0
         prior_user = _retained_user(messages, start) if previous else None
         source = self._source(messages, start, through, prior_user=prior_user)
-        system = {"role": "system", "content": _SUMMARY_PROMPT}
-        output = {"output_limit": self.output_limit}
+        instruction = _SUMMARY_PROMPT
+        if target_tokens is not None:
+            instruction += f" Keep the complete JSON under about {target_tokens} tokens."
+        system = {"role": "system", "content": instruction}
+        body_options: dict[str, Any] = {"output_limit": self.output_limit}
+        if self.response_format is not None:
+            body_options["response_format"] = self.response_format
         pending = next(source, None)
         offset = 0
         repair_available = True
@@ -464,15 +472,15 @@ class Compactor:
             }
             prompt = [system, user]
             prefix = user["content"]
-            budget = request_budget(prompt, output, self.context_window, counter=self.counter)
-            ceiling = budget.compaction_threshold
+            budget = request_budget(prompt, body_options, self.context_window, counter=self.counter)
+            ceiling = budget.hard_input_limit
             if ceiling is None:
                 ceiling = budget.input_tokens + 24_000
 
             def fits(candidate: str, user=user, prompt=prompt, ceiling=ceiling) -> bool:
                 user["content"] = candidate
                 return request_budget(
-                    prompt, output, self.context_window, counter=self.counter,
+                    prompt, body_options, self.context_window, counter=self.counter,
                 ).input_tokens < ceiling
 
             body = prefix
@@ -518,9 +526,9 @@ class Compactor:
                 if not repair_available or exc.reason not in ("summary_json", "summary_schema", "summary_length"):
                     raise
                 repair_available = False
-                repair = [{**system, "content": f"{_SUMMARY_PROMPT}{_SUMMARY_REPAIR}\n{exc}"}, user]
+                repair = [{**system, "content": f"{instruction}{_SUMMARY_REPAIR}\n{exc}"}, user]
                 if request_budget(
-                    repair, output, self.context_window, counter=self.counter,
+                    repair, body_options, self.context_window, counter=self.counter,
                 ).input_tokens >= ceiling:
                     repair = prompt
                 summary = _summary_text(await request(repair, self.output_limit), model_output=True)

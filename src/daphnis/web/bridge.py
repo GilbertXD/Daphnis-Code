@@ -173,7 +173,11 @@ class Bridge:
                 "approval": asdict(approval) if approval else None,
                 "session_usage": asdict(ops.session_usage),
                 "turn_usage": asdict(usage) if usage else None,
-                "context_budget": asdict(budget) if budget else None,
+                "context_budget": {
+                    **asdict(budget),
+                    "hard_limit": budget.hard_limit,
+                    "threshold_blocked_by_reserve": budget.threshold_blocked_by_reserve,
+                } if budget else None,
                 "compacting": ops.compacting,
                 "compacted_through": ops.compacted_through,
             }),

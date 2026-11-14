@@ -26,9 +26,10 @@ from daphnis.compaction import (
     _summary_text,
     safe_boundaries,
 )
+from daphnis.compaction_settings import CompactionSettings
 from daphnis.models import ModelInfo
 from daphnis.terminal_commands import terminal_command
-from daphnis.token_budget import request_budget
+from daphnis.token_budget import TokenCounter, request_budget
 from daphnis.tools import create_tools
 from daphnis.turn_state import ABANDONED, CONTINUE, TERMINATED, TURN_STATE
 
@@ -39,6 +40,69 @@ SUMMARY = json.dumps({
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_summary_batch_and_repair_budget_count_response_format(self):
+        response_format = {"type": "json_object"}
+        counter = TokenCounter(lambda text: 120 if text == json.dumps(
+            response_format, separators=(",", ":"),
+        ) else (len(text) + 2) // 3)
+        compactor = Compactor(1200, counter=counter, response_format=response_format)
+        raw = [
+            {"role": "user", "content": "x" * 3000},
+            {"role": "assistant", "content": "done"},
+            {"role": "user", "content": "continue"},
+        ]
+        calls = []
+
+        async def summarize(messages, limit):
+            budget = request_budget(
+                messages, {"output_limit": limit, "response_format": response_format},
+                1200, counter=counter,
+            )
+            self.assertTrue(budget.fits)
+            calls.append([message["content"] for message in messages])
+            return "invalid JSON" if len(calls) == 1 else SUMMARY
+
+        await compactor.summarize(raw, None, 2, summarize)
+        self.assertGreater(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+
+    async def test_manual_compaction_retries_oversize_candidate_and_summary_truncation(self):
+        requests = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append(body)
+            self.assertEqual(body["response_format"], {"type": "json_object"})
+            self.assertNotIn("tools", body)
+            if len(requests) == 1:
+                return httpx.Response(200, json=reply('{"goals":"unfinished', finish="length"))
+            if len(requests) == 2:
+                return httpx.Response(200, json=reply(json.dumps({
+                    "goals": "verbose " * 800, "progress": "", "files": "", "next_steps": "",
+                })))
+            return httpx.Response(200, json=reply(SUMMARY))
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(Path(directory) / "history")
+            model = ModelInfo("fixture", "mimo", context_window=100_000, thinking_modes=("off",))
+            app = Application(workspace=directory, provider="mimo", model_id=model.id, catalog=(model,),
+                              history=history, connections={"mimo": {"base_url": "https://model.test/v1",
+                                                                    "transport": httpx.MockTransport(handler)}})
+            self.addAsyncCleanup(app.close)
+            state = app._session
+            state.messages.add_user("Original task " * 150)
+            state.messages.add_assistant("Original answer")
+            state.messages.add_user("Most recent task")
+            history.save(state)
+            candidates = []
+            app.events.on("compaction.candidate", candidates.append)
+            checkpoint = await Operations(app).compact()
+            self.assertEqual(len(requests), 3)
+            self.assertIn("truncated", requests[1]["messages"][0]["content"])
+            self.assertEqual(requests[0]["messages"][1], requests[2]["messages"][1])
+            self.assertEqual([event.data["reason"] for event in candidates], ["no_token_reduction", "reduced"])
+            self.assertEqual(history.load(state.id).compaction, checkpoint)
+
     def test_projection_preserves_omitted_user_task_and_original_reply(self):
         raw = [
             {"role": "user", "content": "写一篇1000字的小说"},
@@ -429,6 +493,89 @@ SMALL_MODEL = ModelInfo("model-a", "compatible", context_window=1200, supports_t
 
 
 class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fixed_threshold_triggers_summary_without_shrinking_maintenance_window(self):
+        state = session()
+        state.messages.add_user("past data " * 160)
+        state.messages.add_assistant("old answer")
+        requests = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append(body)
+            summary = "Summarize" in body["messages"][0]["content"]
+            return httpx.Response(200, json=reply(SUMMARY if summary else "finished"))
+
+        settings = CompactionSettings(threshold_mode="tokens", threshold_value=420)
+        model = ModelInfo("model-a", "compatible", context_window=2000)
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(model,),
+                compaction_settings=settings,
+            )
+            result = await agent.run(session=state, prompt="continue", output_limit=30)
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual((result.primary_requests, result.maintenance_requests), (1, 1))
+        self.assertEqual(state.compaction.through, 2)
+        self.assertGreater(
+            request_budget(requests[0]["messages"], requests[0], None).input_tokens,
+            settings.threshold_value,
+        )
+        self.assertEqual(requests[-1]["max_tokens"], 30)
+
+    async def test_disabled_auto_summary_still_trims_for_safety_and_allows_manual_summary(self):
+        state = session()
+        full_result = "old tool output " * 160
+        state.messages.add_user("old question")
+        state.messages.add({"role": "assistant", "content": None, "tool_calls": [tool_call()]})
+        state.messages.add_tool_result(tool_call_id="call-1", content=full_result)
+        state.messages.add_assistant("old answer")
+        requests = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            requests.append(body)
+            summary = "Summarize" in body["messages"][0]["content"]
+            return httpx.Response(200, json=reply(SUMMARY if summary else "finished"))
+
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(SMALL_MODEL,),
+                compaction_settings=CompactionSettings(auto_enabled=False),
+            )
+            result = await agent.run(session=state, prompt="continue", output_limit=400)
+            checkpoint = await agent.compact(session=state, operation_id="manual")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual((result.primary_requests, result.maintenance_requests), (1, 0))
+        self.assertIn("Tool output excerpt", requests[0]["messages"][2]["content"])
+        self.assertEqual(state.messages.snapshot()[2]["content"], full_result)
+        self.assertIsNone(state.compaction)
+        self.assertEqual(checkpoint.through, 4)
+        self.assertIn("Summarize", requests[1]["messages"][0]["content"])
+
+    async def test_threshold_consumed_by_reserve_does_not_trigger_repeated_maintenance(self):
+        state = session()
+        requests = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            response = reply(None, finish="tool_calls", calls=[tool_call()]) if len(requests) == 1 else reply()
+            return httpx.Response(200, json=response)
+
+        async with make_client(handler) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(SMALL_MODEL,), tools=registry(),
+                compaction_settings=CompactionSettings(threshold_mode="tokens", threshold_value=50),
+            )
+            with self.assertLogs("daphnis.agent", level="WARNING") as logged:
+                result = await agent.run(session=state, prompt="echo once", output_limit=50)
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual((result.primary_requests, result.maintenance_requests), (2, 0))
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("输出预留", logged.output[0])
+
     async def test_maintenance_exhaustion_keeps_primary_allowance_and_raw_checkpoint(self):
         state = session()
         state.messages.add_user("past data " * 1200)

@@ -60,6 +60,11 @@ export type ContextBudget = {
   output_reserve: number
   compaction_threshold: number | null
   needs_compaction: boolean
+  auto_enabled: boolean
+  trigger_tokens: number | null
+  hard_limit: number | null
+  threshold_blocked_by_reserve: boolean
+  count_source: 'estimate' | 'local_tokenizer'
 }
 
 export type Status = {

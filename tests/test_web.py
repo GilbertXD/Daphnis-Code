@@ -56,7 +56,7 @@ class WebTests(unittest.TestCase):
             body = json.loads(request.content)
             self.requests.append(body)
             last = body["messages"][-1]
-            if "Summarize the coding conversation" in body["messages"][0]["content"]:
+            if "Summarize the conversation" in body["messages"][0]["content"]:
                 return httpx.Response(200, json={"choices": [{
                     "index": 0, "message": {"role": "assistant", "content": json.dumps({
                         "goals": "continue", "progress": "recorded old state",
@@ -145,6 +145,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual(frame["state"]["messages"][0]["content"], old_prompt)
         self.assertEqual(len(frame["state"]["messages"]), 4)
         self.assertGreater(frame["status"]["context_budget"]["input_tokens"], 0)
+        budget = frame["status"]["context_budget"]
+        self.assertEqual(budget["hard_limit"], budget["context_window"] * 95 // 100)
+        self.assertTrue(budget["auto_enabled"])
         self.assertFalse(frame["status"]["compacting"])
         names = [event["name"] for event in frame["events"]]
         self.assertIn("context.overflow", names)

@@ -5,7 +5,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from contextlib import AsyncExitStack
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -14,6 +14,7 @@ from saturnus import ChatClient
 
 from .agent import Agent, TurnResult
 from .compaction import CompactionCheckpoint, CompactionError
+from .compaction_settings import CompactionSettings
 from .context import Context
 from .events import Event, EventBus
 from .history import (
@@ -72,7 +73,10 @@ class Application:
         max_primary_requests: int = 20,
         max_maintenance_requests: int = 12,
         max_total_requests: int = 32,
-        recent_tokens: int = 4096,
+        recent_tokens: int | None = None,
+        compaction_settings: CompactionSettings | None = None,
+        model_compaction_settings: Mapping[tuple[str, str], CompactionSettings] | None = None,
+        output_limits: Mapping[tuple[str, str], int] | None = None,
     ) -> None:
         self._catalog = tuple(catalog)
         validate_catalog(self._catalog)
@@ -96,8 +100,14 @@ class Application:
             "max_primary_requests": max_primary_requests,
             "max_maintenance_requests": max_maintenance_requests,
             "max_total_requests": max_total_requests,
-            "recent_tokens": recent_tokens,
         }
+        compaction_settings = compaction_settings or CompactionSettings()
+        self._compaction_settings = (
+            compaction_settings if recent_tokens is None
+            else replace(compaction_settings, recent_tokens=recent_tokens)
+        )
+        self._model_compaction_settings = dict(model_compaction_settings or {})
+        self._output_limits = dict(output_limits or {})
         self._task: asyncio.Task[TurnResult] | asyncio.Task[CompactionCheckpoint | None] | None = None
         self._approval_mode = ApprovalMode.AUTO
         self._approval: asyncio.Future[ApprovalDecision] | None = None
@@ -133,11 +143,7 @@ class Application:
             data = event.data
             self._last_budget = (
                 event.session_id, data["provider"], data["model_id"],
-                TokenBudget(
-                    data["input_tokens"], data["context_window"], data["output_reserve"],
-                    data["compaction_threshold"], data["needs_compaction"],
-                    data.get("count_source", "estimate"),
-                ),
+                TokenBudget(**{field.name: data[field.name] for field in fields(TokenBudget)}),
             )
         else:
             self._compacting = event.name == "compaction.started"
@@ -413,6 +419,9 @@ class Application:
             tools=self._tools.select(enabled_tools, mode=self._approval_mode),
             events=self.events,
             context=Context(system_prompt=session.effective_system_prompt),
+            compaction_settings=self._model_compaction_settings.get(
+                (provider, session.model_id), self._compaction_settings,
+            ),
             **self._request_limits,
         )
 
@@ -438,6 +447,7 @@ class Application:
                         recovery_key=recovery_key,
                         stream=stream,
                         thinking_mode=thinking,
+                        output_limit=self._output_limits.get((provider, session.model_id)),
                         persist=persist,
                     )
                 except asyncio.CancelledError:
@@ -471,6 +481,10 @@ class Application:
             client=self._client(provider), provider=provider, catalog=self._catalog,
             custom_compatibility=self._connection(provider).get("compatibility") is not None,
             events=self.events,
+            context=Context(system_prompt=session.effective_system_prompt),
+            compaction_settings=self._model_compaction_settings.get(
+                (provider, session.model_id), self._compaction_settings,
+            ),
             **self._request_limits,
         )
         fields = {"session_id": session.id, "turn_id": uuid4().hex, "trigger": "manual"}

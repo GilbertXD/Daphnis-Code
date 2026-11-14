@@ -1,12 +1,15 @@
-"""Read environment variables into Application connection options."""
+"""Read server-side settings into Application options."""
 
 import json
 import os
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .compaction_settings import CompactionSettings
 from .models import MODELS, ModelInfo
+from .models.models import validate_catalog
 from .models.tokenizer import verified_tokenizer
 
 _DEEPSEEK_V4_PRO_TOKENIZER_SHA256 = "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
@@ -22,6 +25,86 @@ def environment_catalog() -> tuple[ModelInfo, ...]:
         if (model.provider, model.id) == ("deepseek", "deepseek-v4-pro") else model
         for model in MODELS
     )
+
+
+def _table(value: Any, label: str, *, allowed: set[str] | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(f"{label} 必须是 TOML 表。")
+    if allowed is not None and (unknown := value.keys() - allowed):
+        raise ValueError(f"{label} 有未知配置项：{', '.join(sorted(unknown))}。")
+    return value
+
+
+def _compaction_settings(
+    value: Any, label: str, base: CompactionSettings,
+) -> CompactionSettings:
+    fields = _table(value, label, allowed={
+        "auto_enabled", "threshold_mode", "threshold_value", "recent_tokens",
+    })
+    if fields.get("threshold_mode", base.threshold_mode) != base.threshold_mode and (
+        "threshold_value" not in fields
+    ):
+        raise ValueError(f"{label} 切换阈值模式时须同时设置 threshold_value。")
+    try:
+        return replace(base, **fields)
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from None
+
+
+def load_context_options(
+    path: Path, *, catalog: tuple[ModelInfo, ...] = MODELS,
+) -> dict[str, Any]:
+    """Read compaction preferences and deployment limits from an explicit TOML file."""
+    try:
+        with path.open("rb") as source:
+            data = tomllib.load(source)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        raise ValueError("DAPHNIS_CONFIG 不是有效的 UTF-8 TOML。") from None
+    _table(data, "DAPHNIS_CONFIG", allowed={"compaction", "models"})
+    settings = _compaction_settings(data.get("compaction", {}), "compaction", CompactionSettings())
+    validate_catalog(catalog)
+    models = {(model.provider, model.id): model for model in catalog}
+    overrides: dict[tuple[str, str], CompactionSettings] = {}
+    output_limits: dict[tuple[str, str], int] = {}
+    for name, options in _table(data.get("models", {}), "models").items():
+        label = f"models.{name}"
+        provider, _, model_id = name.partition(":")
+        if not provider or not model_id or model_id != model_id.strip():
+            raise ValueError(f"{label} 需要使用 provider:model_id 格式。")
+        key = (provider, model_id)
+        fields = _table(options, label, allowed={"context_window", "output_limit", "compaction"})
+        model = models.get(key)
+        if model is None:
+            if provider != "compatible":
+                raise ValueError(f"{label} 对应的模型不在模型目录中。")
+            model = ModelInfo(id=model_id, provider=provider)
+        if "context_window" in fields:
+            window = fields["context_window"]
+            if type(window) is not int or window <= 0:
+                raise ValueError(f"{label}.context_window 必须是正整数。")
+            model = replace(model, context_window=window)
+        models[key] = model
+        if "output_limit" in fields:
+            limit = fields["output_limit"]
+            if type(limit) is not int or limit <= 0:
+                raise ValueError(f"{label}.output_limit 必须是正整数。")
+            if model.max_output_tokens is not None and limit > model.max_output_tokens:
+                raise ValueError(f"{label}.output_limit 不能超过模型上限 {model.max_output_tokens}。")
+            output_limits[key] = limit
+        if "compaction" in fields:
+            overrides[key] = _compaction_settings(fields["compaction"], f"{label}.compaction", settings)
+    return {
+        "catalog": tuple(models.values()),
+        "compaction_settings": settings,
+        "model_compaction_settings": overrides,
+        "output_limits": output_limits,
+    }
+
+
+def environment_context_options() -> dict[str, Any]:
+    catalog = environment_catalog()
+    path = os.getenv("DAPHNIS_CONFIG")
+    return load_context_options(Path(path).expanduser(), catalog=catalog) if path else {"catalog": catalog}
 
 
 def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:

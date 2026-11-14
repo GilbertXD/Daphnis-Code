@@ -18,6 +18,7 @@ from saturnus import Compatibility, ValidationError
 
 from daphnis import History, Operations, TurnResult, TurnStatus
 from daphnis.app import Application
+from daphnis.compaction_settings import CompactionSettings
 from daphnis.config import environment_connections
 from daphnis.models import CapabilityError, ModelInfo
 from daphnis.tool_state import PENDING, TOOL_STATE
@@ -44,6 +45,42 @@ def response(message, finish="stop"):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_switching_models_recomputes_compaction_budget_and_output_limit(self):
+        bodies = []
+
+        def handler(request):
+            bodies.append(json.loads(request.content))
+            return response({"role": "assistant", "content": "done"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_a = ModelInfo("a", "mimo", context_window=10_000, default_output_tokens=1_500)
+            model_b = ModelInfo("b", "mimo", context_window=20_000, default_output_tokens=2_000)
+            ops = Operations(Application(
+                workspace=root, provider="mimo", model_id="a", catalog=(model_a, model_b),
+                history=History(root / "sessions"),
+                connections={"mimo": {
+                    "base_url": "https://model.test", "transport": httpx.MockTransport(handler),
+                }},
+                compaction_settings=CompactionSettings(threshold_value=0.75),
+                model_compaction_settings={
+                    ("mimo", "b"): CompactionSettings(threshold_mode="tokens", threshold_value=12_000),
+                },
+                output_limits={("mimo", "b"): 500},
+            ))
+            self.addAsyncCleanup(ops.close)
+            self.assertEqual((await ops.send("one", stream=False)).status, TurnStatus.COMPLETED)
+            budget = ops.context_budget
+            self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (7500, 1500, 9500))
+            self.assertNotIn("max_completion_tokens", bodies[-1])
+
+            await ops.set_model("mimo", "b")
+            self.assertIsNone(ops.context_budget)
+            self.assertEqual((await ops.send("two", stream=False)).status, TurnStatus.COMPLETED)
+            budget = ops.context_budget
+            self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (12000, 500, 19000))
+            self.assertEqual(bodies[-1]["max_completion_tokens"], 500)
+
     async def test_session_system_prompt_persists_and_keeps_approval_and_hard_blocks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -962,7 +999,7 @@ class CLITests(unittest.TestCase):
                 ),
                 patch.object(cli, "Application", side_effect=factory),
                 patch.object(cli, "load_dotenv"),
-                patch.object(cli, "environment_catalog", return_value=CATALOG),
+                patch.object(cli, "environment_context_options", return_value={"catalog": CATALOG}),
             ):
 
                 def run(*args, error=None):

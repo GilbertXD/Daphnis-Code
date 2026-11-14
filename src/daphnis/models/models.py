@@ -14,16 +14,24 @@ class ModelInfo:
     supports_tools: bool | None = None
     thinking_modes: tuple[str, ...] | None = None
     token_counter: TokenCounter = DEFAULT_COUNTER
+    max_output_tokens: int | None = None
+    default_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "provider"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string.")
-        if self.context_window is not None and (
-            type(self.context_window) is not int or self.context_window <= 0
+        for name in ("context_window", "max_output_tokens", "default_output_tokens"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer or None.")
+        if (
+            self.default_output_tokens is not None
+            and self.max_output_tokens is not None
+            and self.default_output_tokens > self.max_output_tokens
         ):
-            raise ValueError("context_window must be a positive integer or None.")
+            raise ValueError("default_output_tokens cannot exceed max_output_tokens.")
         if self.supports_tools is not None and type(self.supports_tools) is not bool:
             raise ValueError("supports_tools must be True, False, or None.")
         if self.thinking_modes is not None:
@@ -37,14 +45,14 @@ class ModelInfo:
             object.__setattr__(self, "thinking_modes", modes)
 
 
-# Verified 2026-11-04 against official DeepSeek and MiMo API documentation.
-# DeepSeek's /models example gives an exact token count. MiMo documents "1M"
-# without an exact integer, so its context_window remains unknown here.
+# Exact limits come from DeepSeek's /models example and MiMo's OpenCode guide.
+# MiMo's default is documented for Chat Completions.
 DEEPSEEK_MODELS = (
     ModelInfo(
         id="deepseek-flash",
         provider="deepseek",
         context_window=1_048_576,
+        max_output_tokens=393_216,
         supports_tools=True,
         thinking_modes=("off", "on", "low", "high", "max"),
     ),
@@ -52,6 +60,7 @@ DEEPSEEK_MODELS = (
         id="deepseek-v4-pro",
         provider="deepseek",
         context_window=1_048_576,
+        max_output_tokens=393_216,
         supports_tools=True,
         thinking_modes=("off", "on", "low", "high", "max"),
     ),
@@ -61,12 +70,18 @@ MIMO_MODELS = (
     ModelInfo(
         id="mimo-v2.6-pro",
         provider="mimo",
+        context_window=1_048_576,
+        max_output_tokens=131_072,
+        default_output_tokens=131_072,
         supports_tools=True,
         thinking_modes=("off", "on"),
     ),
     ModelInfo(
         id="mimo-v2.6-flash",
         provider="mimo",
+        context_window=1_048_576,
+        max_output_tokens=131_072,
+        default_output_tokens=131_072,
         supports_tools=True,
         thinking_modes=("off", "on"),
     ),

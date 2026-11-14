@@ -58,9 +58,12 @@ function StatusPanel({ view }: { view: View }) {
       <div><dt>模型</dt><dd>{state.model.provider} / {state.model.id}</dd></div>
       <div><dt>窗口</dt><dd>{state.model.context_window?.toLocaleString() ?? '未知'}</dd></div>
       {status.context_budget && <>
-        <div><dt>最近请求输入估算</dt><dd>≈ {status.context_budget.input_tokens.toLocaleString()}</dd></div>
+        <div><dt>最近请求输入估算</dt><dd>≈ {status.context_budget.input_tokens.toLocaleString()}（{status.context_budget.count_source === 'local_tokenizer' ? '本地分词' : '长度估算'}）</dd></div>
         <div><dt>输出预留</dt><dd>{status.context_budget.output_reserve.toLocaleString()}</dd></div>
-        <div><dt>压缩阈值</dt><dd>{status.context_budget.compaction_threshold?.toLocaleString() ?? '未知'}</dd></div>
+        <div><dt>自动压缩阈值（输入 + 预留）</dt><dd>{!status.context_budget.auto_enabled ? '已关闭'
+          : status.context_budget.threshold_blocked_by_reserve ? '不高于输出预留，未生效'
+          : status.context_budget.trigger_tokens?.toLocaleString() ?? '未知'}</dd></div>
+        <div><dt>安全上限（输入 + 预留）</dt><dd>{status.context_budget.hard_limit?.toLocaleString() ?? '未知'}</dd></div>
       </>}
       <div><dt>摘要检查点</dt><dd>{status.compacted_through ? `第 ${status.compacted_through} 条消息` : '无'}</dd></div>
       <div><dt>审批模式</dt><dd>{state.approval_mode}</dd></div>

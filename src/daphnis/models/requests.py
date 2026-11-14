@@ -72,5 +72,7 @@ def prepare_request_options(
     if output_limit is not None:
         if type(output_limit) is not int or output_limit <= 0:
             raise ValueError("output_limit must be a positive integer.")
+        if model.max_output_tokens is not None and output_limit > model.max_output_tokens:
+            raise ValueError(f"output_limit exceeds the model maximum of {model.max_output_tokens}.")
         body["output_limit"] = output_limit
     return body

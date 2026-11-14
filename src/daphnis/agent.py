@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -30,6 +31,7 @@ from .compaction import (
     Compactor,
     safe_boundaries,
 )
+from .compaction_settings import CompactionSettings
 from .context import Context, history_range_hint
 from .events import EventBus
 from .history import finish_io
@@ -68,6 +70,7 @@ from .turn_state import (
     recovery_state,
 )
 
+logger = logging.getLogger(__name__)
 _ACTIVE_SESSIONS: set[str] = set()
 
 
@@ -143,7 +146,8 @@ class Agent:
         max_maintenance_requests: int | None = None,
         max_total_requests: int | None = None,
         max_tool_calls: int = 100,
-        recent_tokens: int = 4096,
+        recent_tokens: int | None = None,
+        compaction_settings: CompactionSettings | None = None,
     ) -> None:
         if max_requests is not None:
             if max_primary_requests is not None or max_total_requests is not None:
@@ -162,8 +166,6 @@ class Agent:
                 raise ValueError(f"{name} must be a positive integer.")
         if type(max_maintenance_requests) is not int or max_maintenance_requests < 0:
             raise ValueError("max_maintenance_requests must be a non-negative integer.")
-        if type(recent_tokens) is not int or recent_tokens < 0:
-            raise ValueError("recent_tokens must be a non-negative integer.")
         self._client = client
         self._provider = provider
         self._catalog = tuple(catalog)
@@ -176,7 +178,11 @@ class Agent:
         self.max_maintenance_requests = max_maintenance_requests
         self.max_total_requests = max_total_requests
         self.max_tool_calls = max_tool_calls
-        self.recent_tokens = recent_tokens
+        compaction_settings = compaction_settings or CompactionSettings()
+        self.compaction_settings = (
+            compaction_settings if recent_tokens is None
+            else replace(compaction_settings, recent_tokens=recent_tokens)
+        )
 
     async def _request(
         self,
@@ -292,6 +298,11 @@ class Agent:
             history_lookup=history_lookup,
         )
 
+    def _summary_response_format(self) -> dict[str, str] | None:
+        if self._provider in {"mimo", "deepseek"} and not self._custom_compatibility:
+            return {"type": "json_object"}
+        return None
+
     async def _request_summary(
         self,
         model: ModelInfo,
@@ -303,10 +314,12 @@ class Agent:
         can_disable_thinking = "off" in (model.thinking_modes or ()) and (
             model.provider != "compatible" or self._custom_compatibility
         )
+        response_format = self._summary_response_format()
         body = prepare_request_options(
             model=model,
             thinking_mode="off" if can_disable_thinking else None,
             output_limit=output_limit,
+            extra_body={"response_format": response_format} if response_format is not None else None,
             custom_compatibility=self._custom_compatibility,
         )
         await self.events.emit(
@@ -343,15 +356,20 @@ class Agent:
             raise ValueError("Session provider does not match the ChatClient connection.")
         model = resolve_model(session.provider, session.model_id, catalog=self._catalog)
         compactor = Compactor(
-            model.context_window, counter=model.token_counter, recent_tokens=self.recent_tokens,
+            model.context_window, counter=model.token_counter,
+            recent_tokens=self.compaction_settings.recent_tokens,
+            response_format=self._summary_response_format(),
         )
         raw = session.messages.snapshot()
+        fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
         if raw and len(raw) not in safe_boundaries(raw):
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
         through = compactor.cut(raw, previous)
         if through is None:
+            await self.events.emit("compaction.candidate", **fields, reason="no_safe_cut")
             return None
+        before = self._request_budget(self._model_context(session.messages, previous), {}, model).input_tokens
         number = 0
 
         async def summarize(messages: list[dict[str, Any]], output_limit: int) -> str:
@@ -366,21 +384,48 @@ class Agent:
                 "request_number": number, "purpose": "compaction", "maintenance": True,
             })
 
-        checkpoint = await compactor.summarize(raw, previous, through, summarize)
-        before = self._model_context(session.messages, previous)
-        after = self._model_context(session.messages, checkpoint)
-        if self._request_budget(after, {}, compactor).input_tokens >= self._request_budget(
-            before, {}, compactor,
-        ).input_tokens:
+        return await self._shorter_checkpoint(
+            compactor, raw, previous, through, summarize, before,
+            lambda candidate: self._request_budget(self._model_context(session.messages, candidate), {}, model).input_tokens,
+            fields, can_retry=lambda: number < min(self.max_maintenance_requests, self.max_total_requests),
+        )
+
+    async def _shorter_checkpoint(
+        self, compactor: Compactor, raw: list[dict[str, Any]], previous: CompactionCheckpoint | None,
+        through: int, summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]], before: int,
+        projected_tokens: Callable[[CompactionCheckpoint], int], fields: dict[str, Any],
+        *, can_retry: Callable[[], bool], input_target: int | None = None,
+    ) -> CompactionCheckpoint | None:
+        placeholder = CompactionCheckpoint(through, '{"goals":"x","progress":"","files":"","next_steps":""}')
+        fixed = projected_tokens(placeholder)
+        if fixed >= before:
+            await self.events.emit("compaction.candidate", **fields, reason="no_token_headroom",
+                                   through=through, before_tokens=before, after_tokens=fixed)
             return None
-        return checkpoint
+        headroom = before - fixed
+        if input_target is not None and input_target > fixed:
+            headroom = min(headroom, input_target - fixed)
+        targets = (max(1, min(compactor.output_limit * 3 // 4, headroom * 3 // 4)), max(1, headroom // 2))
+        for target in dict.fromkeys((targets[0], min(targets))):
+            candidate = await compactor.summarize(raw, previous, through, summarize, target_tokens=target)
+            after = projected_tokens(candidate)
+            reason = "reduced" if after < before else "no_token_reduction"
+            await self.events.emit("compaction.candidate", **fields, reason=reason, through=through,
+                                   before_tokens=before, after_tokens=after)
+            if after < before:
+                return candidate
+            if not can_retry():
+                break
+        return None
 
     def _request_budget(
-        self, messages: list[dict[str, Any]], body: dict[str, Any], compactor: Compactor,
+        self, messages: list[dict[str, Any]], body: dict[str, Any], model: ModelInfo,
     ) -> TokenBudget:
         return request_budget(
-            messages, body, compactor.context_window, counter=compactor.counter,
+            messages, body, model.context_window, counter=model.token_counter,
             provider=None if self._custom_compatibility else self._provider,
+            default_output_tokens=None if self._custom_compatibility else model.default_output_tokens,
+            settings=self.compaction_settings,
         )
 
     async def _compact_request(
@@ -390,31 +435,40 @@ class Agent:
         checkpoint: CompactionCheckpoint | None,
         messages: list[dict[str, Any]],
         body: dict[str, Any],
+        model: ModelInfo,
         compactor: Compactor,
         summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]],
         fields: dict[str, Any],
+        can_retry: Callable[[], bool],
+        attempted_cuts: set[tuple[int, int]],
         trigger: str = "pressure",
         history_lookup: bool = False,
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
         overflow = trigger == "overflow"
-        before = self._request_budget(messages, body, compactor).input_tokens
+        before = self._request_budget(messages, body, model).input_tokens
         await self.events.emit("compaction.started", **fields, input_tokens=before)
         status = "skipped"
         error = None
         failure_reason = None
         try:
             pruned = compactor.prune(messages)
-            budget = self._request_budget(pruned, body, compactor)
+            budget = self._request_budget(pruned, body, model)
             messages = pruned
-            if overflow or budget.needs_compaction:
+            if self.compaction_settings.auto_enabled and (
+                overflow or budget.needs_compaction or budget.needs_safety_compaction
+            ):
+                available = (
+                    budget.compaction_threshold if budget.needs_compaction
+                    else budget.hard_input_limit
+                )
                 raw = history.snapshot()
-                available = budget.compaction_threshold
+                input_target = available
                 if available is not None:
                     privileged = Messages([
                         message for message in raw if message["role"] in ("system", "developer")
                     ])
-                    fixed = self._request_budget(self.context.build(privileged), body, compactor)
+                    fixed = self._request_budget(self.context.build(privileged), body, model)
                     available -= fixed.input_tokens + compactor.output_limit
                     available -= compactor.counter.count(SUMMARY_POLICY)
                     if history_lookup:
@@ -422,22 +476,37 @@ class Agent:
                 through = compactor.cut(
                     raw, checkpoint, within_turn=True, available_tokens=available,
                 )
-                if through is not None:
+                cut_key = (checkpoint.through if checkpoint else 0, through) if through is not None else None
+                if through is None:
+                    failure_reason = "no_safe_cut"
+                elif cut_key in attempted_cuts:
+                    failure_reason = "already_attempted"
+                else:
+                    attempted_cuts.add(cut_key)
+
+                    def project_candidate(candidate: CompactionCheckpoint) -> list[dict[str, Any]]:
+                        return compactor.prune(self._model_context(
+                            history, candidate, history_lookup=history_lookup,
+                        ))
+
                     try:
-                        candidate = await compactor.summarize(raw, checkpoint, through, summarize)
+                        candidate = await self._shorter_checkpoint(
+                            compactor, raw, checkpoint, through, summarize, budget.input_tokens,
+                            lambda candidate: self._request_budget(project_candidate(candidate), body, model).input_tokens,
+                            fields, can_retry=can_retry, input_target=input_target,
+                        )
                     except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
                         error = type(exc).__name__
                         if isinstance(exc, CompactionError):
                             failure_reason = exc.reason
                     else:
-                        projected = compactor.prune(self._model_context(
-                            history, candidate, history_lookup=history_lookup,
-                        ))
-                        after = self._request_budget(projected, body, compactor)
-                        if after.input_tokens < budget.input_tokens:
-                            checkpoint, messages, budget = candidate, projected, after
+                        if candidate is None:
+                            failure_reason = "no_token_reduction"
+                        else:
+                            checkpoint, messages = candidate, project_candidate(candidate)
+                            budget = self._request_budget(messages, body, model)
                             status = "staged"
-            if overflow or budget.needs_compaction:
+            if overflow or budget.needs_compaction or budget.needs_safety_compaction:
                 # The latest exchange can itself be oversized. Keep its IDs and excerpts.
                 messages = compactor.prune(messages, include_latest=True)
             return checkpoint, messages
@@ -445,7 +514,7 @@ class Agent:
             status = "cancelled"
             raise
         finally:
-            after_tokens = self._request_budget(messages, body, compactor).input_tokens
+            after_tokens = self._request_budget(messages, body, model).input_tokens
             if status == "skipped":
                 if error:
                     status = "failed"
@@ -521,7 +590,9 @@ class Agent:
                 item["function"]["name"] for item in definitions
             )
             compactor = Compactor(
-                model.context_window, counter=model.token_counter, recent_tokens=self.recent_tokens,
+                model.context_window, counter=model.token_counter,
+                recent_tokens=self.compaction_settings.recent_tokens,
+                response_format=self._summary_response_format(),
             )
 
             def check_session() -> None:
@@ -628,9 +699,12 @@ class Agent:
 
             maintenance_limited = False
 
+            def maintenance_available() -> bool:
+                return maintenance_requests < self.max_maintenance_requests and requests + 1 < self.max_total_requests
+
             async def summarize(messages: list[dict[str, Any]], limit: int) -> str:
                 nonlocal requests, maintenance_requests, maintenance_limited
-                if maintenance_requests >= self.max_maintenance_requests or requests + 1 >= self.max_total_requests:
+                if not maintenance_available():
                     maintenance_limited = True
                     raise CompactionError(
                         "No maintenance requests available for compaction.", reason="maintenance_limit",
@@ -719,22 +793,37 @@ class Agent:
             )
             for call, index in pending:
                 await process_tool(call, index, {**fields, "request_number": 0})
+            attempted_cuts: set[tuple[int, int]] = set()
+            warned_about_reserve = False
             while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
                 messages = self._model_context(session.messages, checkpoint, history_lookup=history_lookup)
-                budget = self._request_budget(messages, body, compactor)
-                if budget.needs_compaction:
+                budget = self._request_budget(messages, body, model)
+                if budget.threshold_blocked_by_reserve and not warned_about_reserve:
+                    logger.warning(
+                        "压缩阈值（%s Token）不高于输出预留（%s Token）；"
+                        "本轮仅按安全上限检查。请提高阈值或降低 output_limit。",
+                        budget.trigger_tokens, budget.output_reserve,
+                    )
+                    warned_about_reserve = True
+                if budget.needs_compaction or budget.needs_safety_compaction:
                     checkpoint, messages = await self._compact_request(
                         history=session.messages, checkpoint=checkpoint, messages=messages,
-                        body=body, compactor=compactor, summarize=summarize, fields=fields,
-                        history_lookup=history_lookup,
+                        body=body, model=model, compactor=compactor, summarize=summarize,
+                        fields=fields, history_lookup=history_lookup,
+                        can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                     )
-                    budget = self._request_budget(messages, body, compactor)
+                    budget = self._request_budget(messages, body, model)
                 if not budget.fits:
                     if maintenance_limited:
                         break
-                    raise CompactionError("The request cannot fit the configured context window.")
+                    raise CompactionError(
+                        f"请求超过上下文安全上限（输入 {budget.input_tokens:,} + 输出预留 "
+                        f"{budget.output_reserve:,} > {budget.hard_limit:,} Token）。"
+                        "请尝试 /compact、缩短输入或降低 output_limit。",
+                        reason="context_safety_limit",
+                    )
                 while True:
                     try:
                         response, request_fields = await send_request(messages, body, budget)
@@ -752,11 +841,11 @@ class Agent:
                             before = budget.input_tokens
                             checkpoint, reduced = await self._compact_request(
                                 history=session.messages, checkpoint=checkpoint, messages=messages,
-                                body=body, compactor=compactor, summarize=summarize,
-                                fields=failure_fields, trigger="overflow",
-                                history_lookup=history_lookup,
+                                body=body, model=model, compactor=compactor, summarize=summarize,
+                                fields=failure_fields, trigger="overflow", history_lookup=history_lookup,
+                                can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                             )
-                            budget = self._request_budget(reduced, body, compactor)
+                            budget = self._request_budget(reduced, body, model)
                             if not budget.fits:
                                 reason = "window_limit"
                             elif budget.input_tokens >= before:

@@ -220,6 +220,8 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                 prepare_request_options(model=model, output_limit=limit)
         with self.assertRaises(TypeError):
             prepare_request_options(model=model, extra_body=[])
+        with self.assertRaisesRegex(ValueError, "exceeds the model maximum"):
+            prepare_request_options(model=model, output_limit=model.max_output_tokens + 1)
 
         async with ChatClient(
             base_url="https://model.test",
