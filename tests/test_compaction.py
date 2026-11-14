@@ -196,9 +196,9 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_history_range_hint_requires_checkpoint_and_both_selected_tools(self):
         for compacted, names, expected in (
-            (False, ["history_search", "history_read"], False),
-            (True, ["history_search"], False),
-            (True, ["history_search", "history_read"], True),
+            (False, ["retrieval", "history_read"], False),
+            (True, ["retrieval"], False),
+            (True, ["retrieval", "history_read"], True),
         ):
             with self.subTest(compacted=compacted, names=names), tempfile.TemporaryDirectory() as directory:
                 state = Session(directory, "compatible", "model-a")
@@ -528,7 +528,7 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, page["content"])
             return httpx.Response(200, json=reply())
 
-        tools = create_tools(redactor=Redactor([secret])).select(["history_search", "history_read"])
+        tools = create_tools(redactor=Redactor([secret])).select(["retrieval", "history_read"])
         async with make_client(handler) as client:
             agent = Agent(
                 client=client, provider="compatible", catalog=CATALOG, tools=tools,

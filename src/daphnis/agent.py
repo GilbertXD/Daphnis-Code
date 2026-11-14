@@ -291,7 +291,7 @@ class Agent:
 
     def _model_context(
         self, history: Messages, checkpoint: CompactionCheckpoint | None,
-        *, history_lookup: bool | str = False,
+        *, history_lookup: bool = False,
     ) -> list[dict[str, Any]]:
         if checkpoint is None:
             return self.context.build(history)
@@ -444,7 +444,7 @@ class Agent:
         can_retry: Callable[[], bool],
         attempted_cuts: set[tuple[int, int]],
         trigger: str = "pressure",
-        history_lookup: bool | str = False,
+        history_lookup: bool = False,
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
         overflow = trigger == "overflow"
@@ -483,9 +483,7 @@ class Agent:
                     available -= fixed.input_tokens + compactor.output_limit
                     available -= compactor.counter.count(SUMMARY_POLICY)
                     if history_lookup:
-                        available -= compactor.counter.count(
-                            history_range_hint(len(raw), retrieval=history_lookup == "retrieval"),
-                        )
+                        available -= compactor.counter.count(history_range_hint(len(raw)))
                 through = compactor.cut(
                     raw, checkpoint, within_turn=True, available_tokens=available,
                 )
@@ -600,10 +598,8 @@ class Agent:
             definitions = tools.definitions() if tools is not None else []
             if definitions:
                 require_tools(model)
-            tool_names = {item["function"]["name"] for item in definitions}
-            history_lookup = (
-                "retrieval" if {"retrieval", "history_read"} <= tool_names
-                else {"history_search", "history_read"} <= tool_names
+            history_lookup = {"retrieval", "history_read"}.issubset(
+                item["function"]["name"] for item in definitions
             )
             compactor = Compactor(
                 model.context_window, counter=model.token_counter,

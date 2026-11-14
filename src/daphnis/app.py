@@ -43,7 +43,6 @@ from .tools import (
     ToolExecutor,
     create_tools,
 )
-from .tools.retrieval import RetrievalEngine
 from .turn_state import RecoveryAction
 from .usage import UsageTracker
 
@@ -78,7 +77,6 @@ class Application:
         compaction_settings: CompactionSettings | None = None,
         model_compaction_settings: Mapping[tuple[str, str], CompactionSettings] | None = None,
         output_limits: Mapping[tuple[str, str], int] | None = None,
-        retrieval: RetrievalEngine | None = None,
     ) -> None:
         self._catalog = tuple(catalog)
         validate_catalog(self._catalog)
@@ -91,10 +89,7 @@ class Application:
                 secrets.append(key)
             if isinstance(headers := options.get("auth_headers"), Mapping):
                 secrets.extend(value for value in headers.values() if isinstance(value, str))
-        if retrieval is not None and isinstance(key := getattr(retrieval.embedder, "api_key", None), str):
-            secrets.append(key)
         self._history_redactor = Redactor(secrets)
-        self._retrieval = retrieval
         self._clients: dict[str, ChatClient] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -221,7 +216,6 @@ class Application:
             trusted=self._trusted_tools,
             redactor=self._history_redactor,
             search_excluded_directory=self._history.directory,
-            retrieval=self._retrieval,
             connections=(
                 server
                 for server in self._mcp.values()

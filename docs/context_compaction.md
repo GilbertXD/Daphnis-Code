@@ -64,28 +64,22 @@ context_window = 64000
 
 ## 历史回查
 
-在支持工具的会话中可启用 `history_search`、`history_read` 和 `history_operations`。需要为已有会话增加工具时，可用终端命令 `/tools on history_search history_read history_operations`。主模型请求存在压缩检查点，且同时启用了搜索和读取工具时，上下文说明会提示可回查的范围 `[0, through)`。符合回查规则的工具结果预览会提示原始 `message_id`。用该 ID 从第一页读取，再按 `next_start` 翻页。
+支持工具的会话可使用 `retrieval`、`history_read` 和 `history_operations`。需要为已有会话启用这些工具时，可运行 `/tools on retrieval history_read history_operations`。恢复旧会话时，已启用的 `history_search` 会映射为 `retrieval`。
+
+`retrieval` 是独立的会话历史工具，无需额外配置。它在本地用 BM25 对可见的脱敏文本排序，默认返回 5 条、最多 10 条片段，并附可直接传给 `history_read` 的原始消息 ID 和字符区间。生成压缩后的请求时，如果两种工具均已启用，上下文会提示压缩范围 `[0, through)` 和回查方法。模型根据当前任务决定是否检索。符合回查规则的工具结果预览会提示原始 `message_id`。
 
 ```text
-history_search({"query":"发布标记","limit":5})
+retrieval({"query":"发布标记","limit":5})
 history_read({"message_id":12,"start":0})
 history_read({"message_id":12,"start":4096,"end":8192})
 history_operations({"start":0,"limit":10})
 ```
 
-`history_search` 对可见文本做不区分大小写的字面匹配，按消息从新到旧返回，每条最多 240 个字符。默认 10 条，上限 20 条。`history_read` 只读当前 Session 已提交的原始记录，每页最多 4096 个字符。使用返回的 `next_start` 翻页，`end` 为可选的排他上界。`message_id` 是从 0 开始的原始消息位置，压缩和会话重载不会改变它。范围按脱敏后的可见文本计算。
+`history_read` 只读当前 Session 已提交的原始记录，每页最多 4096 个字符。可以从第一页读取，也可以指定检索结果中的范围。使用返回的 `next_start` 翻页，`end` 为可选的排他上界。`message_id` 是从 0 开始的原始消息位置，压缩和会话重载不会改变它。范围按脱敏后的可见文本计算。
 
 `history_operations` 按结果消息的原始顺序返回可核对的内置工具调用。每项包含调用消息 ID、工具名、结果消息 ID 和可公开的工具调用 ID。无法公开的调用 ID 返回 null。使用 `next_start` 继续，默认 10 条，上限 20 条。索引省略参数和结果正文，历史操作不能证明当前工作区仍处于相同状态。
 
 可回查用户和助手的可见文本，以及来源可核对的内置工具结果。系统和开发者消息、私有推理、工具参数、受保护凭据文件的结果、外部工具及历史回查工具自身的结果在可见范围外。回查不访问其他会话，所有返回内容只作历史数据使用。工具执行继续遵循当前审批模式和硬编码权限规则。
-
-### 可选 Retrieval / RAG
-
-在 CLI 或 Web 的服务端环境设置 `DAPHNIS_RETRIEVAL=bm25`、`semantic` 或 `hybrid`。未设置时使用 `history_search`。启用后由 `retrieval` 提供搜索，`history_read` 和 `history_operations` 继续可用。恢复会话时，原来选择的搜索工具会映射为当前配置提供的搜索工具。
-
-`retrieval` 按相关性返回当前会话的脱敏片段，附原始 `message_id` 和可直接传给 `history_read` 的字符区间。BM25 在本地运行。Semantic 用向量相似度排序，Hybrid 融合 BM25 和向量排名。模型通过工具调用获取片段，压缩检查点无需重建。
-
-向量检索使用 OpenAI 兼容的 Embedding 服务。设置完整端点 `DAPHNIS_EMBEDDING_URL`、模型 `DAPHNIS_EMBEDDING_MODEL`，以及可选的 `DAPHNIS_EMBEDDING_DIMENSIONS` 和 `DAPHNIS_EMBEDDING_API_KEY`。配置的服务会收到脱敏后的查询和当前会话可回查的文本片段。服务不可用、未配置或索引超过向量上限时，工具回退到 BM25，并返回 `fallback` 原因。
 
 ## 提交、取消与持久化
 

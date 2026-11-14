@@ -313,12 +313,10 @@ class Operations:
         restored = app._history.load(session_id)
         if not Path(restored.workspace).is_dir():
             raise ValueError("该会话原工作区已不存在。")
-        available = set(self.all_tools)
-        for old, new in (("history_search", "retrieval"), ("retrieval", "history_search")):
-            if old not in available and new in available and old in restored.enabled_tools:
-                restored = replace(restored, enabled_tools=tuple(dict.fromkeys(
-                    new if name == old else name for name in restored.enabled_tools
-                )))
+        if "history_search" in restored.enabled_tools:
+            restored = replace(restored, enabled_tools=tuple(dict.fromkeys(
+                "retrieval" if name == "history_search" else name for name in restored.enabled_tools
+            )))
         model = app._model_for(restored.provider, restored.model_id)
         self._validate_thinking(model, restored.thinking)
         self._validate_tools(
