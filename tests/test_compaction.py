@@ -30,6 +30,7 @@ from daphnis.models import ModelInfo
 from daphnis.terminal_commands import terminal_command
 from daphnis.token_budget import request_budget
 from daphnis.tools import create_tools
+from daphnis.turn_state import ABANDONED, CONTINUE, TERMINATED, TURN_STATE
 
 SUMMARY = json.dumps({
     "goals": "Update a file", "progress": "Inspected the workspace",
@@ -38,6 +39,26 @@ SUMMARY = json.dumps({
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
+    def test_projection_preserves_omitted_user_task_and_original_reply(self):
+        raw = [
+            {"role": "user", "content": "写一篇1000字的小说"},
+            {"role": "assistant", "content": "# 《无法投递》\n" + "小说正文" * 100},
+            {"role": "user", "content": "已作废的要求", TURN_STATE: ABANDONED},
+            {"role": "user", "content": "做一个扫雷游戏"},
+            {"role": "assistant", "content": "扫雷完成。"},
+            {"role": "user", "content": "我们做过什么？"},
+        ]
+        checkpoint = CompactionCheckpoint(5, json.dumps({
+            "goals": "制作小游戏", "progress": "扫雷完成", "files": "minesweeper.html", "next_steps": "",
+        }))
+        projected = Context().build(Messages(raw), checkpoint)
+        summary = projected[1]["content"]
+        self.assertIn('[message_id=0] "写一篇1000字的小说"', summary)
+        self.assertIn('[message_id=1] "# 《无法投递》"', summary)
+        self.assertNotIn("已作废的要求", summary)
+        self.assertNotIn("小说正文" * 100, summary)
+        self.assertEqual(projected[-1], raw[-1])
+
     def test_summary_parser_accepts_one_json_object_with_optional_fence(self):
         canonical = _summary_text(SUMMARY)
         for value in (
@@ -169,6 +190,118 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             offset = part["end"]
         self.assertEqual(offset, len(content))
         self.assertEqual(raw[2]["content"], content)
+
+    async def test_summary_folds_only_repetitive_command_diagnostics(self):
+        log = {
+            "ok": False, "error": {"code": "command_failed", "message": "nonzero exit"},
+            "stdout": (
+                "".join(f"[{index:04}] TRACE checking cached inputs\n" for index in range(80))
+                + "ERROR ERR_PAYLOAD_CHECKSUM failure_id=BLD-7841\n"
+                + "".join(f"[{index:04}] TRACE checking cached inputs\n" for index in range(80, 160))
+            ),
+            "stderr": "WARNING followup needed\n" + "DEBUG check complete\n" * 10,
+            "exit_code": 23, "timed_out": False, "terminated": False,
+            "stdout_truncated": False, "stderr_truncated": True,
+        }
+        content = json.dumps(log)
+        unique = json.dumps({
+            **log,
+            "ok": True, "exit_code": 0, "error": None,
+            "stdout": "".join(f"[{index:04}] INFO record id={index}\n" for index in range(20)),
+            "stderr": "",
+        })
+        raw = Messages()
+        raw.add_user("Build and collect diagnostics.")
+        raw.add_assistant(extra={"tool_calls": [
+            tool_call("command", name="run_command"),
+            tool_call("external", name="mcp_example"),
+            tool_call("unique", name="run_command"),
+        ]})
+        raw.add_tool_result(tool_call_id="external", content=content)
+        raw.add_tool_result(tool_call_id="command", content=content)
+        raw.add_tool_result(tool_call_id="unique", content=unique)
+        raw.add_user("Follow up.")
+        original = raw.snapshot()
+        records = []
+
+        async def summarize(messages, limit):
+            records.extend(
+                json.loads(line)
+                for line in messages[1]["content"].split("History records:\n", 1)[1].splitlines()
+            )
+            return SUMMARY
+
+        await Compactor(None).summarize(original, None, 5, summarize)
+        results = {record["tool_call_id"]: record for record in records if record["role"] == "tool"}
+        self.assertEqual(results["external"]["content"], content)
+        self.assertEqual(results["unique"]["content"], unique)
+        record = results["command"]
+        self.assertEqual(record["message_index"], 3)
+        self.assertEqual(record["view"], "folded_command_log")
+        self.assertEqual(record["end"], len(record["content"]))
+        reduced = json.loads(record["content"])
+        self.assertEqual(
+            {key: value for key, value in reduced.items() if key not in {"stdout", "stderr"}},
+            {key: value for key, value in log.items() if key not in {"stdout", "stderr"}},
+        )
+        self.assertEqual(reduced["stdout"].splitlines(), [
+            "[0000] TRACE checking cached inputs",
+            "[Daphnis: 78 repeated log lines folded.]",
+            "[0079] TRACE checking cached inputs",
+            "ERROR ERR_PAYLOAD_CHECKSUM failure_id=BLD-7841",
+            "[0080] TRACE checking cached inputs",
+            "[Daphnis: 78 repeated log lines folded.]",
+            "[0159] TRACE checking cached inputs",
+        ])
+        self.assertIn("WARNING followup needed\n", reduced["stderr"])
+        self.assertIn("[Daphnis: 8 repeated log lines folded.]", reduced["stderr"])
+        self.assertEqual(raw.snapshot(), original)
+
+    async def test_recovery_facts_survive_compaction_when_the_model_omits_them(self):
+        def result(code, *, source="daphnis_recovery"):
+            return json.dumps({"ok": False, "source": source, "error": {"code": code}})
+
+        raw = Messages()
+        raw.add_user("Run the first batch", extra={TURN_STATE: TERMINATED})
+        raw.add_assistant(extra={"tool_calls": [tool_call("a"), tool_call("b"), tool_call("c")]})
+        raw.add_tool_result(tool_call_id="a", content=result("execution_result_unknown"))
+        raw.add_tool_result(tool_call_id="b", content=result("execution_skipped"))
+        raw.add_tool_result(tool_call_id="c", content=result("execution_result_unknown", source="other"))
+        raw.add_user("Check the workspace")
+        raw.add_assistant("Workspace checked")
+        raw.add_user("Next task")
+        original = raw.snapshot()
+        expected = [
+            {"message_index": 0, "turn_terminated_by_user": True},
+            {"message_index": 2, "tool_call_id": "a", "error_code": "execution_result_unknown"},
+            {"message_index": 3, "tool_call_id": "b", "error_code": "execution_skipped"},
+        ]
+        records = []
+
+        async def summarize(messages, limit):
+            for line in messages[1]["content"].split("History records:\n", 1)[1].splitlines():
+                record = json.loads(line)
+                if record["field"] == "recovery":
+                    records.append({"message_index": record["message_index"], **json.loads(record["content"])})
+            return SUMMARY
+
+        compactor = Compactor(None)
+        first = await compactor.summarize(original, None, 5, summarize)
+        self.assertEqual(records, expected)
+        second = await compactor.summarize(original, first, 7, summarize)
+        for checkpoint in (first, second):
+            effective = Context().build(raw, checkpoint)
+            summary, facts = effective[1]["content"].rsplit("\n", 1)
+            self.assertIn(checkpoint.summary, summary)
+            self.assertEqual(json.loads(facts), expected)
+            self.assertEqual(effective[2:], original[checkpoint.through:])
+
+        continued = Messages([{**original[0], TURN_STATE: CONTINUE}, *original[1:]])
+        effective = Context().build(continued, first)
+        summary, facts = effective[1]["content"].rsplit("\n", 1)
+        self.assertIn("A turn_terminated_by_user record means", summary)
+        self.assertEqual(json.loads(facts), expected[1:])
+        self.assertEqual(raw.snapshot(), original)
 
     async def test_manual_compaction_is_atomic_and_restores_the_effective_context(self):
         bodies = []

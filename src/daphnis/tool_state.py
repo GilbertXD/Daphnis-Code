@@ -9,30 +9,34 @@ TOOL_STATE = "daphnis_tool_state"
 PENDING = "PENDING"
 RUNNING = "RUNNING"
 TERMINATED_SKIP_MESSAGE = "任务已终止，工具未执行。"
-_UNKNOWN = "execution_result_unknown"
+EXECUTION_RESULT_UNKNOWN = "execution_result_unknown"
+EXECUTION_SKIPPED = "execution_skipped"
+_RECOVERY_SOURCE = "daphnis_recovery"
 
 
 def _recovery_result(code: str, message: str) -> str:
     return json.dumps({
         "ok": False,
-        "source": "daphnis_recovery",
+        "source": _RECOVERY_SOURCE,
         "error": {"code": code, "message": message},
     }, ensure_ascii=False)
 
 
-def _is_unknown(content: Any) -> bool:
-    if not isinstance(content, str):
-        return False
+def recovery_error_code(content: Any) -> str | None:
+    if not isinstance(content, str) or _RECOVERY_SOURCE not in content:
+        return None
     try:
         value = json.loads(content)
     except (ValueError, RecursionError):
-        return False
-    return (
+        return None
+    if (
         isinstance(value, dict)
-        and value.get("source") == "daphnis_recovery"
-        and isinstance(value.get("error"), dict)
-        and value["error"].get("code") == _UNKNOWN
-    )
+        and value.get("source") == _RECOVERY_SOURCE
+        and isinstance(error := value.get("error"), dict)
+        and (code := error.get("code")) in (EXECUTION_RESULT_UNKNOWN, EXECUTION_SKIPPED)
+    ):
+        return code
+    return None
 
 
 def resolve_tool_placeholders(
@@ -40,16 +44,17 @@ def resolve_tool_placeholders(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Record unknown results and skip pending calls when execution is unsafe."""
     unknown = any(
-        messages[index].get(TOOL_STATE) == RUNNING or _is_unknown(messages[index].get("content"))
+        messages[index].get(TOOL_STATE) == RUNNING
+        or recovery_error_code(messages[index].get("content")) == EXECUTION_RESULT_UNKNOWN
         for index in indices.values()
     )
     for call_id, index in indices.items():
         state = messages[index].get(TOOL_STATE)
         if state == RUNNING:
-            content = _recovery_result(_UNKNOWN, "执行中断，工具可能已经产生副作用，请检查实际环境。")
+            content = _recovery_result(EXECUTION_RESULT_UNKNOWN, "执行中断，工具可能已经产生副作用，请检查实际环境。")
         elif state == PENDING and (terminate or unknown):
             content = _recovery_result(
-                "execution_skipped",
+                EXECUTION_SKIPPED,
                 TERMINATED_SKIP_MESSAGE if terminate else "前序工具结果未知，此工具未执行，需要重新规划。",
             )
         else:
