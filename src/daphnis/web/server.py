@@ -32,6 +32,7 @@ _FIELDS = {
     "system": {"prompt": (str, type(None))},
     "tools": {"names": list},
     "set_approval_mode": {"mode": str},
+    "confirm_full": {},
     "send": {"prompt": str},
     "retry": {"key": str},
     "continue": {"key": str},
@@ -85,8 +86,11 @@ async def _command(request: Request):
         raise RequestError("目标项目与工作目录必须同时提供。")
     if action == "approve" and value["decision"] not in {"deny", "allow_once", "trust_session"}:
         raise RequestError("审批选项无效。")
-    if action == "set_approval_mode" and value["mode"] not in tuple(ApprovalMode):
-        raise RequestError("审批模式无效。")
+    if action == "set_approval_mode":
+        if value["mode"] == ApprovalMode.FULL:
+            raise RequestError("启用 FULL 前需要确认风险。")
+        if value["mode"] not in tuple(ApprovalMode):
+            raise RequestError("审批模式无效。")
     return action, session, value
 
 
@@ -146,6 +150,8 @@ async def _execute(bridge, action, session, args):
             await ops.set_tools(args["names"])
         case "set_approval_mode":
             ops.set_approval_mode(args["mode"])
+        case "confirm_full":
+            ops.set_approval_mode(ApprovalMode.FULL)
         case "send":
             if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)

@@ -203,6 +203,7 @@ BLOCKED_PROGRAMS = frozenset(
         "sudo",
         "su",
         "doas",
+        "pkexec",
         "shutdown",
         "reboot",
         "halt",
@@ -337,14 +338,16 @@ def _git_command(arguments: list[str]) -> tuple[str, list[str]]:
     return arguments[index], arguments[index + 1 :]
 
 
-def blocked_reason(program: str, arguments: list[str], workspace: Path) -> str | None:
+def blocked_reason(
+    program: str, arguments: list[str], workspace: Path, *, cwd: Path,
+) -> str | None:
     name = program.lower()
     options = _option_words(arguments)
-    if name in BLOCKED_PROGRAMS or name.startswith("mkfs"):
+    if name in BLOCKED_PROGRAMS or name.startswith(("mkfs", "newfs")):
         return f"Program is blocked: {name}"
     if name == "diskutil":
         return "Disk control commands are not supported."
-    if name == "rm":
+    if name in ("rm", "rmdir"):
         recursive = any(
             (
                 arg.startswith("-")
@@ -359,16 +362,32 @@ def blocked_reason(program: str, arguments: list[str], workspace: Path) -> str |
             or (arg.startswith("--") and len(arg) > 2 and "--force".startswith(arg))
             for arg in options
         )
-        if recursive and force:
+        if name == "rm" and recursive and force:
             return "Recursive forced deletion is blocked."
-    if name in ("rm", "rmdir"):
+        critical = {Path(path).resolve() for path in CRITICAL_DIRECTORIES}
+        critical.update((workspace, Path.home().resolve()))
+        remove_parents = name == "rmdir" and any(
+            (arg.startswith("-") and not arg.startswith("--") and "p" in arg[1:])
+            or (arg.startswith("--pa") and "--parents".startswith(arg))
+            for arg in options
+        )
+        after_separator = False
         for argument in arguments:
-            if argument.startswith("-"):
+            if not after_separator and argument == "--":
+                after_separator = True
                 continue
-            target = Target.capture(workspace / argument, workspace).path
-            critical = {Path(path).resolve() for path in CRITICAL_DIRECTORIES}
-            if target in critical or target == Path.home().resolve():
-                return "Deletion of a root or critical directory is blocked."
+            if not after_separator and argument.startswith("-") and argument != "-":
+                continue
+            target = (cwd / argument).resolve()
+            if target in critical:
+                return "Deletion of the workspace root or a critical directory is blocked."
+            if name == "rm" and recursive and not target.is_relative_to(workspace):
+                return "Recursive deletion outside the workspace is blocked."
+            if remove_parents and any(
+                (cwd / parent).resolve() in critical
+                for parent in Path(argument).parents if parent not in (Path("."), Path("/"))
+            ):
+                return "Removing the workspace root or a critical parent directory is blocked."
     if name == "git":
         command, rest = _git_command(arguments)
         options = _option_words(rest)
@@ -394,6 +413,21 @@ def blocked_reason(program: str, arguments: list[str], workspace: Path) -> str |
             or any(arg.startswith("+") for arg in rest)
         ):
             return "Git force push is blocked."
+        if command in {"branch", "tag"} and (
+            short_force or long_force or (
+                command == "branch" and any(
+                    arg.startswith("-") and not arg.startswith("--") and "D" in arg[1:]
+                    for arg in options
+                )
+            )
+        ):
+            return "Forced Git branch or tag changes are blocked."
+        if command in {"checkout", "switch"} and (
+            short_force or long_force or "--discard-changes" in options
+            or (command == "checkout" and "-B" in options)
+            or (command == "switch" and ("-C" in options or "--force-create" in options))
+        ):
+            return "Forced Git checkout or switch is blocked."
         known = {
             "--version",
             "--help",
@@ -451,7 +485,7 @@ def trusted_read_program(path: Path) -> bool:
 
 
 def read_arguments(
-    program: str, arguments: list[str]
+    program: str, arguments: list[str], *, mode: ApprovalMode = ApprovalMode.AUTO,
 ) -> tuple[list[str], list[str]] | None:
     """Recognize file operands for preflight and the approval display."""
     if program in ("echo", "pwd", "uname"):
@@ -466,6 +500,8 @@ def read_arguments(
             index += 1
             if index >= len(arguments) or not re.fullmatch(r"[0-9]+", arguments[index]):
                 return None
+        elif mode is ApprovalMode.FULL and program in ("head", "tail") and re.fullmatch(r"-[0-9]+", argument):
+            pass
         elif not (
             len(argument) > 1
             and all(flag in allowed_flags.get(program, "") for flag in argument[1:])
@@ -475,7 +511,7 @@ def read_arguments(
     separator = arguments[index:index + 1] == ["--"]
     paths = arguments[index + separator:]
     if any(
-        path in ("", "-") or path.startswith("~")
+        path in ("", "-") or (mode is not ApprovalMode.FULL and path.startswith("~"))
         or (not separator and path.startswith("-"))
         for path in paths
     ):

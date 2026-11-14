@@ -476,6 +476,13 @@ class DaphnisApp(App[None]):
             elif result.action == "tools":
                 self.push_screen(ToolsScreen(self.ops), self._tools_selected)
                 show_text = False
+            elif result.action == "confirm_full":
+                screen = ChoiceScreen("启用 FULL\n" + result.text, {
+                    "确认风险": [("取消", False, False), ("确认启用 FULL", True, False)],
+                })
+                screen.AUTO_FOCUS = "OptionList"
+                self.push_screen(screen, self._full_approval_selected)
+                show_text = False
             elif result.action == "system":
                 self.push_screen(SystemPromptScreen(result.text), self._system_selected)
                 show_text = False
@@ -524,6 +531,12 @@ class DaphnisApp(App[None]):
             return CommandResult(text=f"Thinking：{self.ops.thinking or '服务端默认'}")
 
         await self._perform_command(select)
+
+    async def _full_approval_selected(self, confirmed: bool | None) -> None:
+        if confirmed:
+            await self._perform_command(
+                lambda: terminal_command(self.ops, "/approval full", full_confirmed=True)
+            )
 
     async def _tools_selected(self, value) -> None:
         if value is not None:

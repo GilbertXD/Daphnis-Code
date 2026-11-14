@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .approval import Operation, Target, ToolError, path_decision
+from .approval import ApprovalMode, Operation, Target, ToolError, path_decision
 from .files import MAX_FILE_BYTES, decode_text, read_bytes
 
 IGNORED_DIRECTORIES = frozenset(
@@ -28,6 +28,7 @@ MAX_CONTENT_BYTES = 8 * MAX_FILE_BYTES
 
 def prepare_search(
     arguments: dict[str, Any], workspace: Path, *, excluded: Path | None = None,
+    approval_mode: ApprovalMode = ApprovalMode.AUTO,
 ) -> Operation:
     root = Target.capture(arguments.get("path", "."), workspace)
     if excluded is not None and root.path.is_relative_to(excluded):
@@ -85,7 +86,7 @@ def prepare_search(
                                     if not file.path.is_relative_to(root.path):
                                         skipped += 1
                                         continue
-                                    data, shortened = read_bytes(file, budget)
+                                    data, shortened = read_bytes(file, budget, mode=approval_mode)
                                     total_bytes += len(data)
                                     truncated |= shortened
                                     text = decode_text(data, shortened)

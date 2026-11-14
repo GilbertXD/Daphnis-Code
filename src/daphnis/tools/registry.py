@@ -258,7 +258,10 @@ class ToolExecutor:
             elif name == "search":
                 operation = prepare_search(
                     arguments, binding.workspace.path, excluded=self._search_excluded_directory,
+                    approval_mode=self._mode,
                 )
+            elif name in {"read_file", "run_command"}:
+                operation = _PREPARERS[name](arguments, binding.workspace.path, mode=self._mode)
             else:
                 operation = _PREPARERS[name](arguments, binding.workspace.path)
             forced = operation.force_approval or any(

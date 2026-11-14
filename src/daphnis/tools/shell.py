@@ -11,6 +11,7 @@ from .approval import (
     ASK_PROGRAMS,
     INTERPRETER,
     READ_PROGRAMS,
+    ApprovalMode,
     CleanupError,
     Decision,
     Operation,
@@ -186,13 +187,12 @@ def _safe_without_file_operands(program: str, arguments: list[str]) -> bool:
     return False
 
 
-def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
+def prepare_command(
+    arguments: dict[str, Any], workspace: Path, *, mode: ApprovalMode = ApprovalMode.AUTO,
+) -> Operation:
     argv = arguments["argv"]
     if not argv[0].strip():
         raise ToolError("command_blocked", "Executable must be a non-empty string.")
-    reason = blocked_reason(Path(argv[0]).name, argv[1:], workspace)
-    if reason:
-        raise ToolError("command_blocked", reason)
     if any(
         token in {"|", "||", "&&", ";", ">", ">>", "<", "2>", "2>>"}
         or "$(" in token
@@ -207,9 +207,12 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
         raise ToolError(
             "invalid_directory", "Command cwd must be an existing directory."
         )
+    reason = blocked_reason(Path(argv[0]).name, argv[1:], workspace, cwd=cwd.path)
+    if reason:
+        raise ToolError("command_blocked", reason)
     executable = resolve_program(argv[0], cwd.path)
     program = executable.path.name.lower()
-    reason = blocked_reason(program, argv[1:], cwd.path)
+    reason = blocked_reason(program, argv[1:], workspace, cwd=cwd.path)
     if reason:
         raise ToolError("command_blocked", reason)
     # Unknown native executables are refused. Recognized scripts go through approval policy.
@@ -238,7 +241,9 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
                 targets.append(Target.capture(argument, cwd.path))
                 break
             index += 1
-    inspected = read_arguments(program, argv[1:]) if program in READ_PROGRAMS else None
+    inspected = read_arguments(program, argv[1:], mode=mode) if program in READ_PROGRAMS else None
+    if mode is ApprovalMode.FULL and program in {"cat", "head", "tail", "wc"} and inspected is None:
+        raise ToolError("command_blocked", "File operands must be identifiable for automatic execution.")
     decision = Decision.ASK
     invocation = (str(executable.path), *argv[1:])
     auto_allowed = _safe_without_file_operands(program, argv[1:]) and trusted_read_program(
@@ -248,9 +253,10 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
         options, paths = inspected
         operands = []
         for path in paths:
-            target = Target.capture(path, cwd.path)
+            # Subprocesses receive literal argv, so a leading tilde is a directory name.
+            target = Target.capture(cwd.path / path, cwd.path)
             if program != "ls":
-                require_readable_path(target)
+                require_readable_path(target, mode=mode)
                 if target.identity is not None and target.path.stat().st_nlink > 1:
                     raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
             targets.append(target)

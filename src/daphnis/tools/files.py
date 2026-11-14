@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from .approval import (
+    ApprovalMode,
     Decision,
     Operation,
     Target,
@@ -47,14 +48,16 @@ def is_credential_path(path: Path) -> bool:
     )
 
 
-def require_readable_path(target: Target) -> None:
+def require_readable_path(target: Target, *, mode: ApprovalMode = ApprovalMode.AUTO) -> None:
     """Protect content, including reads through a resolved symlink."""
-    if any(is_credential_path(path) for path in (target.path, target.requested)):
+    if mode is not ApprovalMode.FULL and any(
+        is_credential_path(path) for path in (target.path, target.requested)
+    ):
         raise ToolError("sensitive_path", "Reading protected credentials is prohibited.")
 
 
-def read_bytes(target: Target, limit: int) -> tuple[bytes, bool]:
-    require_readable_path(target)
+def read_bytes(target: Target, limit: int, *, mode: ApprovalMode = ApprovalMode.AUTO) -> tuple[bytes, bool]:
+    require_readable_path(target, mode=mode)
     with target.open() as fd:
         if os.fstat(fd).st_nlink > 1:
             raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
@@ -71,12 +74,14 @@ def decode_text(data: bytes, truncated: bool) -> str:
     return codecs.getincrementaldecoder("utf-8")().decode(data, final=not truncated)
 
 
-def prepare_read(arguments: dict[str, Any], workspace: Path) -> Operation:
+def prepare_read(
+    arguments: dict[str, Any], workspace: Path, *, mode: ApprovalMode = ApprovalMode.AUTO,
+) -> Operation:
     target = Target.capture(arguments["path"], workspace)
-    require_readable_path(target)
+    require_readable_path(target, mode=mode)
 
     async def run():
-        data, truncated = read_bytes(target, arguments.get("max_bytes", 65536))
+        data, truncated = read_bytes(target, arguments.get("max_bytes", 65536), mode=mode)
         lines = decode_text(data, truncated).splitlines(keepends=True)
         start = arguments.get("start_line", 1)
         end = arguments.get("end_line")

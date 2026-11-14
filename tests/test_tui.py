@@ -89,6 +89,22 @@ async def submit(ui, pilot, text):
 
 
 class TUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_mode_requires_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = controller(Path(temporary), lambda _: self.fail("Unexpected model call"))
+            ops = Operations(app)
+            ui = DaphnisApp(ops, app.events)
+            async with ui.run_test(size=(100, 36)) as pilot:
+                await submit(ui, pilot, "/approval full")
+                await until(pilot, lambda: isinstance(ui.screen, ChoiceScreen))
+                self.assertEqual(ops.approval_mode, "auto")
+                await pilot.press("escape")
+                self.assertEqual(ops.approval_mode, "auto")
+                await submit(ui, pilot, "/approval full")
+                await until(pilot, lambda: isinstance(ui.screen, ChoiceScreen))
+                await pilot.press("down", "enter")
+                await until(pilot, lambda: ops.approval_mode == "full")
+
     async def test_system_prompt_dialog_saves_multiline_text_and_reset_command(self):
         with tempfile.TemporaryDirectory() as temporary:
             app = controller(Path(temporary), lambda request: self.fail("Unexpected model call"))

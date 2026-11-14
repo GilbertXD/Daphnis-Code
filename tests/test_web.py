@@ -200,10 +200,13 @@ class WebTests(unittest.TestCase):
         with self.client.websocket_connect(ORIGIN.replace("http:", "ws:") + "/api/events", headers={"Origin": ORIGIN}) as socket:
             socket.send_text(ACCESS)
             socket.receive_json()
-            for mode in ("ask", "auto", "full"):
+            for mode in ("ask", "auto"):
                 self.command("set_approval_mode", first, mode=mode)
                 self.assertEqual(socket.receive_json()["state"]["approval_mode"], mode)
         self.command("set_approval_mode", first, 400, mode="invalid")
+        self.command("set_approval_mode", first, 400, mode="full")
+        self.assertEqual(self.snapshot()["state"]["approval_mode"], "auto")
+        self.command("confirm_full", first)
         self.assertEqual(self.snapshot()["state"]["approval_mode"], "full")
         self.command("tools", first, 400, names=[{}])
         self.command("send", first, 202, prompt="Save this session")
@@ -227,7 +230,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(state["model"]["thinking_modes"], ["off", "on"])
         self.assertEqual(state["thinking"], "on")
         self.assertEqual(state["enabled_tools"], [])
-        self.command("set_approval_mode", first, mode="full")
+        self.command("confirm_full", first)
         with SessionLease(self.history.directory / f"{first}.json"):
             self.command("delete", first, 409, id=first)
             self.assertEqual(self.snapshot()["session_id"], first)
@@ -253,7 +256,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(project["name"], "Other work")
         self.assertEqual(Path(project["workspace"]), project_root.resolve())
 
-        self.command("set_approval_mode", first, mode="full")
+        self.command("confirm_full", first)
         self.command("project_open", first, project_id=project["id"])
         state = self.snapshot()["state"]
         opened = state["session"]
@@ -467,7 +470,7 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
         approval = waiting["status"]["approval"]
-        self.command("set_approval_mode", session_id, 409, mode="full")
+        self.command("confirm_full", session_id, 409)
         self.assertEqual(self.snapshot()["state"]["approval_mode"], "auto")
         self.assertFalse((self.workspace / "new.txt").exists())
         self.assertEqual(self.snapshot()["status"]["approval"]["request_id"], approval["request_id"])
@@ -490,8 +493,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next_frame["events"], [])
         self.command("restore", next_frame["session_id"], id=session_id)
         self.assertEqual(self.snapshot()["events"], events)
-        self.command("set_approval_mode", next_frame["session_id"], 409, mode="full")
-        self.command("set_approval_mode", session_id, mode="full")
+        self.command("confirm_full", next_frame["session_id"], 409)
+        self.command("confirm_full", session_id)
         (self.workspace / "new.txt").unlink()
         self.command("send", session_id, 202, prompt="test patch")
         done = self.wait_for(lambda frame: not frame["status"]["running"])

@@ -118,8 +118,6 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 full = bound(workspace, approval=approve).select(
                     ["run_command"], mode=ApprovalMode.FULL
                 )
-                denied = await full.execute(call("run_command", argv=["cat", "alias"]))
-                self.assertEqual(denied.value["error"]["code"], "sensitive_path")
                 child = await full.execute(
                     call("run_command", argv=[sys.executable, str(script)])
                 )
@@ -132,6 +130,34 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("example", returned[4]["content"])
             self.assertIn("ordinary code", returned[5]["content"])
             self.assertEqual(child.value["stdout"].strip(), "absent")
+
+    async def test_full_can_read_sensitive_files_without_approval(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            (workspace / ".env").write_text("EXAMPLE=synthetic\n")
+            (workspace / "alias").symlink_to(".env")
+            approval = AsyncMock(return_value=ApprovalDecision.ALLOW_ONCE)
+            tools = bound(workspace, approval=approval)
+            names = ["read_file", "search", "run_command"]
+            reads = [
+                (call("read_file", path=".env"), "content"),
+                (call("run_command", argv=["cat", "alias"]), "stdout"),
+            ]
+            for mode in ApprovalMode:
+                selected = tools.select(names, mode=mode)
+                for request, field in reads:
+                    result = await selected.execute(request)
+                    if mode is ApprovalMode.FULL:
+                        self.assertEqual(result.value.get(field), "EXAMPLE=synthetic\n")
+                    else:
+                        self.assertEqual(result.value["error"]["code"], "sensitive_path")
+            approval.assert_not_awaited()
+            full = tools.select(names, mode=ApprovalMode.FULL)
+            result = await full.execute(call("run_command", argv=["head", "-1", ".env"]))
+            self.assertEqual(result.value.get("stdout"), "EXAMPLE=synthetic\n")
+            result = await full.execute(call("search", query="synthetic", mode="content"))
+            self.assertEqual([match["path"] for match in result.value["matches"]], [".env"])
+            approval.assert_not_awaited()
 
     async def test_bounded_reads_listing_search_and_external_path_approval(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -547,14 +573,16 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             alias = workspace / "innocent-name"
             alias.symlink_to(shutil.which("rm"))
             callback = AsyncMock(return_value=ApprovalDecision.ALLOW_ONCE)
-            tools = bound(workspace, approval=callback).select(
-                ["run_command"], mode=ApprovalMode.FULL
-            )
+            tools = bound(workspace, approval=callback)
+            (workspace / "sub").mkdir()
             vectors = [
                 ["rm", "-rf", "."],
                 ["rm", "-fr", "."],
                 ["rm", "--recursive", "--force", "."],
                 ["rm", "-r", "/"],
+                ["rm", "-r", "."],
+                ["rmdir", str(workspace)],
+                ["rm", "-r", "../outside"],
                 ["rm", "-r", str(Path("/etc").resolve())],
                 [str(alias), "-rf", "."],
                 ["git", "-C", str(workspace), "reset", "--hard"],
@@ -562,12 +590,15 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 ["git", "clean", "-fdx"],
                 ["git", "push", "--force-with-lease"],
                 ["git", "push", "origin", "+main"],
+                ["git", "branch", "-D", "topic"],
+                ["git", "switch", "--discard-changes", "main"],
                 ["sudo", "ls"],
                 ["sh", "-c", "echo forbidden"],
                 ["env", "sh", "-c", "echo forbidden"],
                 ["find", ".", "-delete"],
                 ["rsync", "--delete", "a", "b"],
                 ["mkfs.ext4", "/dev/example"],
+                ["reboot"],
                 ["diskutil", "eraseDisk", "unused"],
                 ["dd", "of=/dev/example"],
                 [sys.executable, "-X", "dev", "-c", "print('blocked')"],
@@ -576,12 +607,14 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             with patch(
                 "asyncio.base_events.BaseEventLoop.subprocess_exec", new_callable=AsyncMock
             ) as spawn:
-                for argv in vectors:
-                    with self.subTest(argv=argv):
-                        result = await tools.execute(call("run_command", argv=argv))
-                        self.assertEqual(
-                            result.value["error"]["code"], "command_blocked"
-                        )
+                for mode in ApprovalMode:
+                    selected = tools.select(["run_command"], mode=mode)
+                    for argv in vectors:
+                        with self.subTest(mode=mode, argv=argv):
+                            result = await selected.execute(call("run_command", argv=argv))
+                            self.assertEqual(result.value["error"]["code"], "command_blocked")
+                    result = await selected.execute(call("run_command", argv=["rm", "-r", ".."], cwd="sub"))
+                    self.assertEqual(result.value["error"]["code"], "command_blocked")
                 spawn.assert_not_awaited()
             callback.assert_not_awaited()
 

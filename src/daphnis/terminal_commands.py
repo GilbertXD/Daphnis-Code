@@ -21,8 +21,13 @@ __all__ = [
 APPROVAL_MODE_TEXT = {
     ApprovalMode.ASK: ("每次询问", "所有可执行工具调用都需要确认。"),
     ApprovalMode.AUTO: ("安全自动", "自动执行无需额外授权的操作，其余按规则确认。"),
-    ApprovalMode.FULL: ("全部自动", "通过安全检查的调用自动执行。"),
+    ApprovalMode.FULL: ("全部自动", "允许读取敏感文件并自动执行工具。"),
 }
+
+FULL_APPROVAL_RISK = (
+    "模型可能读取 .env 等敏感文件，并将内容发给模型服务。\n"
+    "命令和 MCP 工具可能访问工作区外的文件、修改文件或访问网络。"
+)
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
 /thinking [default|档位]  查看或设置思考；default 为服务端默认
@@ -80,7 +85,9 @@ def safe_error(error: object) -> str:
     return text
 
 
-async def terminal_command(ops: Operations, text: str) -> CommandResult:
+async def terminal_command(
+    ops: Operations, text: str, *, full_confirmed: bool = False,
+) -> CommandResult:
     words = shlex.split(text)
     name, *args = words or [""]
     if name == "/help" and not args:
@@ -128,6 +135,8 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
         if args:
             if len(args) != 1 or args[0] not in tuple(ApprovalMode):
                 raise ValueError("用法：/approval [ask|auto|full]")
+            if args[0] == ApprovalMode.FULL and not full_confirmed and ops.approval_mode is not ApprovalMode.FULL:
+                return CommandResult("confirm_full", FULL_APPROVAL_RISK)
             ops.set_approval_mode(args[0])
         mode = ops.approval_mode
         label, description = APPROVAL_MODE_TEXT[mode]
@@ -135,8 +144,7 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
         message = f"工具审批：{label}（{mode}{default}）\n{description}"
         if mode is ApprovalMode.FULL:
             message += (
-                "\n命令和 MCP 工具可能读写文件、访问网络或启动进程。"
-                "新建会话或重启后恢复 AUTO。"
+                f"\n{FULL_APPROVAL_RISK}\n新建会话或重启后恢复 AUTO。"
             )
         return CommandResult(text=message)
     if name == "/new" and not args:

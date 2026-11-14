@@ -17,7 +17,7 @@ type SessionAction = (typeof sessionActions)[number][0]
 const approvalModeText: Record<ApprovalMode, string> = {
   ask: '每次工具调用都需确认。',
   auto: '低风险操作自动执行，其余按规则审批，可授予会话信任。',
-  full: '通过安全检查的调用自动执行。命令和外部工具可能读写文件、访问网络或启动进程。',
+  full: '允许读取敏感文件并自动执行工具。新建会话或重启后恢复 AUTO。',
 }
 
 function Dialog({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
@@ -263,6 +263,7 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
 }
 
 type Modal = { action: 'tools' | 'project' } | { action: 'system'; sessionId: string }
+  | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
   | { action: 'move'; session: Session }
   | { action: 'remove_project'; projectId: string; name: string }
@@ -411,7 +412,15 @@ function Workspace({ view, connected, command }: {
               }}>系统提示词</button>
               <select aria-label="工具审批模式" aria-describedby="approval-mode-description"
                 value={state.approval_mode} disabled={disabled}
-                onChange={(event) => void perform('set_approval_mode', { mode: event.currentTarget.value })}>
+                onChange={(event) => {
+                  const mode = event.currentTarget.value
+                  if (mode === 'full') {
+                    setNotice('')
+                    setModal({ action: 'confirm_full', sessionId: id })
+                  } else {
+                    void perform('set_approval_mode', { mode })
+                  }
+                }}>
                 <option value="ask">ASK</option>
                 <option value="auto">AUTO</option>
                 <option value="full">FULL</option>
@@ -435,6 +444,19 @@ function Workspace({ view, connected, command }: {
       notice={notice} apply={(names) => perform('tools', { names })} />}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
+    {modal?.action === 'confirm_full' && modal.sessionId === id && <Dialog title="启用 FULL" close={() => setModal(null)}>
+      <form onSubmit={async (event) => {
+        event.preventDefault()
+        if (!disabled && await perform('confirm_full')) setModal(null)
+      }}>
+        <p>工具调用将自动执行。模型可能读取 .env 等敏感文件，并将内容发给模型服务。命令和 MCP 工具可能访问工作区外的文件、修改文件或访问网络。</p>
+        {notice && <p role="status">{notice}</p>}
+        <div className="actions">
+          <button autoFocus type="button" onClick={() => setModal(null)}>取消</button>
+          <button className="primary" disabled={disabled} type="submit">确认启用 FULL</button>
+        </div>
+      </form>
+    </Dialog>}
     {modal?.action === 'project' && <ProjectDialog close={() => setModal(null)} disabled={disabled}
       notice={notice} create={(name, workspace) => perform('project_create', { name, workspace })} />}
     {modal?.action === 'remove_project' && <Dialog title="移除项目" close={() => setModal(null)}>
