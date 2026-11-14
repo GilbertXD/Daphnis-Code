@@ -325,6 +325,10 @@ class Agent:
             "model.finished", **fields, finish_reason=reason, response=response,
         )
         content = message.get("content")
+        if reason == "length":
+            raise CompactionError(
+                "The history summary was truncated. Write a shorter summary.", reason="summary_length",
+            )
         if reason != "stop":
             raise CompactionError("The history summary did not finish normally.", reason="summary_finish")
         if not isinstance(content, str) or not content.strip() or message.get("refusal"):

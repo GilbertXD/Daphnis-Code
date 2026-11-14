@@ -57,12 +57,56 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             ("[]", "summary_schema"),
             ('{"goals":"partial"}', "summary_schema"),
             (SUMMARY.replace('"next_steps": "Run checks"', '"next_steps": 1'), "summary_schema"),
+            (SUMMARY.replace('"next_steps": "Run checks"', '"next_steps": NaN'), "summary_json"),
             (SUMMARY[:-1] + ', "goals": "ambiguous"}', "summary_schema"),
             (SUMMARY[:-1] + ', "extra": "field"}', "summary_schema"),
         ):
             with self.subTest(value=value), self.assertRaises(CompactionError) as failure:
                 _summary_text(value)
             self.assertEqual(failure.exception.reason, reason)
+
+    async def test_summary_retries_invalid_format_with_the_same_source(self):
+        raw = [
+            {"role": "user", "content": "Check the tests."},
+            {"role": "assistant", "content": "Checks passed."},
+            {"role": "user", "content": "Next task."},
+        ]
+        prompts = []
+
+        async def summarize(messages, limit):
+            self.assertFalse(request_budget(messages, {"output_limit": limit}, 1200).needs_compaction)
+            prompts.append([message["content"] for message in messages])
+            return '{"goals":["Check the tests"]}' if len(prompts) == 1 else SUMMARY
+
+        checkpoint = await Compactor(1200).summarize(raw, None, 2, summarize)
+        self.assertEqual(checkpoint.summary, _summary_text(SUMMARY))
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0][1], prompts[1][1])
+        self.assertIn("failed validation", prompts[1][0])
+        self.assertIn("Missing history summary fields: progress, files, next_steps.", prompts[1][0])
+
+    async def test_summary_preserves_structured_notes_and_extra_facts(self):
+        raw = [
+            {"role": "user", "content": "Verify the files."},
+            {"role": "assistant", "content": "Verification pending."},
+        ]
+
+        async def summarize(messages, limit):
+            return json.dumps({
+                "goals": "Verify the files",
+                "progress": {"checked": ["main.py"]},
+                "files": ["main.py", "app.py"],
+                "next_steps": [],
+                "tests": {"marker": "failure-204"},
+            })
+
+        checkpoint = await Compactor(1200).summarize(raw, None, 2, summarize)
+        summary = json.loads(checkpoint.summary)
+        self.assertEqual(set(summary), {"goals", "progress", "files", "next_steps"})
+        self.assertIn('{"checked":["main.py"]}', summary["progress"])
+        self.assertIn('{"tests":{"marker":"failure-204"}}', summary["progress"])
+        self.assertEqual(json.loads(summary["files"]), ["main.py", "app.py"])
+        self.assertEqual(summary["next_steps"], "")
 
     async def test_history_range_hint_requires_checkpoint_and_both_selected_tools(self):
         for compacted, names, expected in (
@@ -135,7 +179,11 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             bodies.append(body)
             if "Summarize" in body["messages"][0]["content"]:
                 self.assertNotIn("tools", body)
-                response = reply(summary_content)
+                response = (
+                    reply('{"goals":"unfinished', finish="length")
+                    if len(bodies) == 1
+                    else reply(summary_content)
+                )
                 response["usage"] = {"prompt_tokens": 10, "completion_tokens": 5}
             else:
                 response = reply("done")
@@ -167,8 +215,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             saved = history.load(state.id)
             self.assertEqual(saved.compaction.through, 4)
             self.assertEqual(saved.messages.snapshot(), original)
-            self.assertEqual(saved.usage.total_tokens, 15)
-            self.assertEqual(saved.usage.requests, 1)
+            self.assertEqual(saved.usage.total_tokens, 30)
+            self.assertEqual(saved.usage.requests, 2)
+            self.assertEqual(bodies[0]["messages"][1], bodies[1]["messages"][1])
+            self.assertIn("truncated", bodies[1]["messages"][0]["content"])
             self.assertIsNone(ops.turn_usage)
             self.assertIsNone(await ops.compact())
             ops.restore_session(state.id)
@@ -189,8 +239,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             summary_content = "Invalid summary"
             failures = []
             app.events.on("compaction.finished", failures.append)
+            request_count = len(bodies)
             with self.assertRaises(CompactionError) as invalid_summary:
                 await ops.compact()
+            self.assertEqual(len(bodies) - request_count, 2)
             self.assertEqual(invalid_summary.exception.reason, "summary_json")
             self.assertEqual(failures[-1].data["reason"], "summary_json")
             self.assertEqual(app._session.compaction, saved.compaction)
