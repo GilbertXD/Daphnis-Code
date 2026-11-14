@@ -4,12 +4,17 @@ import { createRoot } from 'react-dom/client'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, Command, Model, Session, View } from './protocol'
+import type { Approval, ApprovalMode, Command, Model, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
 const tokenKey = 'daphnis.access'
 const modelKey = (model: Model) => JSON.stringify([model.provider, model.id])
+const approvalModeText: Record<ApprovalMode, string> = {
+  ask: '每次工具调用都需确认。',
+  auto: '低风险操作自动执行，其余按规则审批，可授予会话信任。',
+  full: '通过安全检查的调用自动执行。命令和外部工具可能读写文件、访问网络或启动进程。',
+}
 
 function Dialog({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
   const dialog = useRef<HTMLDialogElement>(null)
@@ -268,6 +273,13 @@ function Workspace({ view, connected, command }: {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
               }}>系统提示词</button>
+              <select aria-label="工具审批模式" aria-describedby="approval-mode-description"
+                value={state.approval_mode} disabled={disabled}
+                onChange={(event) => void perform('set_approval_mode', { mode: event.currentTarget.value })}>
+                <option value="ask">ASK</option>
+                <option value="auto">AUTO</option>
+                <option value="full">FULL</option>
+              </select>
             </div>
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
@@ -275,6 +287,7 @@ function Workspace({ view, connected, command }: {
               : <button className="primary send" type="submit" disabled={disabled || interrupted || !draft.trim()}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
+          <p id="approval-mode-description" className="approval-mode-description muted">{approvalModeText[state.approval_mode]}</p>
         </form>
       </div>
     </main>

@@ -94,9 +94,11 @@ def _execution_decision(
 ) -> _ExecutionDecision:
     if operation.decision is Decision.DENY:
         return _ExecutionDecision.DENY
+    if mode is ApprovalMode.FULL:
+        return _ExecutionDecision.EXECUTE
     if forced or mode is ApprovalMode.ASK:
         return _ExecutionDecision.PROMPT
-    if mode is ApprovalMode.FULL or operation.decision is Decision.ALLOW:
+    if operation.decision is Decision.ALLOW:
         return _ExecutionDecision.EXECUTE
     if operation.allow_session_trust and trusted:
         return _ExecutionDecision.EXECUTE

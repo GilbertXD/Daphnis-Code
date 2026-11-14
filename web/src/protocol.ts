@@ -35,6 +35,8 @@ export type Message = {
 
 export type Recovery = { kind: 'FAILED_USER' | 'INTERRUPTED_TURN'; key: string; message_index: number }
 
+export type ApprovalMode = 'ask' | 'auto' | 'full'
+
 export type Approval = {
   request_id: string
   tool_call_id: string
@@ -115,7 +117,7 @@ type State = {
   all_tools: string[]
   enabled_tools: string[]
   effective_tools: string[]
-  approval_mode: string
+  approval_mode: ApprovalMode
 }
 
 type Frame = {

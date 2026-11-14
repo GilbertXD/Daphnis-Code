@@ -21,7 +21,7 @@ __all__ = [
 APPROVAL_MODE_TEXT = {
     ApprovalMode.ASK: ("每次询问", "所有可执行工具调用都需要确认。"),
     ApprovalMode.AUTO: ("安全自动", "自动执行无需额外授权的操作，其余按规则确认。"),
-    ApprovalMode.FULL: ("尽可能自动", "跳过常规审批，保留强制审批和硬编码禁止。"),
+    ApprovalMode.FULL: ("全部自动", "通过安全检查的调用自动执行。"),
 }
 
 HELP = """/model [list|序号|模型ID|厂商 模型ID]  查看或切换模型（按厂商分列）
@@ -135,8 +135,8 @@ async def terminal_command(ops: Operations, text: str) -> CommandResult:
         message = f"工具审批：{label}（{mode}{default}）\n{description}"
         if mode is ApprovalMode.FULL:
             message += (
-                "\nMCP Server 可能写入文件或访问网络，"
-                "Daphnis 无法约束其内部的所有行为。仅本次运行有效。"
+                "\n命令和 MCP 工具可能读写文件、访问网络或启动进程。"
+                "新建会话或重启后恢复 AUTO。"
             )
         return CommandResult(text=message)
     if name == "/new" and not args:

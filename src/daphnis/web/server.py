@@ -14,6 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ..tools.approval import ApprovalMode
 from ..turn_state import RecoveryKind
 
 _MAX_BODY_BYTES = 256 * 1024
@@ -26,6 +27,7 @@ _FIELDS = {
     "thinking": {"mode": (str, type(None))},
     "system": {"prompt": (str, type(None))},
     "tools": {"names": list},
+    "set_approval_mode": {"mode": str},
     "send": {"prompt": str},
     "retry": {"key": str},
     "continue": {"key": str},
@@ -77,6 +79,8 @@ async def _command(request: Request):
         raise RequestError("请输入消息。")
     if action == "approve" and value["decision"] not in {"deny", "allow_once", "trust_session"}:
         raise RequestError("审批选项无效。")
+    if action == "set_approval_mode" and value["mode"] not in tuple(ApprovalMode):
+        raise RequestError("审批模式无效。")
     return action, session, value
 
 
@@ -122,6 +126,8 @@ async def _execute(bridge, action, session, args):
                 await ops.set_system_prompt(args["prompt"])
         case "tools":
             await ops.set_tools(args["names"])
+        case "set_approval_mode":
+            ops.set_approval_mode(args["mode"])
         case "send":
             if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)

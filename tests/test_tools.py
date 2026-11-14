@@ -184,12 +184,11 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(requests), 1)
             result = await full.execute(call("read_file", path="link.txt"))
             self.assertTrue(result.value["ok"])
-            self.assertEqual(len(requests), 2)
-            self.assertFalse(requests[-1].can_trust)
+            self.assertEqual(len(requests), 1)
             allowed._trusted.add((allowed._binding.session_id, "read_file"))
             result = await allowed.execute(call("read_file", path="link.txt"))
             self.assertTrue(result.value["ok"])
-            self.assertEqual(len(requests), 3)
+            self.assertEqual(len(requests), 2)
             self.assertFalse(requests[-1].can_trust)
             # Resolve symlink/.. in filesystem order, not by lexical abspath first.
             (base / "external-dir").mkdir()
@@ -207,7 +206,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
             approval = AsyncMock(return_value=ApprovalDecision.DENY)
-            tools = bound(workspace, approval=approval).select(["write_file"], mode=ApprovalMode.FULL)
+            tools = bound(workspace, approval=approval).select(["write_file"])
             definition = tools.definitions()[0]["function"]
             self.assertEqual(definition["name"], "write_file")
             self.assertEqual(definition["parameters"]["required"], ["path", "content"])
@@ -223,8 +222,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(approval.call_args.args[0].can_trust)
             self.assertEqual(list(workspace.iterdir()), [])
 
-            approval.return_value = ApprovalDecision.ALLOW_ONCE
-            created = await tools.execute(request)
+            approval.reset_mock()
+            full = tools.select(["write_file"], mode=ApprovalMode.FULL)
+            created = await full.execute(request)
+            approval.assert_not_awaited()
             target = workspace / "empty.txt"
             self.assertEqual(created.value, {"ok": True, "path": str(target), "bytes_written": 0})
             self.assertEqual(target.read_bytes(), b"")
@@ -306,7 +307,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             target = workspace / "example.txt"
             initial = "你好\r\naaa\n".encode()
             target.write_bytes(initial)
-            tools = bound(workspace, approval=approve)
+            approval = AsyncMock(return_value=ApprovalDecision.DENY)
+            tools = bound(workspace, approval=approval).select(["replace_text"], mode=ApprovalMode.FULL)
             for old, error in (("missing", "text_not_found"), ("aa", "ambiguous_match")):
                 with self.subTest(old=old):
                     result = await tools.execute(call("replace_text", path=target.name, old_text=old, new_text=""))
@@ -319,6 +321,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             result = await tools.execute(call("replace_text", path=target.name, old_text="你好\r\n", new_text=""))
             self.assertEqual(result.value, {"ok": True, "path": str(target), "bytes_written": 4})
             self.assertEqual(target.read_bytes(), b"aaa\n")
+            approval.assert_not_awaited()
 
     async def test_replace_text_enforces_workspace_approval_and_original_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -335,7 +338,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             protected.write_text("old")
             (workspace / "hardlink").hardlink_to(protected)
             approval = AsyncMock(return_value=ApprovalDecision.DENY)
-            tools = bound(workspace, approval=approval).select(["replace_text"], mode=ApprovalMode.FULL)
+            tools = bound(workspace, approval=approval).select(["replace_text"])
+            full = tools.select(["replace_text"], mode=ApprovalMode.FULL)
             for path, error in (
                 ("../outside.txt", "permission_denied"),
                 (str(outside), "permission_denied"),
@@ -344,7 +348,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 (".env", "sensitive_path"),
             ):
                 with self.subTest(path=path):
-                    result = await tools.execute(call("replace_text", path=path, old_text="old", new_text="new"))
+                    result = await full.execute(call("replace_text", path=path, old_text="old", new_text="new"))
                     self.assertEqual(result.value["error"]["code"], error)
             approval.assert_not_awaited()
             edit = call("replace_text", path=target.name, old_text="old", new_text="new")
@@ -355,8 +359,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(approval.call_args.args[0].can_trust)
             self.assertEqual(target.read_text(), "old")
 
-            approval.return_value = ApprovalDecision.ALLOW_ONCE
-            linked = await tools.execute(call("replace_text", path="hardlink", old_text="old", new_text="new"))
+            approval.reset_mock()
+            linked = await full.execute(call("replace_text", path="hardlink", old_text="old", new_text="new"))
             self.assertEqual(linked.value["error"]["code"], "sensitive_path")
             real_sync = os.fsync
 
@@ -365,8 +369,9 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 target.write_text("changed by another writer")
 
             with patch("daphnis.tools.files.os.fsync", side_effect=concurrent_write):
-                raced = await tools.execute(edit)
+                raced = await full.execute(edit)
             self.assertEqual(raced.value["error"]["code"], "target_changed")
+            approval.assert_not_awaited()
             self.assertEqual(target.read_text(), "changed by another writer")
             self.assertEqual(outside.read_text(), "old")
             self.assertEqual(protected.read_text(), "old")
@@ -395,9 +400,6 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             denied = await tools.execute(call("apply_patch", patch=deletion))
             self.assertEqual(denied.value["error"]["code"], "permission_denied")
             full = tools.select(["apply_patch"], mode=ApprovalMode.FULL)
-            result = await full.execute(call("apply_patch", patch=deletion))
-            self.assertEqual(result.value["error"]["code"], "permission_denied")
-            full = allowed.select(["apply_patch"], mode=ApprovalMode.FULL)
             result = await full.execute(call("apply_patch", patch=deletion))
             self.assertTrue(result.value["ok"], result.value)
             self.assertFalse(target.exists())
@@ -634,7 +636,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 patch.dict(os.environ, {"HOME": str(workspace)}),
                 patch("daphnis.tools.shell.trusted_read_program", return_value=True),
             ):
-                for mode in ApprovalMode:
+                for mode in (ApprovalMode.ASK, ApprovalMode.AUTO):
                     selected = tools.select(["run_command"], mode=mode)
                     for argv in (["cat", "~/data"], ["cat", "data"], ["ls", "-a"]):
                         result = await selected.execute(call("run_command", argv=argv))
@@ -649,14 +651,15 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(listing.value["ok"], listing.value)
                 self.assertIn("-data", listing.value["stdout"])
                 full = tools.select(["run_command"], mode=ApprovalMode.FULL)
-                for argv in (["cat", "../outside/data"], ["cat", "data", "-n"]):
-                    result = await full.execute(call("run_command", argv=argv))
-                    self.assertEqual(result.value["error"]["code"], "permission_denied")
+                for path, content in (("data", "inside"), ("~/data", "outside"), ("../outside/data", "outside")):
+                    result = await full.execute(call("run_command", argv=["cat", path]))
+                    self.assertTrue(result.value["ok"], result.value)
+                    self.assertEqual(result.value["stdout"], content)
                 for argv in (["pwd"], ["uname", "-s"], ["echo", "正常文本"]):
                     result = await full.execute(call("run_command", argv=argv))
                     self.assertTrue(result.value["ok"], result.value)
                 for argv in (["pwd", "-P"], ["uname", "--help"], ["echo", "-e", r"\n"]):
-                    result = await full.execute(call("run_command", argv=argv))
+                    result = await tools.execute(call("run_command", argv=argv))
                     self.assertEqual(result.value["error"]["code"], "permission_denied")
                 for arg in ("$(cat /outside/secret)", "`cat /outside/secret`", "|", ">"):
                     result = await full.execute(call("run_command", argv=["echo", arg]))

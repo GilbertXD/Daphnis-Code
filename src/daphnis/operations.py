@@ -301,6 +301,7 @@ class Operations:
             await app._save_session(current)
             await app._history.save_async(fresh)
             app._session = fresh
+            app._approval_mode = ApprovalMode.AUTO
             app._usage.select_session(fresh.id, fresh.usage)
 
         async with app._state_lock:
@@ -361,6 +362,7 @@ class Operations:
             )
             await app._history.delete(current)
             app._session = fresh
+            app._approval_mode = ApprovalMode.AUTO
             app._usage.select_session(fresh.id, fresh.usage)
 
         async with app._state_lock:

@@ -212,7 +212,7 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
     reason = blocked_reason(program, argv[1:], cwd.path)
     if reason:
         raise ToolError("command_blocked", reason)
-    # Unknown native executables are refused. Recognized scripts still require ASK.
+    # Unknown native executables are refused. Recognized scripts go through approval policy.
     script = False
     if program not in ASK_PROGRAMS | READ_PROGRAMS and not INTERPRETER.fullmatch(
         program
@@ -230,7 +230,7 @@ def prepare_command(arguments: dict[str, Any], workspace: Path) -> Operation:
         while index < len(argv):
             argument = argv[index]
             if argument == "-m":
-                break  # Module execution is always ASK; imported code is not a sandbox.
+                break  # Imported code is outside the scope of argv path checks.
             if argument in ("-X", "-W"):
                 index += 2
                 continue

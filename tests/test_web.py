@@ -180,13 +180,22 @@ class WebTests(unittest.TestCase):
                                           json=command).status_code, 403)
         self.assertEqual(self.client.post("/api/command", headers={**self.headers, "Host": "other.test"},
                                           json=command).status_code, 403)
-        self.command("set_approval_mode", first, 400, mode="full")
+        self.assertEqual(frame["state"]["approval_mode"], "auto")
+        with self.client.websocket_connect(ORIGIN.replace("http:", "ws:") + "/api/events", headers={"Origin": ORIGIN}) as socket:
+            socket.send_text(ACCESS)
+            socket.receive_json()
+            for mode in ("ask", "auto", "full"):
+                self.command("set_approval_mode", first, mode=mode)
+                self.assertEqual(socket.receive_json()["state"]["approval_mode"], mode)
+        self.command("set_approval_mode", first, 400, mode="invalid")
+        self.assertEqual(self.snapshot()["state"]["approval_mode"], "full")
         self.command("tools", first, 400, names=[{}])
         self.command("rename", first, id=first, title="Original")
         self.command("new", first)
         frame = self.snapshot()
         second = frame["session_id"]
         self.assertNotEqual(first, second)
+        self.assertEqual(frame["state"]["approval_mode"], "auto")
         self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first, second})
         self.assertEqual(frame["state"]["history_issues"], [])
         self.command("send", first, 409, prompt="stale")
@@ -200,12 +209,14 @@ class WebTests(unittest.TestCase):
         self.assertEqual(state["model"]["thinking_modes"], ["off", "on"])
         self.assertEqual(state["thinking"], "on")
         self.assertEqual(state["enabled_tools"], [])
+        self.command("set_approval_mode", first, mode="full")
         with SessionLease(self.history.directory / f"{first}.json"):
             self.command("delete", first, 409, id=first)
             self.assertEqual(self.snapshot()["session_id"], first)
         self.command("delete", first, id=first)
         state = self.snapshot()["state"]
         self.assertNotEqual(state["session"]["id"], first)
+        self.assertEqual(state["approval_mode"], "auto")
         self.assertEqual([row["id"] for row in state["sessions"]], [second])
         with self.assertRaises(FileNotFoundError):
             self.history.load(first)
@@ -297,6 +308,8 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
         approval = waiting["status"]["approval"]
+        self.command("set_approval_mode", session_id, 409, mode="full")
+        self.assertEqual(self.snapshot()["state"]["approval_mode"], "auto")
         self.assertFalse((self.workspace / "new.txt").exists())
         self.assertEqual(self.snapshot()["status"]["approval"]["request_id"], approval["request_id"])
         self.command("approve", session_id, 409, request_id="stale", decision="allow_once")
@@ -318,6 +331,14 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next_frame["events"], [])
         self.command("restore", next_frame["session_id"], id=session_id)
         self.assertEqual(self.snapshot()["events"], events)
+        self.command("set_approval_mode", next_frame["session_id"], 409, mode="full")
+        self.command("set_approval_mode", session_id, mode="full")
+        (self.workspace / "new.txt").unlink()
+        self.command("send", session_id, 202, prompt="test patch")
+        done = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual((self.workspace / "new.txt").read_text(), "approved\n")
+        self.assertIsNone(done["status"]["approval"])
+        self.assertEqual(sum(e["name"] == "tool.approval_requested" for e in done["events"]), 1)
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
