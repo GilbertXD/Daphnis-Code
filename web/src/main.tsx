@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
+import { AttachmentLabels, readTextFiles, textFileTypes } from './attachments'
+import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
@@ -352,6 +354,14 @@ function Workspace({ view, connected, command }: {
   const [modal, setModal] = useState<Modal | null>(null)
   const [title, setTitle] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [draftFiles, setDraftFiles] = useState<Record<string, DraftAttachment[]>>({})
+  const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({})
+  const [readingFiles, setReadingFiles] = useState<Set<string>>(() => new Set())
+  const fileReads = useRef(new Set<string>())
+  const submissions = useRef(new Map<string, { id: string; text: string; ids: string[] }>())
+  const [dragging, setDragging] = useState(false)
+  const dragDepth = useRef(0)
+  const fileInput = useRef<HTMLInputElement>(null)
   const [busy, setBusy] = useState(false)
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
   const inFlight = useRef(false)
@@ -360,11 +370,15 @@ function Workspace({ view, connected, command }: {
   const { state, status, session_id: id } = view
   useEffect(() => {
     setModal((current) => current?.action === 'prompts' && current.sessionId !== id ? null : current)
+    dragDepth.current = 0
+    setDragging(false)
   }, [id])
   const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
   const recovery = state.recovery
   const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
   const draft = drafts[id] ?? ''
+  const files = draftFiles[id] ?? []
+  const reading = readingFiles.has(id)
   const tools = useMemo(() => collectTools(view.events), [view.events])
   const sessions = state.sessions.some((session) => session.id === id)
     ? state.sessions : [state.session, ...state.sessions]
@@ -397,10 +411,40 @@ function Workspace({ view, connected, command }: {
     setDrafts((current) => ({ ...current, [id]: typeof text === 'function' ? text(current[id] ?? '') : text }))
   }
 
-  async function send() {
-    if (!disabled && !interrupted && draft.trim() && await perform('send', { prompt: draft })) {
-      setDrafts((current) => current[id] === draft ? { ...current, [id]: '' } : current)
+  async function addFiles(added: File[]) {
+    if (!added.length || fileReads.current.has(id)) return
+    fileReads.current.add(id)
+    setReadingFiles(new Set(fileReads.current))
+    setUploadErrors((current) => ({ ...current, [id]: '' }))
+    try {
+      const result = await readTextFiles(added, files)
+      if (result.added.length) setDraftFiles((current) => ({ ...current, [id]: [...(current[id] ?? []), ...result.added] }))
+      setUploadErrors((current) => ({ ...current, [id]: result.error }))
+    } finally {
+      fileReads.current.delete(id)
+      setReadingFiles(new Set(fileReads.current))
     }
+  }
+
+  async function send() {
+    if (disabled || interrupted || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
+    if (files.length) {
+      const pending = submissions.current.get(id)
+      const ids = files.map((file) => file.id)
+      const submission = pending?.text === draft && pending.ids.length === ids.length && pending.ids.every((value, index) => value === ids[index])
+        ? pending : { id: crypto.randomUUID().replaceAll('-', ''), text: draft, ids }
+      submissions.current.set(id, submission)
+      const accepted = await perform('send_attachments', {
+        submission_id: submission.id, prompt: draft, attachments: files.map(({ name, text }) => ({ name, text })),
+      })
+      if (!accepted) return
+      submissions.current.delete(id)
+      const sent = new Set(ids)
+      setDraftFiles((current) => ({ ...current, [id]: (current[id] ?? []).filter((file) => !sent.has(file.id)) }))
+    } else if (!await perform('send', { prompt: draft })) {
+      return
+    }
+    setDrafts((current) => current[id] === draft ? { ...current, [id]: '' } : current)
   }
 
   return <div className={`shell ${open ? 'debug-open' : ''}`}>
@@ -453,7 +497,39 @@ function Workspace({ view, connected, command }: {
           </div>
         </div>}
         {!modal && notice && <p className="notice" role="status">{notice}</p>}
-        <form className="composer" onSubmit={(event) => { event.preventDefault(); void send() }}>
+        <form className={`composer${dragging ? ' attachment-drop' : ''}`} onSubmit={(event) => { event.preventDefault(); void send() }}
+          onDragEnter={(event) => {
+            if (!event.dataTransfer.types.includes('Files')) return
+            event.preventDefault()
+            dragDepth.current += 1
+            setDragging(true)
+          }}
+          onDragOver={(event) => {
+            if (!event.dataTransfer.types.includes('Files')) return
+            event.preventDefault()
+            event.dataTransfer.dropEffect = 'copy'
+          }}
+          onDragLeave={() => {
+            dragDepth.current = Math.max(0, dragDepth.current - 1)
+            if (!dragDepth.current) setDragging(false)
+          }}
+          onDrop={(event) => {
+            if (!event.dataTransfer.types.includes('Files')) return
+            event.preventDefault()
+            dragDepth.current = 0
+            setDragging(false)
+            void addFiles(Array.from(event.dataTransfer.files))
+          }}>
+          <AttachmentLabels files={files} remove={(fileId) => setDraftFiles((current) => ({
+            ...current, [id]: (current[id] ?? []).filter((file) => file.id !== fileId),
+          }))} />
+          {reading && <p className="muted" role="status">正在读取附件…</p>}
+          {uploadErrors[id] && <p className="notice" role="alert">{uploadErrors[id]}</p>}
+          <input ref={fileInput} type="file" hidden multiple accept={textFileTypes} onChange={(event) => {
+            const selected = Array.from(event.currentTarget.files ?? [])
+            event.currentTarget.value = ''
+            void addFiles(selected)
+          }} />
           <textarea ref={composerInput} aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
             onChange={(event) => updateDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
@@ -464,6 +540,8 @@ function Workspace({ view, connected, command }: {
             }} />
           <div className="composer-controls">
             <div className="selectors">
+              <button className="attachment-picker" type="button" aria-label="添加文本附件" disabled={reading}
+                onClick={() => fileInput.current?.click()}>+</button>
               <select aria-label="模型" title={`${state.model.provider} / ${state.model.id}`}
                 value={modelKey(state.model)} disabled={disabled} onChange={(event) => {
                   const model = state.models.find((candidate) => modelKey(candidate) === event.target.value)
@@ -516,7 +594,7 @@ function Workspace({ view, connected, command }: {
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
                 onClick={() => void perform('cancel', { run_id: view.run?.id })} aria-label="停止" title="停止">■</button>
-              : <button className="primary send" type="submit" disabled={disabled || interrupted || !draft.trim()}
+              : <button className="primary send" type="submit" disabled={disabled || interrupted || reading || (!draft.trim() && !files.length)}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
         </form>

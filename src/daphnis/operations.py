@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
-from .attachments import TextAttachmentInput
+from .attachments import (
+    ATTACHMENT_ONLY_PROMPT,
+    TextAttachmentInput,
+    prepare_attachments,
+)
 from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
 from .events import Callback
@@ -580,8 +584,20 @@ class Operations:
             for index, batch in self._app._session.attachment_refs.items()
         }
 
-    def attachment_submitted(self, submission_id: str) -> bool:
-        return any(batch.submission_id == submission_id for batch in self._app._session.attachment_refs.values())
+    def attachment_submitted(
+        self, submission_id: str, prompt: str, attachments: Sequence[TextAttachmentInput],
+    ) -> bool:
+        session = self._app._session
+        for index, batch in session.attachment_refs.items():
+            if batch.submission_id != submission_id:
+                continue
+            uploaded = prepare_attachments(attachments, submission_id)
+            if (session.messages.get(index)["content"] != (prompt if prompt.strip() else ATTACHMENT_ONLY_PROMPT)
+                or [(item.name, item.sha256) for item in batch.files]
+                != [(item.name, item.sha256) for item in uploaded.files]):
+                raise ValueError("该附件发送标识已用于不同内容。")
+            return True
+        return False
 
     async def send(
         self, prompt: str, *, stream: bool = True,

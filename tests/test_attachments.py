@@ -115,7 +115,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             ops = runtime()
             try:
                 ops.restore_session(sid)
-                self.assertTrue(ops.attachment_submitted("b" * 32))
+                self.assertTrue(ops.attachment_submitted("b" * 32, "Explain", [TextAttachmentInput("code.py", "retry-marker\nExact bytes")]))
                 result = await ops.retry_failed_user(ops.recovery.key, stream=False)
                 self.assertEqual(result.status, TurnStatus.COMPLETED)
                 self.assertEqual(history.load(sid).attachment_refs, refs)

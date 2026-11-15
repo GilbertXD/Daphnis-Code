@@ -132,6 +132,14 @@ th, td { border: 1px solid var(--line); padding: 4px 8px; }
 .composer textarea { display: block; width: 100%; background: #fff; border: 0; resize: vertical; min-height: 51px; max-height: 25dvh; padding: 3px 6px; line-height: 1.5; }
 .composer textarea:focus-visible { outline: none; }
 .composer:focus-within { border-color: #000; }
+.composer.attachment-drop { outline: 2px solid #c4c4c4; background: #f6f6f6; }
+.composer.attachment-drop textarea { background: transparent; }
+.attachment-labels { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 8px; padding: 0; list-style: none; }
+.user-message .attachment-labels { margin: 5px 0 0; padding: 0; }
+.attachment-labels li { display: flex; align-items: center; min-width: 0; max-width: min(100%, 230px); gap: 5px; border: 1px solid var(--line); padding: 2px 5px; background: #fff; font-size: .8rem; }
+.attachment-labels li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-labels li button { padding: 0 3px; border: 0; flex-shrink: 0; }
+.selectors .attachment-picker { font-size: 1.13rem; padding-block: 0; }
 .composer-controls, .selectors { display: flex; align-items: center; min-width: 0; }
 .composer-controls { justify-content: space-between; gap: 10px; margin-top: 7px; }
 .selectors { flex-wrap: wrap; row-gap: 3px; }

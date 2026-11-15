@@ -14,11 +14,14 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ..attachments import MAX_FILES, TextAttachmentInput, valid_id
 from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..tools.approval import ApprovalMode
 from ..turn_state import RecoveryKind
 
 _MAX_BODY_BYTES = 256 * 1024
+_ATTACHMENT_PATH = "/api/attachments/send"
+_MAX_ATTACHMENT_BODY_BYTES = 2 * 1024 * 1024
 _FIELDS = {
     "new": {},
     "project_create": {"name": str, "workspace": (str, type(None))},
@@ -44,6 +47,7 @@ _FIELDS = {
     "set_approval_mode": {"mode": str},
     "confirm_full": {},
     "send": {"prompt": str},
+    "send_attachments": {"prompt": str, "attachments": list, "submission_id": str},
     "retry": {"key": str},
     "continue": {"key": str},
     "terminate": {"key": str},
@@ -64,8 +68,10 @@ async def _command(request: Request):
     if request.headers.get("content-type", "").partition(";")[0] != "application/json":
         raise RequestError("需要 application/json 请求。", 415)
     body = bytearray()
+    upload = request.url.path == _ATTACHMENT_PATH
+    limit = _MAX_ATTACHMENT_BODY_BYTES if upload else _MAX_BODY_BYTES
     async for chunk in request.stream():
-        if len(body) + len(chunk) > _MAX_BODY_BYTES:
+        if len(body) + len(chunk) > limit:
             raise RequestError("请求过大。", 413)
         body.extend(chunk)
     try:
@@ -79,6 +85,8 @@ async def _command(request: Request):
     session = value.pop("session_id", None)
     if not isinstance(action, str) or action not in _FIELDS:
         raise RequestError("未知操作。")
+    if upload != (action == "send_attachments"):
+        raise RequestError("请求地址和操作不匹配。")
     fields = _FIELDS[action]
     if (
         not isinstance(session, str) or not 0 < len(session) <= 255
@@ -93,6 +101,13 @@ async def _command(request: Request):
         raise RequestError("工具列表无效。")
     if action == "send" and not value["prompt"].strip():
         raise RequestError("请输入消息。")
+    if action == "send_attachments" and (
+        not valid_id(value["submission_id"]) or not 0 < len(value["attachments"]) <= MAX_FILES
+        or len(value["prompt"].encode()) > _MAX_BODY_BYTES
+        or any(not isinstance(item, dict) or item.keys() != {"name", "text"}
+               or not all(isinstance(field, str) for field in item.values()) for item in value["attachments"])
+    ):
+        raise RequestError("附件发送字段无效。")
     if action == "move" and (value["project_id"] is None) != (value["workspace"] is None):
         raise RequestError("目标项目与工作目录必须同时提供。")
     if action == "approve" and value["decision"] not in {"deny", "allow_once", "trust_session"}:
@@ -103,6 +118,32 @@ async def _command(request: Request):
         if value["mode"] not in tuple(ApprovalMode):
             raise RequestError("审批模式无效。")
     return action, session, value
+
+
+async def _send_attachments(bridge, session, args):
+    prompt = args["prompt"]
+    submission_id = args["submission_id"]
+    attachments = tuple(TextAttachmentInput(**item) for item in args["attachments"])
+    async with bridge.lock:
+        ops = bridge.ops
+        if ops.session.id != session:
+            raise RequestError("当前会话已切换，请重新操作。", 409)
+        if ops.attachment_submitted(submission_id, prompt, attachments):
+            return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
+        if bridge.upload and bridge.upload[0] == submission_id:
+            _, old_prompt, old_attachments, accepted = bridge.upload
+            if (prompt, attachments) != (old_prompt, old_attachments):
+                raise RequestError("该附件发送标识已用于不同内容。", 409)
+        else:
+            if bridge.run is not None or ops.running:
+                raise RequestError("请先等待或停止当前轮。", 409)
+            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+                raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
+            accepted = bridge.start(prompt, attachments=attachments, submission_id=submission_id)
+    error = await asyncio.shield(accepted)
+    if error is not None:
+        raise RequestError(error, 409)
+    return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
 
 
 async def _execute(bridge, action, session, args, discovery):
@@ -270,6 +311,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         bridge = request.app.state.bridge
         try:
             action, session, args = await _command(request)
+            if action == "send_attachments":
+                return await _send_attachments(bridge, session, args)
             if action in _PROMPT_ACTIONS:
                 return await _prompt_response(bridge, action, session, args)
             if action in {"registry_search", "registry_detail"}:
@@ -349,6 +392,7 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         lifespan=lifespan,
         routes=[
             Route("/api/command", command, methods=["POST"]),
+            Route(_ATTACHMENT_PATH, command, methods=["POST"]),
             WebSocketRoute("/api/events", events),
             Mount("/", app=StaticFiles(directory=assets, html=True)),
         ],

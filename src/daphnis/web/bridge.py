@@ -7,12 +7,13 @@ from collections import OrderedDict, deque
 from dataclasses import asdict, fields
 from uuid import uuid4
 
+from ..attachments import ATTACHMENT_ONLY_PROMPT, ATTACHMENT_TOOLS
 from ..history import SessionScan
 from ..operations import Operations
 from .redaction import Redactor
 
 _EVENT_NAMES = (
-    "turn.started", "turn.finished", "model.started", "model.request",
+    "turn.started", "turn.finished", "attachments.committed", "model.started", "model.request",
     "model.delta", "model.usage", "model.finished", "model.response_error",
     "tool.started", "tool.approval_requested", "tool.blocked", "tool.executing", "tool.finished",
     "mcp.error", "mcp.tools_changed",
@@ -30,6 +31,17 @@ def _model_view(model):
         field.name: getattr(model, field.name)
         for field in fields(model) if field.name != "token_counter"
     }
+
+
+def _browser_messages(messages):
+    private = set()
+    for index, message in enumerate(messages):
+        if message["role"] != "tool":
+            private = {call["id"] for call in message.get("tool_calls") or ()
+                       if call.get("function", {}).get("name") in ATTACHMENT_TOOLS}
+        elif message.get("tool_call_id") in private and "content" in message:
+            messages[index] = {**message, "content": "[附件工具输出已隐藏]"}
+    return messages
 
 
 class Journal:
@@ -61,6 +73,7 @@ class Bridge:
         self.journals = OrderedDict()
         self.task = None
         self.run = None
+        self.upload = None
         self.live = {}
         self.lock = asyncio.Lock()
         self._subscriptions = [ops.subscribe(name, self._forward) for name in _EVENT_NAMES]
@@ -92,6 +105,15 @@ class Bridge:
 
     def _forward(self, event):
         data = event.data
+        if event.name == "attachments.committed":
+            if self.upload and self.run and self.run["session_id"] == event.session_id:
+                submission_id, _, _, accepted = self.upload
+                if submission_id == data["submission_id"] and not accepted.done():
+                    accepted.set_result(None)
+            self._notify(state=True)
+            return
+        if event.name == "model.finished" and data.get("attachment_sensitive"):
+            data = {key: value for key, value in data.items() if key != "response"}
         if event.name == "model.delta":
             if self.run is None or event.turn_id != self.run["turn_id"]:
                 return
@@ -159,7 +181,8 @@ class Bridge:
             "projects_error": projects_error,
             "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
-            "messages": ops.message_snapshot(),
+            "messages": _browser_messages(ops.message_snapshot()),
+            "attachment_refs": ops.attachment_snapshot(),
             "recovery": asdict(recovery) if (recovery := ops.recovery) else None,
             "model": _model_view(ops.model),
             "models": [
@@ -231,18 +254,30 @@ class Bridge:
             frame["state"] = self.state()
         return frame
 
-    def start(self, prompt, *, operation=None):
+    def start(self, prompt, *, operation=None, attachments=(), submission_id=None):
         session_id = self.ops.session.id
         self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
                     "base_count": len(self.ops.message_snapshot())}
+        accepted = None
+        if attachments:
+            self.run["prompt"] = prompt if prompt.strip() else ATTACHMENT_ONLY_PROMPT
+            self.run["attachments"] = [item.name for item in attachments]
+            accepted = asyncio.get_running_loop().create_future()
+            self.upload = (submission_id, prompt, attachments, accepted)
         self.live.clear()
-        self.task = asyncio.create_task(self._send(prompt, session_id, operation))
+        self.task = asyncio.create_task(self._send(prompt, session_id, operation, attachments, submission_id, accepted))
         self._notify()
+        return accepted
 
-    async def _send(self, prompt, session_id, operation):
+    async def _send(self, prompt, session_id, operation, attachments, submission_id, accepted):
         result = {"status": "FAILED", "error": "本轮未完成。"}
         try:
-            turn = await (operation() if operation is not None else self.ops.send(prompt, stream=True))
+            if operation is not None:
+                turn = await operation()
+            elif attachments:
+                turn = await self.ops.send(prompt, stream=True, attachments=attachments, submission_id=submission_id)
+            else:
+                turn = await self.ops.send(prompt, stream=True)
             result = {
                 "status": turn.status,
                 "error": turn.error,
@@ -254,7 +289,10 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001 - Return failures across the detached send boundary.
             result = {"status": "FAILED", "error": str(exc)}
         finally:
+            if accepted is not None and not accepted.done():
+                accepted.set_result(self.redactor.text(result["error"] or "附件发送未成功。"))
             self._record("web.send_finished", session_id, self.run["turn_id"], result)
+            self.upload = None
             self.run = None
             self.live.clear()
             self._notify(state=True)

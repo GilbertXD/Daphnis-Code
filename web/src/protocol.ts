@@ -173,6 +173,7 @@ type State = {
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
+  attachment_refs?: Record<number, { id: string; name: string }[]>
   recovery: Recovery | null
   model: Model
   models: Model[]
@@ -191,7 +192,7 @@ type Frame = {
   reset: boolean
   state?: State
   status: Status
-  run: { id: string; turn_id: string; session_id: string; prompt: string | null; base_count: number } | null
+  run: { id: string; turn_id: string; session_id: string; prompt: string | null; base_count: number; attachments?: string[] } | null
   live: Record<string, LiveText>
   events: AgentEvent[]
 }
@@ -270,7 +271,7 @@ export function useConnection(token: string) {
     if (!connected || !view) throw new Error('连接中断，请等待重新连接。')
     let response: Response
     try {
-      response = await fetch('/api/command', {
+      response = await fetch(action === 'send_attachments' ? '/api/attachments/send' : '/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
         body: JSON.stringify({ action, session_id: view.session_id, ...fields }),

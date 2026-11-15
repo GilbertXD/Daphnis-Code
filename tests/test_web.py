@@ -578,6 +578,50 @@ class WebTests(unittest.TestCase):
         self.command("new", sid)
         self.command("mcp_list_prompts", sid, 409, server="demo")
 
+    def test_attachment_send_is_committed_before_ack_and_deduplicated(self):
+        sid = self.snapshot()["session_id"]
+        path = "/api/attachments/send"
+        marker = "upload-private-observation-marker"
+        payload = {
+            "action": "send_attachments", "session_id": sid, "submission_id": "a" * 32,
+            "prompt": "", "attachments": [{"name": "notes.txt", "text": marker}],
+        }
+        invalid = {**payload, "attachments": [{"name": "../notes.txt", "text": marker}]}
+        rejected = self.client.post(path, headers=self.headers, json=invalid)
+        self.assertEqual(rejected.status_code, 409, rejected.text)
+        self.assertEqual(self.snapshot()["state"]["messages"], [])
+        wrong_route = self.client.post("/api/command", headers=self.headers, json=payload)
+        self.assertEqual(wrong_route.status_code, 400)
+        response = self.client.post(path, headers=self.headers, json=payload)
+        self.assertEqual(response.status_code, 202, response.text)
+        saved = self.history.load(sid)
+        item = saved.attachment_refs[0].files[0]
+        self.assertEqual(self.history.attachments.read(sid, item), marker)
+        repeated = self.client.post(path, headers=self.headers, json=payload)
+        self.assertEqual(repeated.status_code, 202, repeated.text)
+        conflict = self.client.post(path, headers=self.headers, json={**payload, "prompt": "different"})
+        self.assertEqual(conflict.status_code, 409, conflict.text)
+        frame = self.wait_for(lambda item: item["run"] is None)
+        self.assertEqual(len(frame["state"]["messages"]), 2)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn(marker, self.requests[0]["messages"][-1]["content"])
+        self.assertEqual(frame["state"]["attachment_refs"], {"0": [{"id": item.id, "name": "notes.txt"}]})
+        self.assertNotIn(marker, json.dumps(frame))
+
+        oversized_command = self.client.post("/api/command", headers=self.headers, json={
+            "action": "send", "session_id": sid, "prompt": "x" * (256 * 1024),
+        })
+        self.assertEqual(oversized_command.status_code, 413)
+        large = {**payload, "submission_id": "b" * 32, "attachments": [
+            {"name": "one.txt", "text": "A" * (128 * 1024)},
+            {"name": "two.txt", "text": "B" * (128 * 1024)},
+        ]}
+        uploaded = self.client.post(path, headers=self.headers, json=large)
+        self.assertEqual(uploaded.status_code, 202, uploaded.text)
+        self.wait_for(lambda item: item["run"] is None)
+        self.assertEqual(len(self.history.load(sid).attachment_refs[2].files), 2)
+        self.assertNotIn("A" * 1024, json.dumps(self.requests[-1]))
+
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
         session_id = self.snapshot()["session_id"]
