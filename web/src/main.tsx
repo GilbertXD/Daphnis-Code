@@ -16,10 +16,12 @@ const sessionActions = [
 ] as const
 type SessionAction = (typeof sessionActions)[number][0]
 
-function Dialog({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
+function Dialog({ title, close, children, className }: {
+  title: string; close: () => void; children: ReactNode; className?: string
+}) {
   const dialog = useRef<HTMLDialogElement>(null)
   useEffect(() => { dialog.current?.showModal() }, [])
-  return <dialog ref={dialog} onCancel={(event) => { event.preventDefault(); close() }} aria-label={title}>
+  return <dialog ref={dialog} className={className} onCancel={(event) => { event.preventDefault(); close() }} aria-label={title}>
     <div className="dialog-heading"><h2>{title}</h2><button className="icon" aria-label="关闭" onClick={close}>×</button></div>
     {children}
   </dialog>
@@ -453,7 +455,7 @@ function Workspace({ view, connected, command }: {
         onClick={() => setOpen(true)}><span aria-hidden="true">‹</span></button>}
     {modal?.action === 'tools' && <ToolsDialog view={view} close={() => setModal(null)} disabled={disabled}
       notice={notice} apply={(names) => perform('tools', { names })} />}
-    {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)}>
+    {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)} className="mcp-dialog">
       <MCPManager servers={state.mcp_servers} disabled={disabled} error={state.mcp_error}
         notice={notice} perform={perform} command={command} />
     </Dialog>}
