@@ -13,4 +13,5 @@ COMPATIBILITY = Compatibility(
             "on": {"type": "enabled"},
         },
     },
+    content_part_mappings={"image_url": {"type": "image_url"}},
 )

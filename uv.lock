@@ -256,7 +256,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.3,<14" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
     { name = "python-multipart", marker = "extra == 'web'", specifier = ">=0.0.33,<1" },
-    { name = "saturnus-llm", specifier = "==0.1.1" },
+    { name = "saturnus-llm", path = "vendor/saturnus_llm-0.1.2-py3-none-any.whl" },
     { name = "starlette", marker = "extra == 'web'", specifier = ">=1.10,<2" },
     { name = "uritemplate", specifier = ">=4.2,<5" },
     { name = "uvicorn", marker = "extra == 'web'", specifier = ">=0.54,<1" },
@@ -909,15 +909,20 @@ wheels = [
 
 [[package]]
 name = "saturnus-llm"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.1.2"
+source = { path = "vendor/saturnus_llm-0.1.2-py3-none-any.whl" }
 dependencies = [
     { name = "httpx" },
     { name = "jsonschema" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/92/d1/325279f1c17e7d39d1a7f8aa4a5c025c1d81228e6dc388199fbe2932f63b/saturnus_llm-0.1.1.tar.gz", hash = "sha256:a4f65605290b46642f5ce63243792b899cfd9cd68a8d65afa92949e6e32dec11", size = 42253, upload-time = "2026-11-07T06:52:24.93Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/24/cb9be0c1376127e96bcd9a7c2604f979827c849afdde3390536cfc8583bb/saturnus_llm-0.1.1-py3-none-any.whl", hash = "sha256:d7f709b705820fa783c1045605eb6b8fabaa3d197029f7eebc5bfa36cf3d2b33", size = 33230, upload-time = "2026-11-07T06:52:23.369Z" },
+    { filename = "saturnus_llm-0.1.2-py3-none-any.whl", hash = "sha256:d21960ab9ea3f0e50130aa115e4d4ec4bf1f52c842222f610352d3e938639e1b" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
 ]
 
 [[package]]
