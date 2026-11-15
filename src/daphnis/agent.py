@@ -881,8 +881,12 @@ class Agent:
                     except (OSError, ValueError):
                         raise ValueError("原始附件快照不可用。") from None
                     body = request_options()
+                    # Budget against a complete copy without changing the pending calls.
+                    projected = session.messages if interrupted is None else Messages(
+                        resolve_tool_placeholders(snapshot, interrupted[1], terminate=True)[0]
+                    )
                     attachment_notes = self._choose_attachment_notes(
-                        session.messages, checkpoint, body, model, attachment_refs, recovery.message_index,
+                        projected, checkpoint, body, model, attachment_refs, recovery.message_index,
                         attachment_note(batch, texts), can_read_attachments,
                     )
                 if interrupted is not None:

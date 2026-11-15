@@ -117,7 +117,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 ops.restore_session(sid)
                 self.assertTrue(ops.attachment_submitted("b" * 32, "Explain", [TextAttachmentInput("code.py", "retry-marker\nExact bytes")]))
                 result = await ops.retry_failed_user(ops.recovery.key, stream=False)
-                self.assertEqual(result.status, TurnStatus.COMPLETED)
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertEqual(history.load(sid).attachment_refs, refs)
                 self.assertIn("retry-marker\nExact bytes", requests[-1]["messages"][-1]["content"])
                 await ops.send("Next", stream=False)
@@ -137,7 +137,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 large = "large-marker " * 5500
                 await ops.set_tools(["read_attachment", "search_attachment"])
                 result = await ops.send("", attachments=[TextAttachmentInput("large.txt", large)], stream=False)
-                self.assertEqual(result.status, TurnStatus.COMPLETED)
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertIn("read_attachment", requests[-1]["messages"][-1]["content"])
                 self.assertNotIn("large-marker", requests[-1]["messages"][-1]["content"])
 
@@ -214,3 +214,96 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertEqual(raw.value["error"]["code"], "sensitive_path")
             self.assertEqual(approvals, ["read_attachment"])
+
+    async def test_aggregate_budget_and_interrupted_tool_continue_after_restart(self):
+        import asyncio
+
+        import httpx
+
+        from daphnis import Operations, TurnStatus
+        from daphnis.agent import TITLE_PROMPT
+        from daphnis.app import Application
+        from daphnis.models import ModelInfo
+        from daphnis.tools import ApprovalMode
+        from daphnis.turn_state import RecoveryKind
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = History(root / "sessions")
+            tiny = ModelInfo(id="tiny", provider="deepseek", context_window=8192,
+                             default_output_tokens=512, supports_tools=False)
+            large = ModelInfo(id="large", provider="deepseek", context_window=131_072,
+                              default_output_tokens=512, supports_tools=True)
+            uploads = [TextAttachmentInput("first.txt", "alpha " * 1200),
+                       TextAttachmentInput("second.txt", "beta " * 1250)]
+            bodies = []
+
+            def provider(request):
+                body = json.loads(request.content)
+                content = body["messages"][-1]["content"]
+                calls = []
+                if body["messages"][0]["content"] != TITLE_PROMPT:
+                    bodies.append(body)
+                    if body["messages"][-1]["role"] == "user":
+                        first = next(json.loads(line) for line in content.splitlines() if line.startswith('{"name":'))
+                        self.assertNotIn("alpha alpha alpha", content)
+                        self.assertNotIn("beta beta beta", content)
+                        calls.append({"id": "read-first", "type": "function", "function": {
+                            "name": "read_attachment", "arguments": json.dumps({"id": first["id"]}),
+                        }})
+                    else:
+                        page = json.loads(content)
+                        self.assertTrue(page["ok"])
+                        self.assertIn("alpha alpha alpha", page["lines"][0]["text"])
+                message = {"role": "assistant", "content": "done"}
+                if calls:
+                    message = {"role": "assistant", "content": None, "tool_calls": calls}
+                return httpx.Response(200, json={"choices": [{
+                    "index": 0, "finish_reason": "tool_calls" if calls else "stop", "message": message,
+                }]})
+
+            def runtime(model_id):
+                return Operations(Application(
+                    workspace=root, provider="deepseek", model_id=model_id, history=history,
+                    catalog=(tiny, large), interactive=True,
+                    connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(provider)}},
+                ))
+
+            ops = runtime("tiny")
+            try:
+                # Smaller than 4,000 tokens, but over five percent of the tiny window's available room.
+                failed = await ops.send("read", attachments=[TextAttachmentInput("short.txt", "abc " * 400)], stream=False)
+                self.assertIn("无法安全内联", failed.error)
+                self.assertEqual(ops.message_snapshot(), [])
+                self.assertEqual(bodies, [])
+            finally:
+                await ops.close()
+
+            ops = runtime("large")
+            try:
+                approved = asyncio.Event()
+                ops.subscribe("tool.approval_requested", lambda event: approved.set())
+                ops.set_approval_mode(ApprovalMode.ASK)
+                task = asyncio.create_task(ops.send("read", attachments=uploads, stream=False))
+                try:
+                    await asyncio.wait_for(approved.wait(), 3)
+                finally:
+                    await ops.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                sid = ops.session.id
+                self.assertEqual(ops.recovery.kind, RecoveryKind.INTERRUPTED_TURN)
+                refs = history.load(sid).attachment_refs
+            finally:
+                await ops.close()
+
+            ops = runtime("large")
+            try:
+                ops.restore_session(sid)
+                result = await ops.continue_interrupted_turn(ops.recovery.key, stream=False)
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                self.assertEqual(history.load(sid).attachment_refs, refs)
+                self.assertEqual(len(list((history.attachments.directory / sid).glob("*.txt"))), 2)
+                self.assertEqual(len(bodies), 2)
+            finally:
+                await ops.close()

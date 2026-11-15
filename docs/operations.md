@@ -58,7 +58,7 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 工具 | `all_tools` 是可用目录，`enabled_tools` 是已启用偏好（包括已启用的离线 MCP 工具），`effective_tools` 是两者的交集。`await set_tools(names, keep_unavailable=False)` 保存选择，可用 `keep_unavailable=True` 保留未列出的离线偏好。 |
 | MCP | `managed_mcp()` 查看已保存配置。空闲时可用 `await save_mcp(name, enabled=..., options=..., create=...)` 创建或编辑配置，省略 `options` 可只切换启用状态。`await restart_mcp(name)` 重连已启用的服务，`await delete_mcp(name)` 删除配置。`connect_mcp()`、`reconnect_mcp()`、`disconnect_mcp()` 和 `refresh_mcp()` 仍用于直接管理运行时连接。`mcp_status()` 和 `list_mcp_tools()` 查询实时状态和在线工具。 |
 | MCP 模板 | `list_mcp_prompt_servers()` 列出已连接且支持模板的服务。`await list_mcp_prompts(server)` 返回模板定义，`await get_mcp_prompt(server, name, arguments)` 校验字符串参数并返回 SDK 的 `GetPromptResult`，保留消息角色、顺序与内容类型。两个异步方法只读取远程模板。 |
-| 执行与取消 | `await send(prompt, stream=True)` 执行一轮并返回 `TurnResult`。`running` 查询是否有活跃 Turn 或手动压缩，`await cancel()` 请求取消并等待任务停止。 |
+| 执行与取消 | `await send(prompt, stream=True)` 执行一轮并返回 `TurnResult`。可用 `attachments` 传入 `daphnis.attachments.TextAttachmentInput(name, text)` 的序列。`running` 查询是否有活跃 Turn 或手动压缩，`await cancel()` 请求取消并等待任务停止。 |
 | 恢复 | `recovery` 返回当前待处理状态的 `kind`、原 User 的 `message_index` 和 `key`。将该键传给 `retry_failed_user(key)`、`continue_interrupted_turn(key)` 或 `terminate_interrupted_turn(key)`。 |
 | 上下文 | `await compact()` 在空闲时请求手动压缩，返回已保存的检查点或 `None`。`context_budget` 返回最近一次主请求的输入预算，`compacting` 和 `compacted_through` 表示压缩状态和已提交摘要覆盖到的消息数。 |
 | 审批 | `approval_mode` 和 `set_approval_mode(mode)` 查询及设置模式。`pending_approval` 返回当前请求的独立副本或 `None`。`resolve_approval(request_id, decision)` 仅对匹配且仍在等待的请求返回 `True`，用 `can_trust` 判断是否可提交会话信任。 |
