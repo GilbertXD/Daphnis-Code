@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ from typing import Self, TypeVar
 
 from saturnus import Messages, ValidationError
 
+from .attachments import AttachmentBatch, AttachmentStore
 from .compaction import CompactionCheckpoint
 from .project import Project, validate_project_id
 from .session import Session
@@ -22,6 +24,8 @@ from .usage import UsageTotals
 
 if os.name == "posix":
     import fcntl
+
+logger = logging.getLogger(__name__)
 
 
 class SessionConflictError(RuntimeError):
@@ -120,6 +124,7 @@ class History:
             else Path(directory)
         )
         self.directory = location.expanduser().resolve()
+        self.attachments = AttachmentStore(self.directory)
 
     def list_sessions(self) -> tuple[SessionInfo, ...]:
         """List valid saved Sessions, newest first."""
@@ -257,9 +262,16 @@ class History:
         await finish_io(asyncio.to_thread(update))
 
     async def delete(self, session: Session) -> None:
+        def remove(lease: SessionLease) -> None:
+            lease.destination.unlink(missing_ok=True)
+            try:
+                self.attachments.delete(session.id)
+            except OSError:
+                logger.warning("无法清理已删除会话的附件快照。")
+
         async with self.lease(session) as lease:
             # Keep the stable lock file so concurrent processes lock the same inode.
-            await finish_io(asyncio.to_thread(lease.destination.unlink, missing_ok=True))
+            await finish_io(asyncio.to_thread(remove, lease))
 
     def save(self, session: Session, *, lease: SessionLease | None = None) -> None:
         destination = self._path(session.id)
@@ -283,6 +295,7 @@ class History:
             compaction=session.compaction,
             system_prompt=session.system_prompt,
             project_id=session.project_id,
+            attachment_refs=session.attachment_refs,
         )
         data = {
             "version": 2,
@@ -304,6 +317,8 @@ class History:
             data["system_prompt"] = validated.system_prompt
         if validated.project_id is not None:
             data["project_id"] = validated.project_id
+        if validated.attachment_refs:
+            data["attachment_refs"] = {str(index): asdict(batch) for index, batch in validated.attachment_refs.items()}
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())
@@ -360,6 +375,11 @@ class History:
                 raise ValueError("Invalid session compaction checkpoint.")
             checkpoint = CompactionCheckpoint(**checkpoint)
         messages = Messages(data["messages"])
+        refs = data.get("attachment_refs", {})
+        if not isinstance(refs, dict) or not all(
+            index.isascii() and index.isdigit() and index == str(int(index)) for index in refs
+        ):
+            raise ValueError("Invalid Session attachment indices.")
         interrupted_tool_group(data["messages"])
         session = Session(
             id=data["id"],
@@ -374,6 +394,7 @@ class History:
             title=data.get("title"),
             compaction=checkpoint,
             system_prompt=data.get("system_prompt"),
+            attachment_refs={int(index): AttachmentBatch.from_json(batch) for index, batch in refs.items()},
         )
         session.project_id = self.resolve_project_id(data.get("project_id"), Path(session.workspace))
         return session

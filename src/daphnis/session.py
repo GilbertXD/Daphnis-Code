@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from saturnus import Messages
 
+from .attachments import AttachmentBatch
 from .compaction import CompactionCheckpoint
 from .project import validate_project_id
 from .turn_state import RecoveryState, recovery_state
@@ -35,6 +36,7 @@ class Session:
     compaction: CompactionCheckpoint | None = None
     system_prompt: str | None = None
     project_id: str | None = None
+    attachment_refs: dict[int, AttachmentBatch] = field(default_factory=dict)
 
     @property
     def recovery(self) -> RecoveryState | None:
@@ -59,6 +61,24 @@ class Session:
             validate_project_id(self.project_id)
         if not isinstance(self.messages, Messages):
             raise TypeError("messages must be a Saturnus Messages instance.")
+        if not isinstance(self.attachment_refs, dict):
+            raise TypeError("Session attachment_refs must be an object.")
+        ids: set[str] = set()
+        submissions: set[str] = set()
+        for index, batch in self.attachment_refs.items():
+            if (
+                type(index) is not int or not 0 <= index < len(self.messages)
+                or self.messages.get(index)["role"] != "user" or not isinstance(batch, AttachmentBatch)
+            ):
+                raise ValueError("Attachment refers to an invalid user message index.")
+            for item in batch.files:
+                if item.id in ids:
+                    raise ValueError("Duplicate Session attachment ID.")
+                ids.add(item.id)
+            if batch.submission_id is not None:
+                if batch.submission_id in submissions:
+                    raise ValueError("Duplicate Session attachment submission ID.")
+                submissions.add(batch.submission_id)
         if not isinstance(self.usage, UsageTotals):
             raise TypeError("usage must be a UsageTotals instance.")
         if self.thinking is not None and (
