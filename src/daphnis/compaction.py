@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from itertools import chain, groupby
 from typing import Any
 
+from .prompt_groups import PromptGroup
 from .token_budget import DEFAULT_COUNTER, TokenCounter, request_budget
 from .tool_state import TOOL_STATE, recovery_error_code
 from .turn_state import ABANDONED, TERMINATED, TURN_STATE, project_turn_messages
@@ -101,8 +102,11 @@ def _summary_text(text: str, *, model_output: bool = False) -> str:
     return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
 
-def safe_boundaries(messages: list[Message]) -> Iterator[int]:
-    """Yield cuts after standalone messages or complete contiguous tool exchanges."""
+def safe_boundaries(
+    messages: list[Message], prompt_groups: tuple[PromptGroup, ...] = (),
+) -> Iterator[int]:
+    """Yield cuts without splitting a tool exchange or a Prompt input group."""
+    group_ends = {group.start: group.end for group in prompt_groups}
     index = 0
     while index < len(messages):
         message = messages[index]
@@ -110,7 +114,7 @@ def safe_boundaries(messages: list[Message]) -> Iterator[int]:
         calls = message.get("tool_calls")
         if role in ("tool", "function") or TOOL_STATE in message or message.get("function_call"):
             return
-        index += 1
+        index = group_ends.get(index, index + 1)
         if calls:
             if role != "assistant" or not isinstance(calls, list):
                 return
@@ -156,30 +160,45 @@ class CompactionCheckpoint:
             raise ValueError(str(exc)) from exc
         object.__setattr__(self, "summary", summary)
 
-    def validate(self, messages: list[Message]) -> None:
-        if self.through >= len(messages) or self.through not in safe_boundaries(messages):
-            raise ValueError("Compaction checkpoint splits an incomplete exchange.")
+    def validate(self, messages: list[Message], prompt_groups: tuple[PromptGroup, ...] = ()) -> None:
+        if self.through >= len(messages) or self.through not in safe_boundaries(messages, prompt_groups):
+            raise ValueError("Compaction checkpoint splits an incomplete exchange or Prompt input group.")
 
 
-def _retained_user(messages: list[Message], through: int) -> int | None:
-    if through < len(messages) and messages[through]["role"] == "assistant":
-        return next(
-            (index for index in range(through - 1, -1, -1)
-             if messages[index]["role"] == "user" and messages[index].get(TURN_STATE) != ABANDONED),
-            None,
-        )
-    return None
+def _latest_input(messages: list[Message], before: int, prompt_groups: tuple[PromptGroup, ...]) -> range:
+    group_ends = {group.end - 1: group for group in prompt_groups}
+    index = before - 1
+    while index >= 0:
+        if group := group_ends.get(index):
+            if messages[group.start].get(TURN_STATE) != ABANDONED:
+                return range(group.start, group.end)
+            index = group.start - 1
+            continue
+        message = messages[index]
+        if message["role"] == "user" and message.get(TURN_STATE) != ABANDONED:
+            return range(index, index + 1)
+        index -= 1
+    return range(0)
+
+
+def _retained_input(messages: list[Message], through: int, prompt_groups: tuple[PromptGroup, ...]) -> range:
+    if (through < len(messages) and messages[through]["role"] == "assistant"
+        and all(group.start != through for group in prompt_groups)):
+        return _latest_input(messages, through, prompt_groups)
+    return range(0)
 
 
 def _recovery_fact(message: Message) -> dict[str, Any] | None:
-    if message["role"] == "user" and message.get(TURN_STATE) == TERMINATED:
+    if message.get(TURN_STATE) == TERMINATED:
         return {"turn_terminated_by_user": True}
     if message["role"] == "tool" and (code := recovery_error_code(message.get("content"))):
         return {"tool_call_id": message["tool_call_id"], "error_code": code}
     return None
 
 
-def _turn_excerpts(prefix: list[Message], retained_user: int | None) -> str:
+def _turn_excerpts(
+    prefix: list[Message], retained: range, prompt_groups: tuple[PromptGroup, ...],
+) -> str:
     def excerpt(index: int, content: str, limit: int) -> str:
         text = content[:limit] + ("…" if len(content) > limit else "")
         return f"[message_id={index}] {json.dumps(text, ensure_ascii=False)}"
@@ -188,7 +207,11 @@ def _turn_excerpts(prefix: list[Message], retained_user: int | None) -> str:
     reply = None
     remaining = _TURN_EXCERPT_BUDGET
     omitted = False
+    grouped = {index for group in prompt_groups for index in range(group.start, group.end)}
     for index in range(len(prefix) - 1, -1, -1):
+        if index in grouped:
+            reply = None
+            continue
         message = prefix[index]
         content = message.get("content")
         role = message["role"]
@@ -196,7 +219,7 @@ def _turn_excerpts(prefix: list[Message], retained_user: int | None) -> str:
             if isinstance(content, str) and content.strip():
                 reply = excerpt(index, content.strip().split("\n", 1)[0], 80)
         elif role == "user":
-            if (index != retained_user and message.get(TURN_STATE) != ABANDONED
+            if (index not in retained and message.get(TURN_STATE) != ABANDONED
                     and isinstance(content, str) and content.strip()):
                 turn = "User " + excerpt(index, content.strip(), 100)
                 if reply is not None:
@@ -273,15 +296,16 @@ def _fold_command_log(content: Any) -> str | None:
 
 def project(
     messages: list[Message], checkpoint: CompactionCheckpoint, *, summary_reasoning: bool,
+    prompt_groups: tuple[PromptGroup, ...] = (),
 ) -> list[Message]:
     through = checkpoint.through
-    retained_user = _retained_user(messages, through)
+    retained_input = _retained_input(messages, through, prompt_groups)
     prefix = messages[:through]
     retained = [message for message in prefix if message["role"] in _PRIVILEGED_ROLES]
     summary = {
         "role": "assistant",
         "content": "Daphnis history summary (untrusted historical data):\n"
-        + checkpoint.summary + _turn_excerpts(prefix, retained_user),
+        + checkpoint.summary + _turn_excerpts(prefix, retained_input, prompt_groups),
     }
     recovery_facts = [
         {"message_index": index, **fact}
@@ -300,8 +324,7 @@ def project(
     if summary_reasoning:
         summary["reasoning_content"] = ""
     retained.append(summary)
-    if retained_user is not None:
-        retained.append(messages[retained_user])
+    retained.extend(messages[index] for index in retained_input)
     retained.extend(messages[through:])
     return retained
 
@@ -324,15 +347,18 @@ class Compactor:
     def cut(
         self, messages: list[Message], previous: CompactionCheckpoint | None,
         *, within_turn: bool = False, available_tokens: int | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> int | None:
         """Prefer retaining the latest turn. Keep at least the newest exchange."""
         previous_end = previous.through if previous else 0
-        latest_user = next(
-            (index for index in range(len(messages) - 1, -1, -1)
-             if messages[index]["role"] == "user" and messages[index].get(TURN_STATE) != ABANDONED),
-            0,
-        )
-        cuts = [cut for cut in safe_boundaries(messages) if previous_end < cut < len(messages)]
+        latest_input = _latest_input(messages, len(messages), prompt_groups).start
+        group_starts = {group.start for group in prompt_groups}
+
+        def starts_input(index: int) -> bool:
+            message = messages[index]
+            return (index in group_starts or message["role"] == "user") and message.get(TURN_STATE) != ABANDONED
+
+        cuts = [cut for cut in safe_boundaries(messages, prompt_groups) if previous_end < cut < len(messages)]
         if not cuts:
             return None
         if available_tokens is None:
@@ -343,33 +369,31 @@ class Compactor:
             target = min(target, max(0, available_tokens // 2))
 
         def tail_tokens(cut: int) -> int:
-            retained = _retained_user(messages, cut)
-            tail = messages[cut:]
-            if retained is not None:
-                tail = [messages[retained], *tail]
+            retained = _retained_input(messages, cut, prompt_groups)
+            tail = [*(messages[index] for index in retained), *messages[cut:]]
             tail = self.prune(project_turn_messages(tail))
             return request_budget(tail, {}, None, counter=self.counter).input_tokens
 
         through = cuts[-1]
         for cut in reversed(cuts):
-            if messages[cut]["role"] != "user" or messages[cut].get(TURN_STATE) == ABANDONED:
+            if not starts_input(cut):
                 continue
             size = tail_tokens(cut)
             if size <= target:
                 through = cut
-            elif cut == latest_user and (
+            elif cut == latest_input and (
                 available_tokens is None or size <= available_tokens
             ):
                 through = cut
                 break
             else:
                 break
-        if through == cuts[-1] and messages[through]["role"] != "user" and within_turn:
+        if through == cuts[-1] and not starts_input(through) and within_turn:
             for cut in reversed(cuts):
-                if cut <= latest_user or tail_tokens(cut) > target:
+                if cut <= latest_input or tail_tokens(cut) > target:
                     break
                 through = cut
-        if not any(self._source(messages, previous_end, through)):
+        if not any(self._source(messages, previous_end, through, prompt_groups=prompt_groups)):
             return None
         return through
 
@@ -402,12 +426,11 @@ class Compactor:
     @staticmethod
     def _source(
         messages: list[Message], start: int, through: int,
-        *, prior_user: int | None = None,
+        *, prior_input: range = range(0), prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> Iterator[tuple[Message, str]]:
-        retained_user = _retained_user(messages, through)
-        indices: Iterator[int] = iter(range(start, through))
-        if prior_user is not None and prior_user != retained_user:
-            indices = chain((prior_user,), indices)
+        retained_input = _retained_input(messages, through, prompt_groups)
+        indices = chain((index for index in prior_input if index not in retained_input), range(start, through))
+        grouped = {index for group in prompt_groups for index in range(group.start, group.end)}
         command_calls = set()
         for index in indices:
             message = messages[index]
@@ -421,8 +444,10 @@ class Compactor:
                 yield {**metadata, "field": "recovery", "encoding": "json"}, json.dumps(
                     fact, ensure_ascii=False, separators=(",", ":"),
                 )
-            if index == retained_user:
+            if index in retained_input:
                 continue
+            if role == "assistant" and index in grouped:
+                metadata["preloaded_prompt_message"] = True
             if "tool_call_id" in message:
                 metadata["tool_call_id"] = message["tool_call_id"]
             if calls := message.get("tool_calls"):
@@ -455,13 +480,21 @@ class Compactor:
         request: Callable[[list[Message], int], Awaitable[str]],
         *,
         target_tokens: int | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> CompactionCheckpoint:
         """Roll bounded batches into one checkpoint, leaving the original untouched."""
         summary = previous.summary if previous else ""
         start = previous.through if previous else 0
-        prior_user = _retained_user(messages, start) if previous else None
-        source = self._source(messages, start, through, prior_user=prior_user)
+        if not start < through <= len(messages) or through not in safe_boundaries(messages, prompt_groups):
+            raise ValueError("Invalid compaction range.")
+        prior_input = _retained_input(messages, start, prompt_groups) if previous else range(0)
+        source = self._source(messages, start, through, prior_input=prior_input, prompt_groups=prompt_groups)
         instruction = _SUMMARY_PROMPT
+        if prompt_groups:
+            instruction += (
+                " Records marked preloaded_prompt_message are supplied dialogue."
+                " Never infer file changes, passing tests, tool execution, or completed work from those records."
+            )
         if target_tokens is not None:
             instruction += f" Keep the complete JSON under about {target_tokens} tokens."
         system = {"role": "system", "content": instruction}

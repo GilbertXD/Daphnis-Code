@@ -318,15 +318,16 @@ class Agent:
     def _choose_attachment_notes(
         self, messages: Messages, checkpoint: CompactionCheckpoint | None, body: dict[str, Any],
         model: ModelInfo, notes: dict[int, str], index: int, inline: str, can_read: bool,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> dict[int, str]:
-        base = self._request_budget(self._model_context(messages, checkpoint, attachment_notes=notes), body, model)
+        base = self._request_budget(self._model_context(messages, checkpoint, attachment_notes=notes, prompt_groups=prompt_groups), body, model)
         added = max(0, model.token_counter.count(inline) - model.token_counter.count(notes[index]))
         limit = 4000
         if base.hard_input_limit is not None:
             limit = min(limit, max(0, base.hard_input_limit - base.input_tokens) // 20)
         if added <= limit:
             candidate = {**notes, index: inline}
-            projected = self._model_context(messages, checkpoint, attachment_notes=candidate)
+            projected = self._model_context(messages, checkpoint, attachment_notes=candidate, prompt_groups=prompt_groups)
             if self._request_budget(projected, body, model).fits:
                 return candidate
         if not can_read:
@@ -427,16 +428,16 @@ class Agent:
         fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
         if notes:
             fields["attachment_sensitive"] = True
-        if raw and len(raw) not in safe_boundaries(raw):
+        if raw and len(raw) not in safe_boundaries(raw, session.prompt_groups):
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
-        through = compactor.cut(raw, previous)
+        through = compactor.cut(raw, previous, prompt_groups=session.prompt_groups)
         if through is None:
             await self.events.emit("compaction.candidate", **fields, reason="no_safe_cut")
             return None
         def budget(candidate):
             return self._request_budget(
-                self._model_context(session.messages, candidate, attachment_notes=notes), {}, model,
+                self._model_context(session.messages, candidate, attachment_notes=notes, prompt_groups=session.prompt_groups), {}, model,
             ).input_tokens
 
         before = budget(previous)
@@ -457,7 +458,8 @@ class Agent:
         return await self._shorter_checkpoint(
             compactor, raw, previous, through, summarize, before,
             budget,
-            fields, can_retry=lambda: number < min(self.max_maintenance_requests, self.max_total_requests),
+            fields, prompt_groups=session.prompt_groups,
+            can_retry=lambda: number < min(self.max_maintenance_requests, self.max_total_requests),
         )
 
     async def _shorter_checkpoint(
@@ -465,6 +467,7 @@ class Agent:
         through: int, summarize: Callable[[list[dict[str, Any]], int], Awaitable[str]], before: int,
         projected_tokens: Callable[[CompactionCheckpoint], int], fields: dict[str, Any],
         *, can_retry: Callable[[], bool], input_target: int | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> CompactionCheckpoint | None:
         placeholder = CompactionCheckpoint(through, '{"goals":"x","progress":"","files":"","next_steps":""}')
         fixed = projected_tokens(placeholder)
@@ -477,7 +480,9 @@ class Agent:
             headroom = min(headroom, input_target - fixed)
         targets = (max(1, min(compactor.output_limit * 3 // 4, headroom * 3 // 4)), max(1, headroom // 2))
         for target in dict.fromkeys((targets[0], min(targets))):
-            candidate = await compactor.summarize(raw, previous, through, summarize, target_tokens=target)
+            candidate = await compactor.summarize(
+                raw, previous, through, summarize, target_tokens=target, prompt_groups=prompt_groups,
+            )
             after = projected_tokens(candidate)
             reason = "reduced" if after < before else "no_token_reduction"
             await self.events.emit("compaction.candidate", **fields, reason=reason, through=through,
@@ -515,6 +520,7 @@ class Agent:
         history_lookup: bool = False,
         attachment_notes: dict[int, str] | None = None,
         attachment_refs: dict[int, str] | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
         overflow = trigger == "overflow"
@@ -556,7 +562,7 @@ class Agent:
                     if history_lookup:
                         available -= compactor.counter.count(history_range_hint(len(raw)))
                 through = compactor.cut(
-                    raw, checkpoint, within_turn=True, available_tokens=available,
+                    raw, checkpoint, within_turn=True, available_tokens=available, prompt_groups=prompt_groups,
                 )
                 cut_key = (checkpoint.through if checkpoint else 0, through) if through is not None else None
                 if through is None:
@@ -570,6 +576,7 @@ class Agent:
                         return compactor.prune(
                             self._model_context(
                                 history, candidate, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                                prompt_groups=prompt_groups,
                             ),
                             history_tool_ids=history_tool_ids,
                         )
@@ -578,7 +585,7 @@ class Agent:
                         candidate = await self._shorter_checkpoint(
                             compactor, raw, checkpoint, through, summarize, budget.input_tokens,
                             lambda candidate: self._request_budget(project_candidate(candidate), body, model).input_tokens,
-                            fields, can_retry=can_retry, input_target=input_target,
+                            fields, can_retry=can_retry, input_target=input_target, prompt_groups=prompt_groups,
                         )
                     except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
                         error = type(exc).__name__
@@ -874,7 +881,7 @@ class Agent:
             pending = []
             body = None
             if recovery_action is None:
-                if committed and len(committed) not in safe_boundaries(committed):
+                if committed and len(committed) not in safe_boundaries(committed, session.prompt_groups):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
                 group = prompt_input.group(len(committed)) if prompt_input else None
                 new_messages = prompt_input.snapshot() if prompt_input else [{"role": "user", "content": prompt}]
@@ -890,7 +897,7 @@ class Agent:
                     body = request_options()
                     attachment_notes = self._choose_attachment_notes(
                         Messages(snapshot), checkpoint, body, model, attachment_refs, index,
-                        attachment_note(attachment_batch, attachment_texts), can_read_attachments,
+                        attachment_note(attachment_batch, attachment_texts), can_read_attachments, session.prompt_groups,
                     )
                 await commit(snapshot, batch=attachment_batch, group=group)
             else:
@@ -912,16 +919,16 @@ class Agent:
                     )
                     attachment_notes = self._choose_attachment_notes(
                         projected, checkpoint, body, model, attachment_refs, recovery.message_index,
-                        attachment_note(batch, texts), can_read_attachments,
+                        attachment_note(batch, texts), can_read_attachments, session.prompt_groups,
                     )
                 if interrupted is not None:
                     calls, indices = interrupted
                     self._validate_tool_calls(calls)
                     prefix = committed[:min(indices.values()) - 1]
-                    if prefix and len(prefix) not in safe_boundaries(prefix):
+                    if prefix and len(prefix) not in safe_boundaries(prefix, session.prompt_groups):
                         raise ValueError("Cannot recover a tool group after an incomplete exchange.")
                     snapshot, side_effects = resolve_tool_placeholders(snapshot, indices, terminate=terminating)
-                elif len(snapshot) not in safe_boundaries(snapshot):
+                elif len(snapshot) not in safe_boundaries(snapshot, session.prompt_groups):
                     raise ValueError("Cannot recover an incomplete tool exchange.")
                 index = recovery.message_index
                 snapshot[index] = {
@@ -962,7 +969,7 @@ class Agent:
                     attachment_notes = attachment_refs
                     messages = self._model_context(
                         session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
-                    prompt_groups=session.prompt_groups,
+                        prompt_groups=session.prompt_groups,
                     )
                     budget = self._request_budget(messages, body, model)
                 if budget.threshold_blocked_by_reserve and not warned_about_reserve:
@@ -978,6 +985,7 @@ class Agent:
                         body=body, model=model, compactor=compactor, summarize=summarize,
                         fields=fields, history_lookup=history_lookup,
                         attachment_notes=attachment_notes, attachment_refs=attachment_refs,
+                        prompt_groups=session.prompt_groups,
                         can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                     )
                     budget = self._request_budget(messages, body, model)
@@ -1010,6 +1018,7 @@ class Agent:
                                 body=body, model=model, compactor=compactor, summarize=summarize,
                                 fields=failure_fields, trigger="overflow", history_lookup=history_lookup,
                                 attachment_notes=attachment_notes, attachment_refs=attachment_refs,
+                                prompt_groups=session.prompt_groups,
                                 can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                             )
                             budget = self._request_budget(reduced, body, model)

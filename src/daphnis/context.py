@@ -66,14 +66,14 @@ class Context:
     ) -> list[dict[str, Any]]:
         """Build the protocol-ready Working view from committed messages."""
         messages = working_messages.snapshot()
-        if messages and len(messages) not in safe_boundaries(messages):
+        if messages and len(messages) not in safe_boundaries(messages, prompt_groups):
             raise ValueError("Cannot request a model with an incomplete tool exchange.")
         messages = annotate_attachments(messages, attachment_notes)
         if prompt_groups:
             messages = project_terminated_turns(messages, prompt_groups)
         prompt = self.system_prompt
         if checkpoint is not None:
-            messages = project(messages, checkpoint, summary_reasoning=summary_reasoning)
+            messages = project(messages, checkpoint, summary_reasoning=summary_reasoning, prompt_groups=prompt_groups)
             prompt = f"{prompt}\n\n{SUMMARY_POLICY}" if prompt is not None else SUMMARY_POLICY
             if history_lookup:
                 prompt += "\n\n" + history_range_hint(checkpoint.through)

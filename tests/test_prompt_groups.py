@@ -103,3 +103,53 @@ class PromptGroupTurnTests(unittest.IsolatedAsyncioTestCase):
             task = replace(task, messages=Messages(prompt.snapshot()), prompt_groups=(prompt.group(0),))
             self.assertEqual(task.recovery.kind, RecoveryKind.FAILED_USER)
             self.assertEqual(task.recovery.message_index, 0)
+
+    async def test_compaction_keeps_atomic_boundaries_and_reloads_failed_group(self):
+        from daphnis import Context
+        from daphnis.compaction import CompactionCheckpoint, Compactor, safe_boundaries
+
+        completed = PromptInput("previous", "example", "previous", MESSAGES)
+        failed = PromptInput("failed", "example", "failed", (
+            ("assistant", "another example"), ("user", "next task"),
+        ))
+        old_reply = {"role": "assistant", "content": "actual reply"}
+        messages = [*completed.snapshot(), old_reply, *failed.snapshot()]
+        groups = (completed.group(0), failed.group(4))
+        summary = '{"goals":"review","progress":"","files":"","next_steps":""}'
+        compactor = Compactor(8192)
+        self.assertEqual(list(safe_boundaries(messages, groups)), [3, 4, 6])
+        self.assertEqual(compactor.cut(messages, None, prompt_groups=groups), 4)
+        with self.assertRaises(ValueError):
+            CompactionCheckpoint(2, summary).validate(messages, groups)
+
+        async def summarize(request, _):
+            self.assertIn("Never infer file changes", request[0]["content"])
+            self.assertIn('"preloaded_prompt_message":true', request[1]["content"])
+            self.assertIn("actual reply", request[1]["content"])
+            self.assertNotIn("example", request[1]["content"])
+            return summary
+
+        checkpoint = await compactor.summarize(messages, None, 4, summarize, prompt_groups=groups)
+        # A cut just before a model reply retains the entire original input, including its assistant.
+        tail = Context().build(Messages(messages), CompactionCheckpoint(3, summary), prompt_groups=groups)
+        self.assertEqual(tail[2:], messages)
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(Path(directory) / "sessions")
+            task = replace(session(), messages=Messages(messages), compaction=checkpoint, prompt_groups=groups)
+            history.save(task)
+            restored = history.load(task.id)
+            self.assertEqual(restored.recovery.message_index, 4)
+            self.assertEqual(restored.messages.snapshot(), messages)
+            requests = []
+
+            def model(request):
+                requests.append(json.loads(request.content)["messages"])
+                return httpx.Response(200, json=reply())
+
+            async with make_client(model) as client:
+                result = await make_agent(client).run(
+                    session=restored, recovery_action=RecoveryAction.RETRY, recovery_key=restored.recovery.key,
+                )
+            self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+            self.assertEqual(requests[0][2:], failed.snapshot())
+            self.assertNotIn("sample exchange", str(requests[0]))

@@ -120,7 +120,7 @@ class Session:
         if self.compaction is not None:
             if not isinstance(self.compaction, CompactionCheckpoint):
                 raise TypeError("compaction must be a CompactionCheckpoint or None.")
-            self.compaction.validate(self.messages.snapshot())
+            self.compaction.validate(self.messages.snapshot(), self.prompt_groups)
         if self.system_prompt is not None and (
             not isinstance(self.system_prompt, str) or not self.system_prompt.strip()
         ):
