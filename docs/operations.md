@@ -1,6 +1,6 @@
 # 公共 Operations 接口
 
-`Operations` 可从 `daphnis` 导入。多个实例可引用同一个 Application，共享当前会话、配置、任务和审批状态。自行构造 `Application` 时可注入模型连接、目录和 History。Web 使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装交互式运行环境，并连接 `DAPHNIS_MCP_CONFIG` 指定的 MCP 服务。
+`Operations` 可从 `daphnis` 导入。多个实例可引用同一个 Application，共享当前会话、配置、任务和审批状态。自行构造 `Application` 时可注入模型连接、目录和 History。Web 使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装交互式运行环境，并恢复已启用的 MCP 服务。
 
 ## 最小示例
 
@@ -56,7 +56,7 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 思考档位 | `thinking` 返回当前档位。`await set_thinking(mode)` 保存档位，传入 `None` 采用服务端默认。 |
 | 系统提示词 | `get_system_prompt()` 返回当前生效文本。`await set_system_prompt(prompt)` 保存会话覆盖值，支持多行。`await reset_system_prompt()` 恢复内置默认值。 |
 | 工具 | `all_tools` 是可用目录，`enabled_tools` 是已启用偏好（包括已启用的离线 MCP 工具），`effective_tools` 是两者的交集。`await set_tools(names, keep_unavailable=False)` 保存选择，可用 `keep_unavailable=True` 保留未列出的离线偏好。 |
-| MCP | `await connect_mcp(name, ...)`、`await reconnect_mcp(name)`、`await disconnect_mcp(name)`、`await refresh_mcp(name)` 管理显式配置的服务。`list_mcp_servers()`、`mcp_status()`、`list_mcp_tools()` 查询连接名、状态和在线工具。 |
+| MCP | `managed_mcp()` 查看已保存配置。空闲时可用 `await save_mcp(name, enabled=..., options=..., create=...)` 创建或编辑配置，省略 `options` 可只切换启用状态。`await restart_mcp(name)` 重连已启用的服务，`await delete_mcp(name)` 删除配置。`connect_mcp()`、`reconnect_mcp()`、`disconnect_mcp()` 和 `refresh_mcp()` 仍用于直接管理运行时连接。`mcp_status()` 和 `list_mcp_tools()` 查询实时状态和在线工具。 |
 | 执行与取消 | `await send(prompt, stream=True)` 执行一轮并返回 `TurnResult`。`running` 查询是否有活跃 Turn 或手动压缩，`await cancel()` 请求取消并等待任务停止。 |
 | 恢复 | `recovery` 返回当前待处理状态的 `kind`、原 User 的 `message_index` 和 `key`。将该键传给 `retry_failed_user(key)`、`continue_interrupted_turn(key)` 或 `terminate_interrupted_turn(key)`。 |
 | 上下文 | `await compact()` 在空闲时请求手动压缩，返回已保存的检查点或 `None`。`context_budget` 返回最近一次主请求的输入预算，`compacting` 和 `compacted_through` 表示压缩状态和已提交摘要覆盖到的消息数。 |

@@ -20,7 +20,7 @@ cp .env.example .env
 | `LLM_PROVIDER` | 启动时使用的厂商，取值为 `deepseek`、`mimo` 或 `compatible` |
 | `LLM_MODEL` | 启动时使用的模型 ID。DeepSeek 和 MiMo 使用[仓库中的模型目录](src/daphnis/models/models.py) |
 | `LLM_BASE_URL`、`LLM_API_KEY` | 启动厂商的服务地址和 API Key |
-| `DAPHNIS_MCP_CONFIG` | 可选的 MCP 服务 JSON 配置文件，见[配置示例](docs/tools.md#mcp-配置与生命周期) |
+| `DAPHNIS_MCP_CONFIG` | 可选的旧版 MCP JSON 导入文件，见[配置示例](docs/tools.md#mcp-配置与生命周期) |
 
 需要在运行中切换厂商时，分别设置 `DEEPSEEK_BASE_URL` / `DEEPSEEK_API_KEY`、`MIMO_BASE_URL` / `MIMO_API_KEY` 或 `COMPATIBLE_BASE_URL` / `COMPATIBLE_API_KEY`。同一厂商的专用地址和密钥配置优先于通用配置。各厂商使用独立的连接和密钥。`compatible` 支持填写任意兼容 Chat Completions 的模型 ID，未登记模型的工具和思考能力默认为未知。
 
@@ -45,6 +45,7 @@ uv run --locked --extra web daphnis-web --workspace .
 - 恢复会话时使用会话保存的工作目录。项目记录缺失、无效或目录不匹配时，会话显示在「无项目」。
 - 通过会话菜单的「移动」可更改归属。移到其他项目后，后续工具操作使用目标项目的工作目录。移到「无项目」会保留原工作目录。
 - 在侧栏新建、恢复、重命名或删除会话，在输入框下方选择模型、思考档位和工具，或编辑、重置会话系统提示词。
+- 点击顶部「MCP」管理服务，或用「发现」搜索官方 MCP Registry 并添加远程服务。连接成功后，可在输入框旁的「工具」面板为当前会话选择工具。
 - 点击失败消息旁的「!」可重试。发送新消息会作废旧失败消息，原文仍可查看。工具任务未完成时，输入区上方提供「继续 / 终止」。
 - 展开右侧调试面板查看事件、工具调用、上下文和请求/响应，并在运行状态中查看 Token 预算与摘要检查点。刷新页面或关闭标签页后，服务端仍继续执行。重连可读取当前状态、待审批请求和仍在缓存中的调试记录。
 - 每个 Web 进程运行一个本地 Agent，同一进程的多个标签页共享当前会话和审批模式。服务重启后使用新令牌，进程内调试记录随进程结束而清空。

@@ -32,7 +32,11 @@ Web 在输入框旁切换审批模式。启用 FULL 需要确认风险，取消�
 
 ## MCP 配置与生命周期
 
-在 `.env` 或服务端环境中设置 `DAPHNIS_MCP_CONFIG=./mcp.json`，Web 启动时会连接其中配置的服务。相对配置文件路径以启动目录为准，相对 `cwd` 以配置文件所在目录为准。`env` 将子进程变量名映射到本地环境变量名。
+在 Web 顶部打开「MCP」，可手动添加 stdio 或 Streamable HTTP 服务，并对其编辑、启用、禁用、重连或删除。服务标识用于生成稳定的工具名，创建后固定。启用状态独立于会话，具体工具仍在「工具」面板内选择。
+
+配置保存在 `~/.daphnis/mcp.json`。Web 启动时恢复已启用的连接，失败的服务保留配置和错误状态，可在面板重连。运行中的 Turn 会保留本轮工具定义快照，连接和配置变更须等任务停止后执行。
+
+首次使用时可在 `.env` 或服务端环境设置 `DAPHNIS_MCP_CONFIG=./legacy-mcp.json` 导入旧配置。只有尚未创建持久化配置时才会导入。旧文件的相对路径以启动目录为准，其中相对 `cwd` 以该文件所在目录为准。`env` 将子进程变量名映射到本地环境变量名。
 
 ```json
 {
@@ -54,16 +58,22 @@ Web 在输入框旁切换审批模式。启用 FULL 需要确认风险，取消�
 ```
 
 ```sh
-DAPHNIS_MCP_CONFIG=./mcp.json uv run --locked --extra web daphnis-web
+DAPHNIS_MCP_CONFIG=./legacy-mcp.json uv run --locked --extra web daphnis-web
 ```
 
-stdio 程序以当前用户权限启动，应使用可信程序。Streamable HTTP 使用最终端点，远程地址要求 HTTPS，回环地址允许 HTTP。认证可省略，启用时由指定环境变量提供 Bearer Token。MCP Server 决定其内部如何读写文件、使用凭据或访问网络，Daphnis 的审批只控制是否发起工具调用。
+stdio 程序以当前用户权限启动，应使用可信程序。手动添加的 Streamable HTTP 服务使用最终端点，远程地址要求 HTTPS，回环地址允许 HTTP。认证可省略，启用时由指定环境变量提供 Bearer Token。凭据请放在服务端环境中，避免写入启动参数或 URL。MCP Server 决定其内部如何读写文件、使用凭据或访问网络，Daphnis 的审批只控制是否发起工具调用。
 
-配置读取或连接失败时，Web 会中止启动并在服务端日志报错。若部分服务已连接，运行时会关闭这些连接。变更配置后重启 Web 以重新加载。支持工具变更通知的服务可自动刷新，运行中的 Turn 保留开始时的工具定义快照，相关的自动授权仍可被撤销。代码可通过 [Operations](operations.md#接口速查) 查询和管理连接。
+支持工具变更通知的服务可自动刷新目录，相关的自动授权仍可被撤销。代码可通过 [Operations](operations.md#接口速查) 查询和管理连接。
 
 对支持工具的模型，首次显式连接新服务时会默认启用发现的工具。从历史恢复的会话和此后新建的会话优先使用保存的选择。恢复会话只恢复启用偏好，MCP 连接需显式配置。掉线和目录变化会保留启用偏好，只有在线且已启用的工具会提供给下一轮。可以在 Web 的「工具」面板启用新发现的工具。
 
 MCP 工具的文本和结构化结果共用 64 KiB 的 UTF-8 JSON 预算，预算在 SDK 解码后生效。超限时会标记省略的字段。
+
+### 在线发现
+
+在「MCP → 发现」输入至少 3 个字符，搜索[官方 MCP Registry](https://registry.modelcontextprotocol.io)。结果显示各服务的最新版本。选择一项可查看来源、连接地址和本地软件包信息。选择支持的远程地址，按需填写 Bearer Token 的环境变量名，再确认添加。
+
+在线发现可添加使用默认 HTTPS 端口的公网 Streamable HTTP 服务，连接会校验 DNS 解析结果并阻止重定向。支持无认证或 Bearer Token。OAuth、自定义认证头、地址模板和 SSE 服务不能通过发现添加。npm、PyPI 等软件包只展示安装信息，需自行安装后再配置 stdio。Registry 查询失败时，已配置的 MCP 服务仍可使用。
 
 ## Web 边界
 
