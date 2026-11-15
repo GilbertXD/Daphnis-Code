@@ -157,25 +157,88 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
   notice: string
 }) {
   const [selected, setSelected] = useState(() => new Set(view.state.enabled_tools))
-  const tools = [...new Set([...view.state.all_tools, ...view.state.enabled_tools])]
+  const available = new Set(view.state.all_tools)
+  const tools = [...new Set([...available, ...view.state.enabled_tools])]
+  const builtIn: string[] = []
+  const otherMcp: string[] = []
+  const offlineMcp: string[] = []
+  const groups = view.state.mcp_servers.map(({ name }) => ({
+    name, prefix: `mcp__${name}__`, tools: [] as string[],
+  }))
+  for (const tool of tools) {
+    if (!tool.startsWith('mcp__')) {
+      builtIn.push(tool)
+      continue
+    }
+    const group = groups.find(({ prefix }) => tool.startsWith(prefix))
+    if (group) group.tools.push(tool)
+    else if (available.has(tool)) otherMcp.push(tool)
+    else offlineMcp.push(tool)
+  }
+
+  function changeSelection(names: Iterable<string>, checked: boolean) {
+    setSelected((current) => {
+      const next = new Set(current)
+      for (const name of names) {
+        if (checked) next.add(name)
+        else next.delete(name)
+      }
+      return next
+    })
+  }
+
+  function toolRows(names: string[], prefix = '') {
+    return names.map((name) => <label key={name}>
+      <input type="checkbox" checked={selected.has(name)} disabled={disabled}
+        onChange={(event) => changeSelection([name], event.currentTarget.checked)} />
+      <span className="mono">{name.slice(prefix.length)}</span>
+      {!available.has(name) && <small className="muted">当前不可用</small>}
+    </label>)
+  }
+
   return <Dialog title="工具配置" close={close}>
-    <p className="muted">启用的工具仍按 Daphnis 的权限规则执行。</p>
-    <div className="tool-options">{tools.map((name) =>
-      <label key={name}><input type="checkbox" checked={selected.has(name)} onChange={(event) => {
-        const checked = event.currentTarget.checked
-        setSelected((current) => {
-          const next = new Set(current)
-          if (checked) next.add(name)
-          else next.delete(name)
-          return next
-        })
-      }} />
-        <span className="mono">{name}</span>
-        {!view.state.all_tools.includes(name) && <small className="muted">当前不可用</small>}
-      </label>)}</div>
+    <p className="muted">选择仅应用于当前会话，工具调用仍遵循审批规则。</p>
+    <div className="tool-options">
+      <section>
+        <h3>内置工具</h3>
+        {builtIn.length ? toolRows(builtIn) : <p className="muted">暂无内置工具。</p>}
+      </section>
+      {!!(groups.length || otherMcp.length || offlineMcp.length) && <section>
+        <h3>MCP 工具</h3>
+        {groups.map((group) => {
+          const online = group.tools.filter((name) => available.has(name))
+          const checked = online.filter((name) => selected.has(name)).length
+          const allChecked = online.length > 0 && checked === online.length
+          const action = allChecked ? '全部停用' : '全部启用'
+          return <div className="tool-group" key={group.name}>
+            <details>
+              <summary aria-label={`${group.name}，已选 ${checked} 个可用工具，共 ${online.length} 个`}>
+                {group.name} <small className="muted">{checked} / {online.length}</small>
+              </summary>
+              <div className="tool-group-rows">
+                {group.tools.length ? toolRows(group.tools, group.prefix) : <p className="muted">暂无工具。</p>}
+              </div>
+            </details>
+            <button className="tool-group-action" type="button" aria-label={`${group.name} ${action}`}
+              disabled={disabled || online.length === 0} onClick={() => changeSelection(online, !allChecked)}>
+              {action}
+            </button>
+          </div>
+        })}
+        {!!otherMcp.length && <details className="tool-group">
+          <summary>其他 MCP 工具</summary>
+          <div className="tool-group-rows">{toolRows(otherMcp)}</div>
+        </details>}
+        {!!offlineMcp.length && <details className="tool-group">
+          <summary>其他不可用 MCP 工具</summary>
+          <div className="tool-group-rows">{toolRows(offlineMcp)}</div>
+        </details>}
+      </section>}
+    </div>
     {notice && <p role="status">{notice}</p>}
     <div className="actions">
-      <button type="button" onClick={() => setSelected(new Set())}>停用全部</button>
+      <button type="button" disabled={disabled || !tools.some((name) => available.has(name) && selected.has(name))}
+        onClick={() => changeSelection(available, false)}>停用全部可用工具</button>
       <button className="primary" disabled={disabled} onClick={async () => {
         if (await apply(tools.filter((name) => selected.has(name)))) close()
       }}>应用</button>
@@ -453,7 +516,8 @@ function Workspace({ view, connected, command }: {
       ? <Debug key={id} view={view} tools={tools} tab={tab} select={setTab} close={() => setOpen(false)} />
       : <button className="debug-rail" type="button" aria-label="展开调试面板" title="展开调试面板"
         onClick={() => setOpen(true)}><span aria-hidden="true">‹</span></button>}
-    {modal?.action === 'tools' && <ToolsDialog view={view} close={() => setModal(null)} disabled={disabled}
+    {modal?.action === 'tools' && <ToolsDialog key={id} view={view} close={() => setModal(null)}
+      disabled={disabled || state.model.supports_tools !== true}
       notice={notice} apply={(names) => perform('tools', { names })} />}
     {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)} className="mcp-dialog">
       <MCPManager servers={state.mcp_servers} disabled={disabled} error={state.mcp_error}
