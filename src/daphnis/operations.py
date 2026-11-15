@@ -22,6 +22,7 @@ from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
 from .mcp_store import MCPServerConfig
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .project import Project
+from .prompt_groups import PromptGroup, PromptInput, input_matches
 from .session import Session
 from .tools import ApprovalDecision, ApprovalMode
 from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
@@ -604,6 +605,21 @@ class Operations:
         attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
     ) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream, attachments=attachments, submission_id=submission_id)
+
+    @property
+    def prompt_groups(self) -> tuple[PromptGroup, ...]:
+        return self._app._session.prompt_groups
+
+    def prompt_submitted(self, group_id: str, messages: tuple[tuple[str, str], ...]) -> bool:
+        group = next((group for group in self.prompt_groups if group.id == group_id), None)
+        if group is None:
+            return False
+        if not input_matches(group, self.message_snapshot(), messages):
+            raise ValueError("该 MCP Prompt 运行标识已用于不同内容。")
+        return True
+
+    async def run_mcp_prompt(self, prompt_input: PromptInput, *, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(stream=stream, prompt_input=prompt_input)
 
     @property
     def recovery(self) -> RecoveryState | None:

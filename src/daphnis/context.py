@@ -7,6 +7,7 @@ from saturnus import Messages
 
 from .attachments import AttachmentBatch
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boundaries
+from .prompt_groups import PromptGroup
 from .turn_state import (
     ABANDONED,
     TURN_STATE,
@@ -61,12 +62,15 @@ class Context:
         self, working_messages: Messages, checkpoint: CompactionCheckpoint | None = None,
         *, summary_reasoning: bool = False, history_lookup: bool = False,
         attachment_notes: dict[int, str] | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> list[dict[str, Any]]:
         """Build the protocol-ready Working view from committed messages."""
         messages = working_messages.snapshot()
         if messages and len(messages) not in safe_boundaries(messages):
             raise ValueError("Cannot request a model with an incomplete tool exchange.")
         messages = annotate_attachments(messages, attachment_notes)
+        if prompt_groups:
+            messages = project_terminated_turns(messages, prompt_groups)
         prompt = self.system_prompt
         if checkpoint is not None:
             messages = project(messages, checkpoint, summary_reasoning=summary_reasoning)
@@ -75,4 +79,4 @@ class Context:
                 prompt += "\n\n" + history_range_hint(checkpoint.through)
         if prompt is not None:
             messages.insert(0, {"role": "system", "content": prompt})
-        return project_turn_messages(project_terminated_turns(messages))
+        return project_turn_messages(messages if prompt_groups else project_terminated_turns(messages))

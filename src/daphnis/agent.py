@@ -50,6 +50,7 @@ from .models import (
     resolve_model,
 )
 from .models.models import validate_catalog
+from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
 from .token_budget import TokenBudget, request_budget
 from .tool_state import (
@@ -300,12 +301,13 @@ class Agent:
     def _model_context(
         self, history: Messages, checkpoint: CompactionCheckpoint | None,
         *, history_lookup: bool = False, attachment_notes: dict[int, str] | None = None,
+        prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> list[dict[str, Any]]:
         if checkpoint is None:
-            return self.context.build(history, attachment_notes=attachment_notes)
+            return self.context.build(history, attachment_notes=attachment_notes, prompt_groups=prompt_groups)
         return self.context.build(
             history, checkpoint, summary_reasoning=self._provider == "deepseek",
-            history_lookup=history_lookup, attachment_notes=attachment_notes,
+            history_lookup=history_lookup, attachment_notes=attachment_notes, prompt_groups=prompt_groups,
         )
 
     def _summary_response_format(self) -> dict[str, str] | None:
@@ -614,6 +616,7 @@ class Agent:
         *,
         session: Session,
         prompt: str | None = None,
+        prompt_input: PromptInput | None = None,
         recovery_action: RecoveryAction | None = None,
         recovery_key: str | None = None,
         stream: bool = False,
@@ -657,16 +660,27 @@ class Agent:
                     "Session provider does not match the ChatClient connection."
                 )
             model = resolve_model(provider, model_id, catalog=self._catalog)
-            recovery = recovery_state(committed, session_id)
+            recovery = recovery_state(committed, session_id, session.prompt_groups)
             if recovery_action is None:
-                if not isinstance(prompt, str):
-                    raise TypeError("prompt must be a string.")
+                if prompt_input is None:
+                    if not isinstance(prompt, str):
+                        raise TypeError("prompt must be a string.")
+                else:
+                    if not isinstance(prompt_input, PromptInput) or prompt is not None or attachment_batch is not None:
+                        raise ValueError("MCP Prompt 必须作为独立任务运行。")
+                    if any(group.id == prompt_input.id for group in session.prompt_groups):
+                        raise ValueError("该 MCP Prompt 已提交。")
+                    if prompt_input.messages[-1][0] != "user":
+                        raise ValueError("当前模型接口需要以 User 消息结束。请补充一条 User 消息。")
                 if recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                     raise ValueError("上轮任务未完成，请先选择继续或终止。")
             else:
                 kind = RecoveryKind.FAILED_USER if recovery_action is RecoveryAction.RETRY else RecoveryKind.INTERRUPTED_TURN
-                if prompt is not None or recovery is None or recovery.kind is not kind or recovery.key != recovery_key:
+                if (prompt is not None or prompt_input is not None or recovery is None
+                    or recovery.kind is not kind or recovery.key != recovery_key):
                     raise ValueError("恢复状态已变化，请刷新后再操作。")
+                if kind is RecoveryKind.FAILED_USER and committed[-1]["role"] != "user":
+                    raise ValueError("当前模型接口无法续写 Assistant 结尾的消息组。请发送新消息。")
             interrupted = interrupted_tool_group(committed)
             tools = None if recovery_action is RecoveryAction.TERMINATE else self.tools
             if isinstance(tools, ToolExecutor):
@@ -705,13 +719,17 @@ class Agent:
 
             async def commit(
                 snapshot: list[dict[str, Any]], *, tool_finished: dict[str, Any] | None = None,
-                batch: AttachmentBatch | None = None,
+                batch: AttachmentBatch | None = None, group: PromptGroup | None = None,
             ) -> None:
                 check_session()
                 refs = session.attachment_refs
                 if batch is not None:
                     refs = {**refs, len(snapshot) - 1: batch}
-                candidate = replace(session, messages=Messages(snapshot), compaction=checkpoint, attachment_refs=refs)
+                groups = session.prompt_groups if group is None else (*session.prompt_groups, group)
+                candidate = replace(
+                    session, messages=Messages(snapshot), compaction=checkpoint,
+                    attachment_refs=refs, prompt_groups=groups,
+                )
 
                 async def save_and_publish() -> None:
                     nonlocal committed, committed_checkpoint
@@ -723,9 +741,12 @@ class Agent:
                     session.usage = candidate.usage
                     session._saved_revision = candidate._saved_revision
                     session.attachment_refs = candidate.attachment_refs
+                    session.prompt_groups = candidate.prompt_groups
                     committed = snapshot
                     if batch is not None:
                         await self.events.emit("attachments.committed", **fields, submission_id=batch.submission_id)
+                    if group is not None:
+                        await self.events.emit("prompt.committed", **fields, group_id=group.id)
                     if committed_checkpoint != checkpoint:
                         committed_checkpoint = checkpoint
                         await self.events.emit("compaction.committed", **fields, through=checkpoint.through)
@@ -855,10 +876,14 @@ class Agent:
             if recovery_action is None:
                 if committed and len(committed) not in safe_boundaries(committed):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
-                snapshot = [*committed, {"role": "user", "content": prompt}]
+                group = prompt_input.group(len(committed)) if prompt_input else None
+                new_messages = prompt_input.snapshot() if prompt_input else [{"role": "user", "content": prompt}]
+                snapshot = [*committed, *new_messages]
                 if recovery is not None:
-                    index = recovery.message_index
-                    snapshot[index] = {**committed[index], TURN_STATE: ABANDONED}
+                    start = recovery.message_index
+                    end = next((group.end for group in session.prompt_groups if group.start == start), start + 1)
+                    for index in range(start, end):
+                        snapshot[index] = {**committed[index], TURN_STATE: ABANDONED}
                 if attachment_batch:
                     index = len(snapshot) - 1
                     attachment_refs[index] = attachment_note(attachment_batch)
@@ -867,7 +892,7 @@ class Agent:
                         Messages(snapshot), checkpoint, body, model, attachment_refs, index,
                         attachment_note(attachment_batch, attachment_texts), can_read_attachments,
                     )
-                await commit(snapshot, batch=attachment_batch)
+                await commit(snapshot, batch=attachment_batch, group=group)
             else:
                 snapshot = committed.copy()
                 terminating = recovery_action is RecoveryAction.TERMINATE
@@ -930,12 +955,14 @@ class Agent:
                 maintenance_limited = False
                 messages = self._model_context(
                     session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                    prompt_groups=session.prompt_groups,
                 )
                 budget = self._request_budget(messages, body, model)
                 if not budget.fits and can_read_attachments and attachment_notes is not attachment_refs:
                     attachment_notes = attachment_refs
                     messages = self._model_context(
                         session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                    prompt_groups=session.prompt_groups,
                     )
                     budget = self._request_budget(messages, body, model)
                 if budget.threshold_blocked_by_reserve and not warned_about_reserve:
@@ -1044,7 +1071,7 @@ class Agent:
                     limit_reason = f"达到模型总请求上限（{requests}/{self.max_total_requests}）"
                 else:
                     limit_reason = "可用于上下文压缩的请求额度不足"
-                pending_recovery = recovery_state(committed, session_id)
+                pending_recovery = recovery_state(committed, session_id, session.prompt_groups)
                 action_hint = (
                     "可重试原消息或发送新消息。"
                     if pending_recovery and pending_recovery.kind is RecoveryKind.FAILED_USER

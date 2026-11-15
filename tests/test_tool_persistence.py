@@ -10,6 +10,7 @@ import httpx
 from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
+from daphnis.prompt_groups import PromptInput
 from daphnis.tool_state import PENDING, RUNNING, TOOL_STATE
 from daphnis.turn_state import project_turn_messages
 
@@ -83,10 +84,14 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 ops = self.application(interactive=terminate, max_primary_requests=1)
                 if terminate:
                     self.approve_writes(ops)
-                paused = await asyncio.wait_for(ops.send("write files", stream=False), 3)
+                prompt = PromptInput("writes", "test", "writes", (
+                    ("assistant", "Sample response"), ("user", "Write files"),
+                ))
+                paused = await asyncio.wait_for(ops.run_mcp_prompt(prompt, stream=False), 3)
                 self.assertEqual(paused.status, TurnStatus.PAUSED_LIMIT)
                 original = tool_results(self.saved(ops))
                 resumed = self.application(restore=ops.session.id)
+                self.assertEqual(resumed.recovery.message_index, 0)
                 key = resumed.recovery.key
                 if terminate:
                     result = await resumed.terminate_interrupted_turn(key)

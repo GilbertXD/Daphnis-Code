@@ -43,7 +43,7 @@ class Session:
 
     @property
     def recovery(self) -> RecoveryState | None:
-        return recovery_state(self.messages.snapshot(), self.id)
+        return recovery_state(self.messages.snapshot(), self.id, self.prompt_groups)
 
     @property
     def effective_system_prompt(self) -> str:

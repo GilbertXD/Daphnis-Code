@@ -6,6 +6,7 @@ from enum import StrEnum
 from itertools import pairwise
 from typing import Any
 
+from .prompt_groups import PromptGroup
 from .tool_state import TERMINATED_SKIP_MESSAGE, TOOL_STATE
 
 TURN_STATE = "daphnis_turn_state"
@@ -36,18 +37,30 @@ class RecoveryState:
     key: str
 
 
-def recovery_state(messages: list[dict[str, Any]], session_id: str) -> RecoveryState | None:
-    if not messages or messages[-1]["role"] not in ("user", "tool"):
+def recovery_state(
+    messages: list[dict[str, Any]], session_id: str, prompt_groups: tuple[PromptGroup, ...] = (),
+) -> RecoveryState | None:
+    if not messages:
         return None
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if message["role"] != "user":
-            continue
-        if message.get(TURN_STATE) in (ABANDONED, TERMINATED):
+    group = prompt_groups[-1] if prompt_groups else None
+    if group and group.end == len(messages):
+        index = group.start
+        kind = RecoveryKind.FAILED_USER
+    elif messages[-1]["role"] in ("user", "tool"):
+        index = next(
+            (i for i in range(len(messages) - 1, (group.end if group else 0) - 1, -1)
+             if messages[i]["role"] == "user"),
+            group.start if group else None,
+        )
+        if index is None:
             return None
         kind = RecoveryKind.FAILED_USER if index == len(messages) - 1 else RecoveryKind.INTERRUPTED_TURN
-        return RecoveryState(kind, index, f"{session_id}:{index}:{message.get(TURN_ATTEMPT, '')}")
-    return None
+    else:
+        return None
+    message = messages[index]
+    if message.get(TURN_STATE) in (ABANDONED, TERMINATED):
+        return None
+    return RecoveryState(kind, index, f"{session_id}:{index}:{message.get(TURN_ATTEMPT, '')}")
 
 
 def _result_object(content: Any) -> dict[str, Any] | None:
@@ -87,11 +100,16 @@ def _with_termination(content: str | list, value: dict[str, Any] | None) -> str 
     return content if content.endswith(suffix) else content + suffix
 
 
-def project_terminated_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def project_terminated_turns(
+    messages: list[dict[str, Any]], prompt_groups: tuple[PromptGroup, ...] = (),
+) -> list[dict[str, Any]]:
     """Annotate the last result of each visible, completed group at termination."""
     projected = messages.copy()
-    users = [index for index, message in enumerate(messages) if message["role"] == "user"]
-    for start, end in pairwise([*users, len(messages)]):
+    grouped = {index for group in prompt_groups for index in range(group.start, group.end)}
+    starts = sorted([*(group.start for group in prompt_groups), *(
+        index for index, message in enumerate(messages) if index not in grouped and message["role"] == "user"
+    )])
+    for start, end in pairwise([*starts, len(messages)]):
         if messages[start].get(TURN_STATE) != TERMINATED:
             continue
         assistant = end - 1

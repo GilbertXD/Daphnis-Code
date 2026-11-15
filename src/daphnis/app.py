@@ -39,6 +39,7 @@ from .models import (
     resolve_model,
 )
 from .models.models import validate_catalog
+from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
 from .terminal_text import sanitize_terminal
@@ -418,6 +419,7 @@ class Application:
     async def _run_turn(
         self, prompt: str | None = None, *, stream: bool = True,
         recovery_action: RecoveryAction | None = None, recovery_key: str | None = None,
+        prompt_input: PromptInput | None = None,
         attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
         self._ensure_idle()
@@ -455,6 +457,8 @@ class Application:
 
         async def run():
             async with self._history.lease(session) as lease:
+                if prompt_input and any(group.id == prompt_input.id for group in session.prompt_groups):
+                    raise ValueError("该 MCP Prompt 已提交。")
                 if submission_id is not None and any(
                     existing.submission_id == submission_id for existing in session.attachment_refs.values()
                 ):
@@ -498,6 +502,7 @@ class Application:
                     result = await agent.run(
                         session=session,
                         prompt=prompt,
+                        prompt_input=prompt_input,
                         recovery_action=recovery_action,
                         recovery_key=recovery_key,
                         stream=stream,
