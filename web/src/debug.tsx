@@ -15,7 +15,7 @@ const names: Record<string, string> = {
   'turn.started': '新一轮对话开始',
   'turn.finished': 'Agent 结束本轮',
   'model.started': '开始模型请求',
-  'model.request': '取得实际请求 JSON',
+  'model.request': '捕获模型请求',
   'model.delta': '收到流式分片（合并展示）',
   'model.usage': '模型报告 Token 用量',
   'model.finished': '收到完整模型响应',
@@ -107,10 +107,11 @@ const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
       <summary>请求 {first.data.request_number} <span className="muted">
         {clock(first.time)}{first.data.purpose === 'compaction' ? ' · 历史摘要' : first.data.purpose === 'title' ? ' · 会话标题' : ''}{request?.data.http_status ? ` · HTTP ${request.data.http_status}` : ''}
       </span></summary>
-      <h4>请求 JSON</h4>
+      <h4>{request?.data.body && request.data.omitted ? '请求安全预览' : '请求 JSON'}</h4>
+      {request?.data.omitted && <p className="muted">{request.data.omitted}</p>}
       {request?.data.body
         ? <DataBlock value={request.data.body} />
-        : <p className="muted">{request?.data.omitted ?? '暂无可用的 HTTP 请求正文。'}</p>}
+        : !request?.data.omitted && <p className="muted">暂无可用的 HTTP 请求正文。</p>}
       <h4>响应 JSON</h4>
       {response?.data.response || response?.data.body
         ? <DataBlock value={response.data.response ?? response.data.body} />
@@ -126,7 +127,7 @@ export function Debug({ view, tools, tab, select, close }: {
   select: (tab: Tab) => void
   close: () => void
 }) {
-  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && !event.data.purpose && event.data.body?.messages)
+  const lastRequest = view.events.findLast((event) => event.name === 'model.request' && !event.data.purpose)
   return <aside className="debug" aria-label="调试详情">
     <div className="debug-heading">
       <button className="icon" aria-label="关闭调试面板" onClick={close}>›</button>
@@ -148,9 +149,12 @@ export function Debug({ view, tools, tab, select, close }: {
         } : undefined} />) : <p className="muted">此会话暂无已捕获的工具调用。</p>)}
       {tab === 'context' && <>
         <details className="context-group" open><summary>最近模型请求的上下文</summary>
-          {lastRequest
-            ? <DataBlock value={lastRequest.data.body?.messages} />
-            : <p className="muted">暂无已捕获的请求上下文。</p>}
+          {lastRequest ? <>
+            {lastRequest.data.omitted && <p className="muted">{lastRequest.data.omitted}</p>}
+            {lastRequest.data.body?.messages
+              ? <DataBlock value={lastRequest.data.omitted ? lastRequest.data.body : lastRequest.data.body.messages} />
+              : !lastRequest.data.omitted && <p className="muted">已捕获请求，暂无可展示的消息。</p>}
+          </> : <p className="muted">暂无已捕获的请求上下文。</p>}
         </details>
         <details className="context-group" open={!lastRequest}><summary>当前已提交消息</summary>
           <DataBlock value={view.state.messages} />

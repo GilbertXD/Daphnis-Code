@@ -15,6 +15,7 @@ from daphnis import History, Operations, Session
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.history import SessionLease
+from daphnis.model_io import preview_request
 from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
@@ -93,10 +94,21 @@ class WebTests(unittest.TestCase):
                 ))
             if last.get("content") == "resource-retry" and not self.resource_failed:
                 self.resource_failed = True
-                return httpx.Response(400, json={"error": {"message": "Fixture first resource turn fails."}})
+                return httpx.Response(400, json={"error": {"message": "Fixture first resource turn fails.", "echo": body}})
             if last.get("content") == "force-error":
                 return httpx.Response(429, json={"error": {"api_key": API_KEY, "message": "Rate limit"}})
-            if last.get("content") == "test mcp":
+            if last.get("content") == "read saved attachment":
+                attachment = next(
+                    json.loads(line)
+                    for message in body["messages"] if message["role"] == "user"
+                    for line in message["content"].splitlines() if line.startswith('{"name": "notes.txt"')
+                )
+                payload = chunk({"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": "attachment-call", "type": "function", "function": {
+                        "name": "read_attachment", "arguments": json.dumps({"id": attachment["id"]}),
+                    },
+                }]}, "tool_calls")
+            elif last.get("content") == "test mcp":
                 payload = chunk({"role": "assistant", "tool_calls": [{
                     "index": 0, "id": "mcp-call", "type": "function", "function": {
                         "name": "mcp__demo__add", "arguments": '{"a":2,"b":3}',
@@ -159,6 +171,35 @@ class WebTests(unittest.TestCase):
                 return frame
             time.sleep(0.01)
         self.fail("Expected Web state did not appear")
+
+    def test_sensitive_request_preview_has_a_bounded_structural_allowlist(self):
+        private = {"content": "secret", "tool_calls": [{"arguments": "secret"}], "name": "secret"}
+        body = {
+            "model": "example", "tools": [private], "user": "secret",
+            "messages": [{"role": "user", **private}] * 5000 + [{"role": "secret", **private}],
+        }
+        self.assertEqual(preview_request(body, attachment_sensitive=False), body)
+        preview = preview_request(body, attachment_sensitive=True)
+        self.assertEqual(preview["model"], "example")
+        self.assertEqual(preview["message_count"], 5001)
+        self.assertEqual(preview["messages"][-1], {"role": "unknown", "content": "[内容已隐藏]"})
+        self.assertLess(len(preview["messages"]), 5001)
+        self.assertLess(len(json.dumps(preview, ensure_ascii=False).encode()), 128 * 1024)
+        self.assertNotIn("secret", json.dumps(preview))
+        self.assertEqual(body["messages"][-1]["content"], "secret")
+
+    def assert_safe_context(self, frame, real_request):
+        event = next(event for event in reversed(frame["events"])
+                     if event["name"] == "model.request" and not event["data"].get("purpose"))
+        data = event["data"]
+        body = data["body"]
+        self.assertEqual(data["omitted"], "部分内容因附件安全策略而隐藏。")
+        self.assertEqual(body["model"], real_request["model"])
+        self.assertEqual(body["message_count"], len(real_request["messages"]))
+        self.assertEqual(body["messages"], [
+            {"role": message["role"], "content": "[内容已隐藏]"} for message in real_request["messages"]
+        ])
+        return data
 
     def test_context_status_and_diagnostics_preserve_the_full_transcript(self):
         initial = self.snapshot()
@@ -630,6 +671,9 @@ class WebTests(unittest.TestCase):
         self.command("mcp_run_prompt", sid, 400, **{**fields, "texts": ["Review", "forged", "resource-retry"]})
         self.command("mcp_run_prompt", sid, 202, **fields)
         failed = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(self.assert_safe_context(failed, self.requests[0])["http_status"], 400)
+        self.assertFalse(any(event["name"] == "model.response_error" for event in failed["events"]))
+        self.assertNotIn("original material", json.dumps(failed["events"]))
         saved = self.history.load(sid)
         item, = saved.attachment_refs[1].files
         self.assertEqual((item.source, item.server, item.uri), ("embedded", "demo", "notes://embedded-source"))
@@ -695,7 +739,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual((item.source, item.uri), ("standalone", preview["uri"]))
         self.assertEqual(self.history.attachments.read(sid, item), "standalone material")
         self.assertEqual(self.history.attachments.read(sid, uploaded), "uploaded material")
-        self.wait_for(lambda frame: not frame["status"]["running"])
+        frame = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assert_safe_context(frame, self.requests[-1])
+        self.assertNotIn("standalone material", json.dumps(frame["events"]))
         content = self.requests[-1]["messages"][-1]["content"]
         self.assertIn("standalone material", content)
         self.assertNotIn(item.uri, content)
@@ -748,6 +794,13 @@ class WebTests(unittest.TestCase):
         self.wait_for(lambda item: item["run"] is None)
         self.assertEqual(len(self.history.load(sid).attachment_refs[2].files), 2)
         self.assertNotIn("A" * 1024, json.dumps(self.requests[-1]))
+
+        self.command("send", sid, 202, prompt="read saved attachment")
+        frame = self.wait_for(lambda item: item["run"] is None)
+        self.assertEqual(self.requests[-1]["messages"][-1]["role"], "tool")
+        self.assertIn(marker, self.requests[-1]["messages"][-1]["content"])
+        self.assert_safe_context(frame, self.requests[-1])
+        self.assertNotIn(marker, json.dumps(frame["events"]))
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)

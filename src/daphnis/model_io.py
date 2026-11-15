@@ -10,6 +10,31 @@ from saturnus import APIError, ChatClient, ResponseError
 
 logger = logging.getLogger(__name__)
 
+_PREVIEW_MESSAGE_LIMIT = 1024
+_PREVIEW_ROLES = ("system", "developer", "user", "assistant", "tool", "function")
+_HIDDEN_CONTENT = "[内容已隐藏]"
+_ATTACHMENT_PREVIEW_NOTICE = "部分内容因附件安全策略而隐藏。"
+
+
+def preview_request(body: dict, *, attachment_sensitive: bool) -> dict:
+    if not attachment_sensitive:
+        return body
+    preview: dict[str, Any] = {}
+    model = body.get("model")
+    if isinstance(model, str) and len(model) <= 256:
+        preview["model"] = model
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        preview["message_count"] = len(messages)
+        preview["messages"] = []
+        for message in messages[-_PREVIEW_MESSAGE_LIMIT:]:
+            role = message.get("role") if isinstance(message, dict) else None
+            preview["messages"].append({
+                "role": role if role in _PREVIEW_ROLES else "unknown",
+                "content": _HIDDEN_CONTENT,
+            })
+    return preview
+
 
 _CONTEXT_CODES = {
     "context_length_exceeded", "context_window_exceeded", "context_size_exceeded",
@@ -79,20 +104,20 @@ class ObservedChatClient(ChatClient):
         }
         if "purpose" in event.data:
             fields["purpose"] = event.data["purpose"]
-        if event.data.get("attachment_sensitive"):
-            await self._events.emit(
-                "model.request", **fields, http_status=response.status_code,
-                omitted="此会话包含附件，模型请求与错误正文已隐藏。",
-            )
-            return
+        sensitive = bool(event.data.get("attachment_sensitive"))
         try:
+            body = json.loads(response.request.content)
+            if sensitive and not isinstance(body, dict):
+                return
+            if sensitive:
+                fields["omitted"] = _ATTACHMENT_PREVIEW_NOTICE
             await self._events.emit(
                 "model.request",
                 **fields,
                 http_status=response.status_code,
-                body=json.loads(response.request.content),
+                body=preview_request(body, attachment_sensitive=sensitive),
             )
-            if failed:
+            if failed and not sensitive:
                 try:
                     body = response.json()
                 except (ValueError, RuntimeError):

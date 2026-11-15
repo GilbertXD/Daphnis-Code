@@ -100,7 +100,7 @@ class Bridge:
         self.cursor += 1
         data = self.redactor.json(data)
         if len(json.dumps(data, ensure_ascii=False).encode()) > _MAX_EVENT_BYTES:
-            fields = ("name", "tool_call_id", "request_number", "status", "http_status")
+            fields = ("name", "tool_call_id", "request_number", "purpose", "status", "http_status")
             data = {key: data[key] for key in fields if key in data}
             data["omitted"] = "此事件的详细内容超过 1 MiB。"
         journal.add({
