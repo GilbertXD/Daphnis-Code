@@ -3,8 +3,9 @@ import type { ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { AttachmentLabels } from './attachments'
+import type { AttachmentHistory } from './attachments'
 import { readableJson } from './protocol'
-import type { AgentEvent, AttachmentInfo, LoadAttachmentImage, Message, View } from './protocol'
+import type { AgentEvent, AttachmentInfo, LoadAttachment, Message, View } from './protocol'
 
 export function Copy({ text }: { text: string }) {
   const [label, setLabel] = useState('复制')
@@ -140,7 +141,7 @@ type Retry = { index: number; disabled: boolean; run: () => void }
 
 function UserMessage({ text, state, retry, attachments = [], history }: {
   text: string; state?: Message['daphnis_turn_state']; retry?: Retry; attachments?: AttachmentInfo[]
-  history?: { sessionId: string; messageIndex: number; loadImage: LoadAttachmentImage }
+  history?: AttachmentHistory
 }) {
   return <article className={`user-message${state === 'ABANDONED' ? ' abandoned' : ''}`}>
     {retry && <button type="button" className="retry-mark" disabled={retry.disabled}
@@ -167,7 +168,7 @@ function savedResult(message: Message): { status: string; error?: unknown } {
 }
 
 const Committed = memo(function Committed({
-  messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups, sessionId, loadImage,
+  messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups, sessionId, loadImage, loadDocument,
 }: {
   messages: Message[]
   tools: TraceTool[]
@@ -177,7 +178,8 @@ const Committed = memo(function Committed({
   attachmentRefs: View['state']['attachment_refs']
   promptGroups: View['state']['prompt_groups']
   sessionId: string
-  loadImage: LoadAttachmentImage
+  loadImage: LoadAttachment
+  loadDocument: LoadAttachment
 }) {
   let calls: Message['tool_calls'] = null
   let request = 0
@@ -218,7 +220,7 @@ const Committed = memo(function Committed({
       calls = null
       return <UserMessage key={index} text={messageText(message)}
         attachments={attachmentRefs?.[index]}
-        history={{ sessionId, messageIndex: index, loadImage }}
+        history={{ sessionId, messageIndex: index, loadImage, loadDocument }}
         state={message.daphnis_turn_state} retry={retry?.index === index ? retry : undefined} />
     }
     if (message.role === 'assistant') {
@@ -246,8 +248,8 @@ const Committed = memo(function Committed({
   })
 })
 
-export function Transcript({ view, tools, retry, loadImage }: {
-  view: View; tools: TraceTool[]; retry?: Retry; loadImage: LoadAttachmentImage
+export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
+  view: View; tools: TraceTool[]; retry?: Retry; loadImage: LoadAttachment; loadDocument: LoadAttachment
 }) {
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
@@ -290,7 +292,7 @@ export function Transcript({ view, tools, retry, loadImage }: {
       </div>}
       <Committed messages={committed} tools={tools} turns={turns} retry={retry}
         attachmentRefs={view.state.attachment_refs} promptGroups={promptGroups}
-        sessionId={view.session_id} loadImage={loadImage}
+        sessionId={view.session_id} loadImage={loadImage} loadDocument={loadDocument}
         recoveryTurn={run?.prompt === null && !activeGroup ? run.turn_id : undefined} />
       {run && <>
         {run.prompt !== null && !committedInput && <UserMessage text={run.prompt}

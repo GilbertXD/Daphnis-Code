@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { AttachmentLabels, MAX_FILES, MAX_TOTAL, imageFileTypes, isImageFile, readFiles, textFileTypes } from './attachments'
+import {
+  AttachmentLabels, MAX_FILES, MAX_TOTAL, documentFileTypes, imageFileTypes, isImageFile, readFiles, textFileTypes,
+} from './attachments'
 import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, Command, LoadAttachmentImage, Model, Project, ResourceDraft, Session, View } from './protocol'
+import type { Approval, Command, LoadAttachment, Model, Project, ResourceDraft, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
@@ -343,11 +345,14 @@ type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system'; sessi
   | { action: 'move'; session: Session }
   | { action: 'remove_project'; projectId: string; name: string }
 
-function Workspace({ view, connected, command, loadImage }: {
+const attachmentKey = (file: DraftAttachment) => file.kind === 'document' ? `${file.id}:${file.readingMode}` : file.id
+
+function Workspace({ view, connected, command, loadImage, loadDocument }: {
   view: View
   connected: boolean
   command: Command
-  loadImage: LoadAttachmentImage
+  loadImage: LoadAttachment
+  loadDocument: LoadAttachment
 }) {
   const [open, setOpen] = useState(false)
   const [sidebar, setSidebar] = useState(false)
@@ -367,6 +372,7 @@ function Workspace({ view, connected, command, loadImage }: {
   const dragDepth = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
   const imageInput = useRef<HTMLInputElement>(null)
+  const documentInput = useRef<HTMLInputElement>(null)
   const attachmentMenu = useRef<HTMLDetailsElement>(null)
   const [busy, setBusy] = useState(false)
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
@@ -417,6 +423,8 @@ function Workspace({ view, connected, command, loadImage }: {
   const allowsImages = state.model.supports_image === true
   const imagesBlocked = !allowsImages && files.some((file) => file.kind === 'image')
   const imageNotice = state.model.supports_image === false ? '当前模型不支持图片。' : '当前模型的图片能力未确认。'
+  const allowsDocuments = state.model.supports_document === true
+  const documentsBlocked = !allowsDocuments && files.some((file) => file.kind === 'document')
   const tools = useMemo(() => collectTools(view.events), [view.events])
   const sessions = state.sessions.some((session) => session.id === id)
     ? state.sessions : [state.session, ...state.sessions]
@@ -455,7 +463,7 @@ function Workspace({ view, connected, command, loadImage }: {
     setReadingFiles(new Set(fileReads.current))
     setUploadErrors((current) => ({ ...current, [id]: '' }))
     try {
-      const result = await readFiles(added, files, allowsImages)
+      const result = await readFiles(added, files, allowsImages, allowsDocuments)
       if (!mounted.current || deletedSessions.current.has(id)) return
       const additions = result.added.map((file): DraftAttachment => {
         if (file.kind !== 'image') return file
@@ -479,7 +487,7 @@ function Workspace({ view, connected, command, loadImage }: {
       }))
     const next = [...files, ...added]
     if (!added.length) return '所选资源已在待发送附件中。'
-    const texts = next.filter((file) => file.kind !== 'image')
+    const texts = next.filter((file) => file.kind === 'text' || file.kind === 'resource')
     if (texts.length > MAX_FILES || texts.reduce((sum, file) => sum + file.size, 0) > MAX_TOTAL) {
       return '每次最多发送 10 份附件或资源，总计最多 256 KiB。'
     }
@@ -490,39 +498,41 @@ function Workspace({ view, connected, command, loadImage }: {
   }
 
   async function send() {
-    if (disabled || interrupted || imagesBlocked || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
+    if (disabled || interrupted || imagesBlocked || documentsBlocked || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
     if (files.length) {
       const pending = submissions.current.get(id)
-      const ids = files.map((file) => file.id)
+      const ids = files.map(attachmentKey)
       const submission = pending?.text === draft && pending.ids.length === ids.length && pending.ids.every((value, index) => value === ids[index])
         ? pending : { id: crypto.randomUUID().replaceAll('-', ''), text: draft, ids }
       submissions.current.set(id, submission)
       let accepted: boolean
-      if (files.some((file) => file.kind === 'image')) {
+      if (files.some((file) => file.kind === 'image' || file.kind === 'document')) {
         const form = new FormData()
         form.set('submission_id', submission.id)
         form.set('prompt', draft)
         const manifest = files.map((file, index) => {
           if (file.kind === 'resource') return { kind: file.kind, resource_id: file.resourceId }
           if (file.kind === 'text') return { kind: file.kind, name: file.name, text: file.text }
-          const field = `image_${index}`
+          const field = `${file.kind}_${index}`
           const content = file.file.type === file.mimeType ? file.file : file.file.slice(0, file.size, file.mimeType)
           form.set(field, content, file.name)
-          return { kind: file.kind, name: file.name, field }
+          return file.kind === 'document'
+            ? { kind: file.kind, name: file.name, field, reading_mode: file.readingMode }
+            : { kind: file.kind, name: file.name, field }
         })
         form.set('manifest', JSON.stringify(manifest))
         accepted = await perform('send_attachments', form)
       } else {
         accepted = await perform('send_attachments', {
           submission_id: submission.id, prompt: draft,
-          attachments: files.filter((file) => file.kind !== 'image').map((file) => file.kind === 'resource'
+          attachments: files.filter((file) => file.kind === 'text' || file.kind === 'resource').map((file) => file.kind === 'resource'
             ? { resource_id: file.resourceId } : { name: file.name, text: file.text }),
         })
       }
       if (!accepted) return
       submissions.current.delete(id)
       const sent = new Set(ids)
-      setDraftFiles((current) => ({ ...current, [id]: (current[id] ?? []).filter((file) => !sent.has(file.id)) }))
+      setDraftFiles((current) => ({ ...current, [id]: (current[id] ?? []).filter((file) => !sent.has(attachmentKey(file))) }))
     } else if (!await perform('send', { prompt: draft })) {
       return
     }
@@ -565,7 +575,7 @@ function Workspace({ view, connected, command, loadImage }: {
         setModal({ action, session })
       }} />
     <main className="conversation" aria-label="Agent 对话">
-      <Transcript key={id} view={view} tools={tools} loadImage={loadImage} retry={recovery?.kind === 'FAILED_USER'
+      <Transcript key={id} view={view} tools={tools} loadImage={loadImage} loadDocument={loadDocument} retry={recovery?.kind === 'FAILED_USER'
         ? { index: recovery.message_index, disabled, run: () => void perform('retry', { key: recovery.key }) }
         : undefined} />
       <div className="composer-zone">
@@ -605,11 +615,15 @@ function Workspace({ view, connected, command, loadImage }: {
             setDragging(false)
             void addFiles(Array.from(event.dataTransfer.files))
           }}>
-          <AttachmentLabels files={files} remove={(fileId) => setDraftFiles((current) => ({
+          <AttachmentLabels files={files} changeReadingMode={busy ? undefined : (fileId, readingMode) => setDraftFiles((current) => ({
+            ...current, [id]: (current[id] ?? []).map((file) =>
+              file.kind === 'document' && file.id === fileId ? { ...file, readingMode } : file),
+          }))} remove={(fileId) => setDraftFiles((current) => ({
             ...current, [id]: (current[id] ?? []).filter((file) => file.id !== fileId),
           }))} />
           {reading && <p className="muted" role="status">正在读取附件…</p>}
           {imagesBlocked && <p className="notice" role="status">{imageNotice}请切换模型或移除图片后再发送。</p>}
+          {documentsBlocked && <p className="notice" role="status">当前模型不支持文档。请切换模型或移除文档后再发送。</p>}
           {uploadErrors[id] && <p className="notice" role="alert">{uploadErrors[id]}</p>}
           <input ref={fileInput} type="file" hidden multiple accept={textFileTypes} onChange={(event) => {
             const selected = Array.from(event.currentTarget.files ?? [])
@@ -617,6 +631,11 @@ function Workspace({ view, connected, command, loadImage }: {
             void addFiles(selected)
           }} />
           <input ref={imageInput} type="file" hidden multiple accept={imageFileTypes} onChange={(event) => {
+            const selected = Array.from(event.currentTarget.files ?? [])
+            event.currentTarget.value = ''
+            void addFiles(selected)
+          }} />
+          <input ref={documentInput} type="file" hidden accept={documentFileTypes} onChange={(event) => {
             const selected = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             void addFiles(selected)
@@ -649,7 +668,12 @@ function Workspace({ view, connected, command, loadImage }: {
                     if (attachmentMenu.current) attachmentMenu.current.open = false
                     imageInput.current?.click()
                   }}>上传图片</button>
+                  <button type="button" disabled={reading || !allowsDocuments} onClick={() => {
+                    if (attachmentMenu.current) attachmentMenu.current.open = false
+                    documentInput.current?.click()
+                  }}>上传文档</button>
                   {!allowsImages && <small className="muted">{imageNotice}</small>}
+                  {!allowsDocuments && <small className="muted">当前模型不支持文档输入。</small>}
                 </div>
               </details>
               <select aria-label="模型" title={`${state.model.provider} / ${state.model.id}`}
@@ -708,7 +732,7 @@ function Workspace({ view, connected, command, loadImage }: {
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
                 onClick={() => void perform('cancel', { run_id: view.run?.id })} aria-label="停止" title="停止">■</button>
               : <button className="primary send" type="submit"
-                disabled={disabled || interrupted || reading || imagesBlocked || (!draft.trim() && !files.length)}
+                disabled={disabled || interrupted || reading || imagesBlocked || documentsBlocked || (!draft.trim() && !files.length)}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
         </form>
@@ -802,7 +826,7 @@ function Workspace({ view, connected, command, loadImage }: {
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem(tokenKey) ?? '')
   const [entry, setEntry] = useState('')
-  const { view, connected, error, command, loadImage } = useConnection(token)
+  const { view, connected, error, command, loadImage, loadDocument } = useConnection(token)
   function login(event: FormEvent) {
     event.preventDefault()
     const value = entry.trim()
@@ -812,7 +836,8 @@ function App() {
     setEntry('')
   }
 
-  if (view) return <Workspace view={view} connected={connected} command={command} loadImage={loadImage} />
+  if (view) return <Workspace view={view} connected={connected} command={command}
+    loadImage={loadImage} loadDocument={loadDocument} />
   return <main className="access">
     <section className="access-card">
       <p className="eyebrow">DAPHNIS / LOCAL WORKSPACE</p>

@@ -623,6 +623,9 @@ class Operations:
                 {"id": item.id, "name": item.name, "type": "image", "mime_type": item.mime_type,
                  "width": item.width, "height": item.height}
                 if isinstance(item, ImageAttachment)
+                else {"id": item.id, "name": item.name, "type": "document", "mime_type": item.mime_type,
+                      "size_bytes": item.size_bytes, "reading_mode": item.reading_mode}
+                if isinstance(item, DocumentAttachment)
                 else {"id": item.id, "name": item.name, "type": "text", "mime_type": item.mime_type}
                 for item in batch.files
             ]
@@ -630,21 +633,38 @@ class Operations:
         }
 
     async def read_attachment_image(self, session_id: str, message_index: int, attachment_id: str) -> tuple[bytes, str]:
+        data, item = await self._read_binary_attachment(session_id, message_index, attachment_id, ImageAttachment)
+        return data, item.mime_type
+
+    async def read_attachment_document(
+        self, session_id: str, message_index: int, attachment_id: str,
+    ) -> tuple[bytes, str, str]:
+        data, item = await self._read_binary_attachment(session_id, message_index, attachment_id, DocumentAttachment)
+        return data, item.mime_type, item.name
+
+    async def _read_binary_attachment(
+        self, session_id: str, message_index: int, attachment_id: str,
+        kind: type[ImageAttachment] | type[DocumentAttachment],
+    ) -> tuple[bytes, ImageAttachment | DocumentAttachment]:
         app = self._app
         session = app._session
         if session.id != session_id or not valid_id(attachment_id) or type(message_index) is not int:
-            raise FileNotFoundError("图片不可用。")
+            raise FileNotFoundError("附件不可用。")
         batch = session.attachment_refs.get(message_index)
-        image = next((item for item in batch.images if item.id == attachment_id), None) if batch else None
-        if image is None:
-            raise FileNotFoundError("图片不可用。")
+        item = next((entry for entry in batch.files if isinstance(entry, kind) and entry.id == attachment_id), None) if batch else None
+        if item is None:
+            raise FileNotFoundError("附件不可用。")
+        store = app._history.attachments
         try:
-            data = await asyncio.to_thread(app._history.attachments.read_image, session.id, image)
+            if isinstance(item, ImageAttachment):
+                data = await asyncio.to_thread(store.read_image, session.id, item)
+            else:
+                data = await asyncio.to_thread(store.read_document, session.id, item)
         except (OSError, ValueError):
-            raise FileNotFoundError("图片不可用。") from None
+            raise FileNotFoundError("附件不可用。") from None
         if app._session.id != session_id:
-            raise FileNotFoundError("图片不可用。")
-        return data, image.mime_type
+            raise FileNotFoundError("附件不可用。")
+        return data, item
 
     def attachment_submitted(
         self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str],

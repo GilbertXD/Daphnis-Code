@@ -6,6 +6,7 @@ export type Model = {
   context_window: number | null
   supports_tools: boolean | null
   supports_image: boolean | null
+  supports_document: boolean | null
   thinking_modes: string[] | null
   configured?: boolean
 }
@@ -158,6 +159,7 @@ export type ContextBudget = {
   hard_limit: number | null
   threshold_blocked_by_reserve: boolean
   count_source: 'estimate' | 'local_tokenizer'
+  unknown_documents?: number
 }
 
 export type Status = {
@@ -195,16 +197,20 @@ export type EventData = {
 export type AgentEvent = { id: number; name: string; turn_id: string; time: number; data: EventData }
 export type LiveText = { content: string; reasoning: string; count: number }
 
+export type ReadingMode = 'text' | 'visual'
+
 export type AttachmentInfo = {
   id: string
   name: string
-  type?: 'text' | 'image'
+  type?: 'text' | 'image' | 'document'
   mime_type?: string
   width?: number
   height?: number
+  size_bytes?: number
+  reading_mode?: ReadingMode
 }
 
-export type LoadAttachmentImage = (
+export type LoadAttachment = (
   sessionId: string, messageIndex: number, attachmentId: string, signal: AbortSignal,
 ) => Promise<Blob>
 
@@ -340,18 +346,22 @@ export function useConnection(token: string) {
     if (action === 'send_attachments' && response.status !== 202) throw new Error('附件提交结果未知。请重试。')
     return result
   }
-  const loadImage: LoadAttachmentImage = useCallback(async (sessionId, messageIndex, attachmentId, signal) => {
+  const loadAttachment = useCallback(async (
+    kind: 'image' | 'document', sessionId: string, messageIndex: number, attachmentId: string, signal: AbortSignal,
+  ) => {
     const query = new URLSearchParams({
       session_id: sessionId, message_index: String(messageIndex), attachment_id: attachmentId,
     })
-    const response = await fetch('/api/attachments/image?' + query, {
+    const response = await fetch(`/api/attachments/${kind}?` + query, {
       headers: { Authorization: 'Bearer ' + token },
       mode: 'same-origin', redirect: 'error', cache: 'no-store', signal,
     })
-    if (!response.ok) throw new Error('图片不可用')
+    if (!response.ok) throw new Error(kind === 'image' ? '图片不可用' : '文档不可用')
     return response.blob()
   }, [token])
-  return { view, connected, error, command, loadImage }
+  const loadImage: LoadAttachment = useCallback((...args) => loadAttachment('image', ...args), [loadAttachment])
+  const loadDocument: LoadAttachment = useCallback((...args) => loadAttachment('document', ...args), [loadAttachment])
+  return { view, connected, error, command, loadImage, loadDocument }
 }
 
 export function sessionTitle(session: Session) {

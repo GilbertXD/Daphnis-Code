@@ -9,10 +9,8 @@ from functools import partial
 from uuid import uuid4
 
 from ..attachments import (
-    ATTACHMENT_ONLY_PROMPT,
     ATTACHMENT_TOOLS,
-    IMAGE_ATTACHMENT_ONLY_PROMPT,
-    ImageAttachmentInput,
+    attachment_only_prompt,
 )
 from ..history import SessionScan
 from ..operations import Operations
@@ -305,8 +303,7 @@ class Bridge:
                     "base_count": len(self.ops.message_snapshot())}
         accepted = None
         if attachments:
-            default = IMAGE_ATTACHMENT_ONLY_PROMPT if any(isinstance(item, ImageAttachmentInput) for item in attachments) else ATTACHMENT_ONLY_PROMPT
-            self.run["prompt"] = prompt if prompt.strip() else default
+            self.run["prompt"] = prompt if prompt.strip() else attachment_only_prompt(attachments)
             self.run["attachments"] = [item.name for item in attachments]
             accepted = asyncio.get_running_loop().create_future()
             self.upload = (submission_id, prompt, attachments, accepted)

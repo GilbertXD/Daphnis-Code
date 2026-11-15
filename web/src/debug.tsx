@@ -59,6 +59,8 @@ function StatusPanel({ view }: { view: View }) {
       <div><dt>窗口</dt><dd>{state.model.context_window?.toLocaleString() ?? '未知'}</dd></div>
       {status.context_budget && <>
         <div><dt>最近请求输入估算</dt><dd>≈ {status.context_budget.input_tokens.toLocaleString()}（{status.context_budget.count_source === 'local_tokenizer' ? '本地分词' : '长度估算'}）</dd></div>
+        {!!status.context_budget.unknown_documents && <div><dt>文档 Token</dt>
+          <dd>{status.context_budget.unknown_documents} 份实际成本未知，输入估算含安全预留</dd></div>}
         <div><dt>输出预留</dt><dd>{status.context_budget.output_reserve.toLocaleString()}</dd></div>
         <div><dt>自动压缩阈值（输入 + 预留）</dt><dd>{!status.context_budget.auto_enabled ? '已关闭'
           : status.context_budget.threshold_blocked_by_reserve ? '不高于输出预留，未生效'

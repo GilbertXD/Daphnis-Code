@@ -6,6 +6,7 @@ import secrets
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 from python_multipart.exceptions import MultipartParseError
 from starlette.applications import Starlette
@@ -19,10 +20,13 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from ..attachments import (
+    MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENTS,
     MAX_FILES,
     MAX_IMAGE_BYTES,
     MAX_IMAGE_TOTAL_BYTES,
     MAX_IMAGES,
+    DocumentAttachmentInput,
     ImageAttachmentInput,
     TextAttachmentInput,
     TextResourceInput,
@@ -37,8 +41,9 @@ from ..turn_state import RecoveryKind
 _MAX_BODY_BYTES = 256 * 1024
 _ATTACHMENT_PATH = "/api/attachments/send"
 _IMAGE_PATH = "/api/attachments/image"
+_DOCUMENT_PATH = "/api/attachments/document"
 _MAX_ATTACHMENT_BODY_BYTES = 2 * 1024 * 1024
-_MAX_MULTIPART_BODY_BYTES = MAX_IMAGE_TOTAL_BYTES + _MAX_ATTACHMENT_BODY_BYTES
+_MAX_MULTIPART_BODY_BYTES = MAX_IMAGE_TOTAL_BYTES + MAX_DOCUMENT_BYTES + _MAX_ATTACHMENT_BODY_BYTES
 _FIELDS = {
     "new": {},
     "project_create": {"name": str, "workspace": (str, type(None))},
@@ -158,7 +163,7 @@ async def _command(request: Request):
 async def _multipart_attachments(request: Request):
     parser = MultiPartParser(
         request.headers, _limited_stream(request, _MAX_MULTIPART_BODY_BYTES),
-        max_files=MAX_IMAGES, max_fields=4, max_part_size=_MAX_ATTACHMENT_BODY_BYTES,
+        max_files=MAX_IMAGES + MAX_DOCUMENTS, max_fields=4, max_part_size=_MAX_ATTACHMENT_BODY_BYTES,
     )
     try:
         form = await parser.parse()
@@ -186,11 +191,11 @@ async def _multipart_attachments(request: Request):
             json.dumps(parts, ensure_ascii=False, allow_nan=False).encode()
         except (ValueError, RecursionError):
             raise RequestError("附件清单无效。") from None
-        if not isinstance(parts, list) or not 0 < len(parts) <= MAX_FILES + MAX_IMAGES:
+        if not isinstance(parts, list) or not 0 < len(parts) <= MAX_FILES + MAX_IMAGES + MAX_DOCUMENTS:
             raise RequestError("附件清单无效。")
 
         entries = []
-        image_count = text_count = image_size = 0
+        image_count = text_count = document_count = image_size = 0
         for index, item in enumerate(parts):
             if not isinstance(item, dict):
                 raise RequestError("附件清单无效。")
@@ -202,6 +207,8 @@ async def _multipart_attachments(request: Request):
                     entries.append(resource)
                     text_count += 1
                 case {"kind": "image", "name": str(name), "field": str(field)} if len(item) == 3 and field == f"image_{index}":
+                    if image_count == MAX_IMAGES:
+                        raise RequestError("每轮最多可发送 4 张图片。")
                     upload = fields.pop(field, None)
                     if not isinstance(upload, UploadFile):
                         raise RequestError("图片二进制字段缺失。")
@@ -213,9 +220,22 @@ async def _multipart_attachments(request: Request):
                         raise RequestError("单张图片最多 5 MiB，图片总计最多 20 MiB。", 413)
                     entries.append(ImageAttachmentInput(name, data, upload.content_type or ""))
                     image_count += 1
+                case {"kind": "document", "name": str(name), "field": str(field), "reading_mode": str(mode)} if len(item) == 4 and field == f"document_{index}":
+                    if document_count == MAX_DOCUMENTS:
+                        raise RequestError("每轮最多可发送一份文档。")
+                    upload = fields.pop(field, None)
+                    if not isinstance(upload, UploadFile):
+                        raise RequestError("文档二进制字段缺失。")
+                    if upload.size is not None and upload.size > MAX_DOCUMENT_BYTES:
+                        raise RequestError("每份文档最多 10 MiB。", 413)
+                    data = await upload.read(MAX_DOCUMENT_BYTES + 1)
+                    if len(data) > MAX_DOCUMENT_BYTES:
+                        raise RequestError("每份文档最多 10 MiB。", 413)
+                    entries.append(DocumentAttachmentInput(name, data, upload.content_type or "", mode))
+                    document_count += 1
                 case _:
                     raise RequestError("附件清单条目无效。")
-        if fields or not 0 < image_count <= MAX_IMAGES or text_count > MAX_FILES:
+        if fields or not (image_count or document_count) or text_count > MAX_FILES:
             raise RequestError("附件清单或数量无效。")
         return session, prompt, submission, tuple(entries)
     finally:
@@ -590,7 +610,9 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         except Exception as exc:  # noqa: BLE001 - Report a redacted transport failure.
             return JSONResponse({"error": bridge.redactor.text(str(exc))}, 500)
 
-    async def attachment_image(request: Request):
+    async def attachment_binary(request: Request):
+        document = request.url.path == _DOCUMENT_PATH
+        label = "文档" if document else "图片"
         headers = request.headers
         if headers.get("origin", origin) != origin or headers.get("sec-fetch-site", "same-origin") != "same-origin":
             return JSONResponse({"error": "请求来源不受信任。"}, 403)
@@ -602,13 +624,18 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             or len(params["session_id"]) > 255 or not valid_id(params["attachment_id"])
             or not 0 < len(index := params["message_index"]) <= 10 or not index.isascii() or not index.isdecimal()
         ):
-            return JSONResponse({"error": "图片引用无效。"}, 400)
+            return JSONResponse({"error": f"{label}引用无效。"}, 400)
+        ops = request.app.state.bridge.ops
+        args = (params["session_id"], int(index), params["attachment_id"])
         try:
-            data, mime_type = await request.app.state.bridge.ops.read_attachment_image(
-                params["session_id"], int(index), params["attachment_id"],
-            )
+            if document:
+                data, mime_type, name = await ops.read_attachment_document(*args)
+                return Response(data, media_type=mime_type, headers={
+                    "Content-Disposition": "attachment; filename*=UTF-8''" + quote(name, safe=""),
+                })
+            data, mime_type = await ops.read_attachment_image(*args)
         except FileNotFoundError:
-            return JSONResponse({"error": "图片不可用。"}, 404)
+            return JSONResponse({"error": f"{label}不可用。"}, 404)
         return Response(data, media_type=mime_type)
 
     async def events(socket: WebSocket):
@@ -660,7 +687,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         routes=[
             Route("/api/command", command, methods=["POST"]),
             Route(_ATTACHMENT_PATH, command, methods=["POST"]),
-            Route(_IMAGE_PATH, attachment_image, methods=["GET"]),
+            Route(_IMAGE_PATH, attachment_binary, methods=["GET"]),
+            Route(_DOCUMENT_PATH, attachment_binary, methods=["GET"]),
             WebSocketRoute("/api/events", events),
             Mount("/", app=StaticFiles(directory=assets, html=True)),
         ],

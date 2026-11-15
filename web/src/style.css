@@ -160,6 +160,11 @@ th, td { border: 1px solid var(--line); padding: 4px 8px; }
 .image-thumb, .image-thumb img { object-fit: contain; }
 .image-thumb img { display: block; width: 100%; height: 100%; }
 .attachment-labels .image-status { font-size: .7rem; }
+.attachment-labels .attachment-entry-document { max-width: 100%; flex-wrap: wrap; gap: 4px 7px; }
+.attachment-entry-document > span { max-width: min(210px, 60vw); }
+.attachment-entry-document .document-format { border: 1px solid var(--line); padding: 1px 4px; font-size: .67rem; }
+.attachment-entry-document label { display: inline-flex; align-items: center; gap: 3px; font-size: .74rem; }
+.attachment-labels .attachment-entry-document > button { opacity: 1; }
 dialog.image-viewer { width: max-content; max-width: 94vw; padding: 10px; }
 .image-viewer header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
 .image-viewer header span { max-width: 66vw; }

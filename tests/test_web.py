@@ -16,6 +16,8 @@ import httpx
 from PIL import Image
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from test_document_attachments import document
+from test_document_models import FileService
 
 from daphnis import History, Operations, Session
 from daphnis.agent import TITLE_PROMPT
@@ -74,8 +76,11 @@ class WebTests(unittest.TestCase):
         self.summary_mode = ""
         self.summary_started = threading.Event()
         self.summary_stopped = threading.Event()
+        self.files = FileService()
 
         async def provider(request):
+            if request.url.path == "/files":
+                return await self.files(request)
             body = json.loads(request.content)
             if body["messages"][0]["content"] == TITLE_PROMPT:
                 self.title_requests.append(body)
@@ -1084,7 +1089,7 @@ class WebTests(unittest.TestCase):
 
         def oversized_body():
             yield b'--length-test\r\nContent-Disposition: form-data; name="image_0"; filename="img.png"\r\n\r\n'
-            for _ in range(23):
+            for _ in range(33):
                 yield b"x" * (1024 * 1024)
             yield b"\r\n--length-test--\r\n"
 
@@ -1120,6 +1125,69 @@ class WebTests(unittest.TestCase):
         self.assertEqual(saved.attachment_refs, {})
         self.command("restore", other, id=session)
         self.assertEqual(self.snapshot()["session_id"], session)
+
+    def test_document_multipart_download_replay_and_privacy(self):
+        session = self.snapshot()["session_id"]
+        upload = document(mode="visual", name="报告")
+        png = image_bytes("PNG")
+        manifest = [
+            {"kind": "text", "name": "notes.txt", "text": "a text note"},
+            {"kind": "document", "name": upload.name, "field": "document_1", "reading_mode": "visual"},
+            {"kind": "image", "name": "image.png", "field": "image_2"},
+        ]
+        data = {"session_id": session, "submission_id": "d" * 32, "prompt": "Review",
+                "manifest": json.dumps(manifest)}
+        files = {"document_1": (upload.name, upload.data, upload.mime_type),
+                 "image_2": ("image.png", png, "image/png")}
+        path = "/api/attachments/send"
+        bad_files = {**files, "document_1": (upload.name, b"bad", upload.mime_type)}
+        self.assertEqual(self.client.post(path, headers=self.headers, data=data, files=bad_files).status_code, 409)
+        oversize = {**files, "document_1": (upload.name, b"x" * (10 * 1024 * 1024 + 1), upload.mime_type)}
+        self.assertEqual(self.client.post(path, headers=self.headers, data=data, files=oversize).status_code, 413)
+        twice = [*manifest, {**manifest[1], "field": "document_3"}]
+        repeated = self.client.post(path, headers=self.headers, data={**data, "manifest": json.dumps(twice)},
+                                    files={**files, "document_3": files["document_1"]})
+        self.assertEqual(repeated.status_code, 400)
+        self.command("model", session, provider="mimo", model_id="mimo-v2.6-flash")
+        self.assertFalse(self.snapshot()["state"]["model"]["supports_document"])
+        self.assertEqual(self.client.post(path, headers=self.headers, data=data, files=files).status_code, 409)
+        self.assertFalse(self.snapshot()["state"]["messages"])
+        self.command("model", session, provider="deepseek", model_id="deepseek-flash")
+        result = self.client.post(path, headers=self.headers, data=data, files=files)
+        self.assertEqual(result.status_code, 202, result.text)
+        self.assertEqual(self.client.post(path, headers=self.headers, data=data, files=files).status_code, 202)
+        conflict = [manifest[0], {**manifest[1], "reading_mode": "text"}, manifest[2]]
+        response = self.client.post(path, headers=self.headers, data={**data, "manifest": json.dumps(conflict)}, files=files)
+        self.assertEqual(response.status_code, 409)
+        frame = self.wait_for(lambda item: item["run"] is None)
+        self.assertEqual(self.files.uploads, [("rich_layout_recognition", upload.data)])
+        self.assertEqual(len(self.requests), 1)
+        parts = self.requests[0]["messages"][-1]["content"]
+        self.assertTrue(any(p["type"] == "image_url" for p in parts))
+        self.assertTrue(any(p["type"] == "file" for p in parts))
+        self.assertTrue(frame["state"]["model"]["supports_document"])
+        text, doc, image = frame["state"]["attachment_refs"]["0"]
+        self.assertEqual([text["type"], doc["type"], image["type"]], ["text", "document", "image"])
+        self.assertEqual(doc["reading_mode"], "visual")
+        self.assertEqual(doc["size_bytes"], len(upload.data))
+        self.assertNotIn("file-api-", json.dumps(frame))
+        self.assertNotIn("synthetic test snapshot", json.dumps(frame))
+        self.assertNotIn("file-api-", (self.history.directory / f"{session}.json").read_text())
+
+        query = {"session_id": session, "message_index": 0, "attachment_id": doc["id"]}
+        endpoint = "/api/attachments/document"
+        self.assertEqual(self.client.get(endpoint, params=query).status_code, 401)
+        self.assertEqual(self.client.get(endpoint, params=query, headers={**self.headers, "Origin": "https://other.test"}).status_code, 403)
+        response = self.client.get(endpoint, params=query, headers=self.headers)
+        self.assertEqual(response.content, upload.data)
+        self.assertEqual(response.headers["content-type"], upload.mime_type)
+        self.assertIn("filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf", response.headers["content-disposition"])
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        for entry in (text, image):
+            self.assertEqual(self.client.get(endpoint, params={**query, "attachment_id": entry["id"]},
+                                             headers=self.headers).status_code, 404)
+        self.command("new", session)
+        self.assertEqual(self.client.get(endpoint, params=query, headers=self.headers).status_code, 404)
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
