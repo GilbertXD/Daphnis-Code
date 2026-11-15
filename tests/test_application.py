@@ -1,8 +1,5 @@
 import asyncio
-import contextlib
-import io
 import json
-import logging
 import os
 import sys
 import tempfile
@@ -11,12 +8,12 @@ import unittest
 from dataclasses import replace
 from inspect import isawaitable
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import httpx
 from saturnus import Compatibility, ValidationError
 
-from daphnis import History, Operations, TurnResult, TurnStatus
+from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction_settings import CompactionSettings
@@ -24,7 +21,6 @@ from daphnis.config import environment_connections
 from daphnis.history import SessionBusyError, SessionLease
 from daphnis.models import CapabilityError, ModelInfo
 from daphnis.tool_state import PENDING, TOOL_STATE
-from daphnis.turn_state import RecoveryKind, RecoveryState
 
 CATALOG = (
     ModelInfo(
@@ -954,151 +950,3 @@ class ConfigTests(unittest.TestCase):
                 connections["deepseek"],
                 {"base_url": "https://deepseek.test", "api_key": None},
             )
-
-
-class CLITests(unittest.TestCase):
-    def test_interrupted_tool_turn_requires_an_explicit_cli_action(self):
-        from daphnis import cli
-
-        ops = Mock(spec=Operations)
-        ops.recovery = RecoveryState(RecoveryKind.INTERRUPTED_TURN, 0, "saved-key")
-        ops.continue_interrupted_turn.return_value = TurnResult("session", "turn", TurnStatus.COMPLETED)
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            self.assertEqual(asyncio.run(cli.execute(ops, "继续")), 3)
-        self.assertIn("/continue", stderr.getvalue())
-        ops.send.assert_not_called()
-        self.assertEqual(asyncio.run(cli.execute(ops, "/continue")), 0)
-        ops.continue_interrupted_turn.assert_awaited_once_with("saved-key", stream=False)
-
-    def test_budget_pause_prints_notice_with_distinct_exit_code(self):
-        from daphnis import cli
-
-        stdout, stderr = io.StringIO(), io.StringIO()
-        ops = Mock(spec=Operations)
-        ops.recovery = None
-        paused = TurnResult("session", "turn", TurnStatus.PAUSED_LIMIT, notice="进度已保存。发送「继续」可接着处理。")
-        ops.send.return_value = paused
-        with (
-            contextlib.redirect_stdout(stdout),
-            contextlib.redirect_stderr(stderr),
-        ):
-            self.assertEqual(asyncio.run(cli.execute(ops, "run")), 3)
-        self.assertEqual(stdout.getvalue(), paused.notice + "\n")
-        self.assertEqual(stderr.getvalue(), "")
-
-    def test_argparse_sanitizes_errors_and_help(self):
-        from daphnis import cli
-
-        for args, code, visible in (
-            (["--未知\x1b]52;c;CLIPBOARD\x07", "值\x1b[31m红\x9b0m色"], 2, "--未知 值红色"),
-            (["--workspace=\x9b31m中文", "--session=\x1b[2J值"], 2, "--session"),
-            (["--workspace", "--thinking"], 2, "expected one argument"),
-            (["--help"], 0, "Daphnis terminal Coding Agent"),
-        ):
-            with self.subTest(code=code, visible=visible):
-                stdout, stderr = io.StringIO(), io.StringIO()
-                with (
-                    patch("sys.argv", ["daphnis", *args]),
-                    contextlib.redirect_stdout(stdout),
-                    contextlib.redirect_stderr(stderr),
-                    self.assertRaises(SystemExit) as exit,
-                ):
-                    cli.main()
-                self.assertEqual(exit.exception.code, code)
-                rendered = stderr.getvalue() if code else stdout.getvalue()
-                self.assertIn(visible, rendered)
-                self.assertNotRegex(rendered, r"[\x1b\x07\x7f-\x9f]|CLIPBOARD")
-
-    def test_prompt_entry_prints_only_final_answer_and_saves_session(self):
-        from daphnis import cli
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            bodies = []
-
-            def handler(request):
-                body = json.loads(request.content)
-                bodies.append(body)
-                if body["messages"][-1]["content"] == "empty answer":
-                    return response({"role": "assistant", "content": ""})
-                if body["messages"][-1]["content"] == "terminal payload":
-                    return response({
-                        "role": "assistant",
-                        "content": "中文\x1b]52;c;PAYLOAD\x07\x9b31m**OK**\x7f\n\tfin",
-                    })
-                if body["messages"][-1]["content"] == "terminal error":
-                    logging.getLogger("daphnis.events").warning("warning\x1b]52;c;PAYLOAD\x07")
-                    raise RuntimeError("failure\x9d52;c;PAYLOAD\x9c")
-                return response({"role": "assistant", "content": "CLI ready"})
-
-            connections = {
-                "deepseek": {
-                    "base_url": "https://model.test",
-                    "transport": httpx.MockTransport(handler),
-                }
-            }
-
-            def factory(**kwargs):
-                return Application(**kwargs, history=History(root / "sessions"))
-
-            history = History(root / "sessions")
-            with (
-                patch.object(
-                    cli,
-                    "environment_connections",
-                    return_value=("deepseek", "a", connections),
-                ),
-                patch.object(cli, "Application", side_effect=factory),
-                patch.object(cli, "load_dotenv"),
-                patch.object(cli, "environment_context_options", return_value={"catalog": CATALOG}),
-            ):
-
-                def run(*args, error=None):
-                    stdout, stderr = io.StringIO(), io.StringIO()
-                    with (
-                        patch("sys.argv", ["daphnis", *args]),
-                        contextlib.redirect_stdout(stdout),
-                        contextlib.redirect_stderr(stderr),
-                    ):
-                        self.assertEqual(cli.main(), 0 if error is None else 1)
-                    if error is None:
-                        self.assertEqual(stderr.getvalue(), "")
-                    else:
-                        self.assertIn(error, stderr.getvalue())
-                        self.assertNotIn("PAYLOAD", stderr.getvalue())
-                    return stdout.getvalue()
-
-                self.assertEqual(
-                    run("--workspace", str(root), "-p", "hello"), "CLI ready\n"
-                )
-                (saved,) = history.list_sessions()
-                self.assertEqual(
-                    run("--session", saved.id, "--thinking", "high", "-p", "continue"),
-                    "CLI ready\n",
-                )
-                self.assertEqual(bodies[-1]["reasoning_effort"], "high")
-                self.assertEqual(bodies[-1]["messages"][-3]["content"], "hello")
-                self.assertIn("deepseek: 1. a", run("-p", "/model list"))
-                (updated,) = history.list_sessions()
-                self.assertEqual(updated.id, saved.id)
-                self.assertEqual(updated.message_count, 4)
-                self.assertEqual(history.load(updated.id).thinking, "high")
-                self.assertEqual(
-                    run(
-                        "--session", saved.id, "-p", "empty answer",
-                        error="no visible text or refusal",
-                    ),
-                    "",
-                )
-                self.assertEqual(history.load(saved.id).messages.get(-1),
-                                 {"role": "user", "content": "empty answer"})
-                self.assertEqual(
-                    run("--session", saved.id, "-p", "terminal payload"),
-                    "中文**OK**\n\tfin\n",
-                )
-                self.assertIn(
-                    "\x1b]52;c;PAYLOAD\x07",
-                    history.load(saved.id).messages.snapshot()[-1]["content"],
-                )
-                self.assertEqual(run("--session", saved.id, "-p", "terminal error",
-                                     error="failure"), "")

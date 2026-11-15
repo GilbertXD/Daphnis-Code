@@ -14,6 +14,7 @@ import httpx
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
 from daphnis.mcp import MCPConnection
+from daphnis.runtime import MCPStartupError, open_operations
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
 
@@ -29,6 +30,48 @@ def tool_call(name, call_id, **arguments):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_connects_configured_tools_and_cleans_up_on_startup_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "mcp.json"
+            env = {
+                "LLM_PROVIDER": "deepseek",
+                "LLM_MODEL": "deepseek-flash",
+                "LLM_BASE_URL": "https://model.test",
+                "DAPHNIS_MCP_CONFIG": str(config),
+            }
+            good, broken = root / "good", root / "broken"
+            good.mkdir()
+            broken.mkdir()
+            (broken / "stderr-exit").touch()
+
+            def server(cwd):
+                return {"transport": "stdio", "command": sys.executable,
+                        "args": [str(DEMO), "."], "cwd": cwd}
+
+            with patch.dict(os.environ, env, clear=True), patch("daphnis.runtime.load_dotenv"):
+                config.write_text(json.dumps({"servers": {"good": server("good")}}))
+                ops = await open_operations(root)
+                try:
+                    self.assertIn("mcp__good__add", ops.effective_tools)
+                finally:
+                    await ops.close()
+
+                pid_file = good / "pid"
+                pid_file.unlink()
+                config.write_text(json.dumps({"servers": {
+                    "good": server("good"), "broken": server("broken"),
+                }}))
+                with self.assertRaisesRegex(MCPStartupError, "无法连接.*第 2 个 MCP 服务"):
+                    await open_operations(root)
+                for process_dir in (good, broken):
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(int((process_dir / "pid").read_text()), 0)
+
+                config.write_text('{"servers":{},"servers":{}}')
+                with self.assertRaisesRegex(MCPStartupError, "DAPHNIS_MCP_CONFIG 无效"):
+                    await open_operations(root)
+
     @unittest.skipUnless(os.name == "posix", "Requires POSIX stderr pipes")
     async def test_stdio_stderr_is_drained_and_sanitized(self):
         with tempfile.TemporaryDirectory() as directory:

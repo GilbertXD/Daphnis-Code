@@ -30,7 +30,6 @@ from daphnis.compaction import (
 from daphnis.compaction_settings import CompactionSettings
 from daphnis.models import ModelInfo
 from daphnis.redaction import Redactor
-from daphnis.terminal_commands import terminal_command
 from daphnis.token_budget import TokenCounter, request_budget
 from daphnis.tools import create_tools
 from daphnis.turn_state import ABANDONED, CONTINUE, TERMINATED, TURN_STATE
@@ -412,8 +411,9 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(history.load(state.id).compaction)
             original = state.messages.snapshot()
 
-            self.assertIn("已压缩", (await terminal_command(ops, "/compact")).text)
+            checkpoint = await ops.compact()
             saved = history.load(state.id)
+            self.assertEqual(checkpoint, saved.compaction)
             self.assertEqual(saved.compaction.through, 4)
             self.assertEqual(saved.messages.snapshot(), original)
             self.assertEqual(saved.usage.total_tokens, 30)

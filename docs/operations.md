@@ -1,10 +1,10 @@
 # 公共 Operations 接口
 
-`Operations` 可从 `daphnis` 导入。多个实例可引用同一个 Application，共享当前会话、配置、任务和审批状态。自行构造 `Application` 时可注入模型连接、目录和 History。交互式客户端也可使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装运行环境。
+`Operations` 可从 `daphnis` 导入。多个实例可引用同一个 Application，共享当前会话、配置、任务和审批状态。自行构造 `Application` 时可注入模型连接、目录和 History。Web 使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装交互式运行环境，并连接 `DAPHNIS_MCP_CONFIG` 指定的 MCP 服务。
 
 ## 最小示例
 
-以下示例从进程环境读取配置。终端和 Web 启动入口会加载 `.env`，直接调用 `environment_connections()` 只读取当前环境变量。示例显式加载启动目录的 `.env`。
+Web 运行时会加载 `.env`。直接调用 `environment_connections()` 只读取当前环境变量，因此示例显式加载启动目录的 `.env`。
 
 ```python
 import asyncio
@@ -72,8 +72,8 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 
 ## 恢复未完成的任务
 
-先加载原会话。终端可用 `/session <会话ID>` 或 `daphnis --session <会话ID>`，Web 可从会话列表选中原会话，代码可调用 `restore_session(session_id)`。加载会话只读取历史。
+先加载原会话。Web 可从会话列表选中原会话，代码可调用 `restore_session(session_id)`。加载会话只读取历史。
 
-如果 `recovery.kind` 为 `FAILED_USER`，Web 在原消息旁显示可点击的「!」，TUI 使用 `/retry`。重试直接复用原消息。发送新消息则作废旧消息，作废记录仍可在界面查看。
+如果 `recovery.kind` 为 `FAILED_USER`，Web 在原消息旁显示可点击的「!」。重试直接复用原消息。发送新消息则作废旧消息，作废记录仍可在界面查看。
 
-如果为 `INTERRUPTED_TURN`，用 Web 的「继续 / 终止」或 TUI 的 `/continue`、`/terminate`。请求额度暂停也适用。继续从已保存的工具事实恢复，终止保存 `TERMINATED` 并允许发送新消息。需要人工批准时，使用 TUI、Web 或接入审批的交互式 Application。结果未知时应检查实际环境。单轮 CLI 可显式使用 `-p /retry`、`-p /continue` 或 `-p /terminate`，退出码 `3` 表示暂停、待处理或已终止。
+如果为 `INTERRUPTED_TURN`，用 Web 的「继续 / 终止」。请求额度暂停也适用。继续从已保存的工具事实恢复，终止保存 `TERMINATED` 并允许发送新消息。Web 可处理人工批准，直接使用 Application 的代码需启用交互模式并接入审批。结果未知时应检查实际环境。

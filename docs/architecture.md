@@ -4,18 +4,16 @@
 
 ```text
 操作
-  CLI / TUI ─────────────┐
-  浏览器 → Web Server / Bridge ─┴─→ Operations → Application → Agent
+  浏览器 → Web Server / Bridge → Operations → Application → Agent
 
 通知
-  Agent / ToolExecutor / Application → EventBus → TUI、UsageTracker
+  Agent / ToolExecutor / Application → EventBus → UsageTracker
                                                └→ Operations.subscribe → Web Bridge
 ```
 
 | 模块 | 职责 |
 | --- | --- |
-| [CLI](../src/daphnis/cli.py)、[TUI](../src/daphnis/tui/app.py) | CLI 装配终端运行环境，按参数执行一轮或启动 Textual TUI，并可加载 MCP 配置。`terminal_commands.py` 解析斜杠命令。TUI 调用 Operations，并把 EventBus 通知转成界面消息。 |
-| [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application 并按需恢复会话。 |
+| [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接已配置的 MCP 服务。 |
 | [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 通过公共 Operations 查询或执行操作，通过 `Operations.subscribe()` 观察事件，再投影成浏览器快照、流式文本和有界调试记录。Bridge 持有的是 Web 任务、游标和缓存，Core 状态以 Operations 为准。 |
 | [Operations](../src/daphnis/operations.py) | 提供面向客户端的命令、只读视图及订阅入口。在共享运行状态上校验操作，协调会话和配置变更。 |
 | [Application](../src/daphnis/app.py) | 持有当前 Session、History、按厂商缓存的客户端、工具目录、MCP 连接、审批和用量跟踪器。为每轮装配 Agent，管理任务、持久化、取消和资源清理。 |
@@ -53,11 +51,11 @@ Working 由当前 History 和检查点投影生成。模型请求保留合法工
 
 预算以模型目录登记的窗口为准，按序列化消息、工具定义等估算输入 Token，并预留输出和估算余量。DeepSeek 的默认输出预留随思考档位变化。窗口未知时仍会报告输入估算。已知窗口接近阈值时，Agent 先在请求副本中修剪旧工具输出，再按需摘要旧历史。摘要优先保留当前用户消息和最近一次工具交换。最新工具输出本身过大时也可发送摘录，调用 ID 和结果配对仍完整。
 
-手动 `/compact` 优先保留最近一轮。摘要作为低权限的历史数据发送，生成摘要的请求没有工具。明确的服务端上下文超限可以触发压缩，整个 Turn 最多重试一次，且要求请求确实缩短、流式输出尚未开始。摘要请求和重试计入本轮模型请求上限。
+通过 `Operations.compact()` 手动压缩时，优先保留最近一轮。摘要作为低权限的历史数据发送，生成摘要的请求没有工具。明确的服务端上下文超限可以触发压缩，整个 Turn 最多重试一次，且要求请求确实缩短、流式输出尚未开始。摘要请求和重试计入本轮模型请求上限。
 
 ### 本地历史与并发
 
-默认目录是 `~/.daphnis/sessions`，消息、工具结果、思考档位和工具偏好保存在 V2 JSON 中。可选的压缩检查点与原始消息在同一个 JSON 中原子保存。旧会话缺少检查点时使用完整历史。CLI、TUI 与 Web 使用同一目录。History 在同目录写临时文件后替换目标 JSON，并以稳定的 POSIX 锁文件协调 Daphnis 进程。
+默认目录是 `~/.daphnis/sessions`，消息、工具结果、思考档位和工具偏好保存在 V2 JSON 中。可选的压缩检查点与原始消息在同一个 JSON 中原子保存。旧会话缺少检查点时使用完整历史。History 在同目录写临时文件后替换目标 JSON，并以稳定的 POSIX 锁文件协调 Daphnis 进程。
 
 租约覆盖模型请求、工具调用、人工审批、手动压缩和保存。同会话的锁已被占用时会立即抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`，需重新加载后再继续。不同会话可以并行。保存和设置写入在线程中执行，取消会等待已开始的写入完成后再释放租约。锁只协调遵守同一机制的进程。
 
@@ -83,4 +81,4 @@ Working 由当前 History 和检查点投影生成。模型请求保留合法工
 
 Web 通过 `POST /api/command` 接收命令，通过 `/api/events` WebSocket 发送状态帧。Bridge 用会话 ID、状态版本和事件游标区分全量快照与增量记录。服务端调试记录按会话有界缓存，重连时可重新获取仍在缓存中的记录。持续连接的浏览器会在本地累积已收到的同会话事件，直到收到重置帧或切换会话。
 
-Core 事件可能含模型请求正文、工具参数和结果。终端在渲染时过滤控制序列，Web 在浏览器边界做[凭据脱敏](tools.md#web-边界)。本地历史保留消息和工具结果原文。
+Core 事件可能含模型请求正文、工具参数和结果。Web 在浏览器边界做[凭据脱敏](tools.md#web-边界)。本地历史保留消息和工具结果原文。

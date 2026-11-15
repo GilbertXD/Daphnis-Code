@@ -873,7 +873,7 @@ class Agent:
                     raise CompactionError(
                         f"请求超过上下文安全上限（输入 {budget.input_tokens:,} + 输出预留 "
                         f"{budget.output_reserve:,} > {budget.hard_limit:,} Token）。"
-                        "请尝试 /compact、缩短输入或降低 output_limit。",
+                        "请缩短输入或降低 output_limit。",
                         reason="context_safety_limit",
                     )
                 while True:
