@@ -173,6 +173,7 @@ export type EventData = {
   name?: string
   request_number?: number
   purpose?: string
+  trigger?: string
   tool_call_id?: string
   arguments?: string
   content?: string | null
@@ -225,7 +226,9 @@ type Frame = {
   reset: boolean
   state?: State
   status: Status
-  run: { id: string; turn_id: string; session_id: string; prompt: string | null; base_count: number; attachments?: string[] } | null
+  run: ({ id: string; turn_id: string; session_id: string } & (
+    { kind: 'compaction' } | { kind?: 'turn'; prompt: string | null; base_count: number; attachments?: string[] }
+  )) | null
   live: Record<string, LiveText>
   events: AgentEvent[]
 }

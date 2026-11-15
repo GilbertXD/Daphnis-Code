@@ -375,6 +375,16 @@ function Workspace({ view, connected, command }: {
   const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
   const recovery = state.recovery
   const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
+  const compacting = view.run?.kind === 'compaction'
+  const lastOperation = view.events.findLast((event) => event.name === 'turn.started'
+    || (event.name === 'compaction.finished' && event.data.trigger === 'manual'))
+  const compactResult = lastOperation?.name === 'compaction.finished' ? lastOperation.data : null
+  const compactNotice = compactResult?.status === 'committed' ? '上下文压缩完成'
+    : compactResult?.status === 'skipped' ? '暂无可压缩的历史消息'
+    : compactResult?.status === 'cancelled' ? '已停止上下文压缩'
+    : compactResult?.status === 'failed'
+      ? `压缩失败：${compactResult.reason || (typeof compactResult.error === 'string' ? compactResult.error : '未知错误')}`
+      : ''
   const draft = drafts[id] ?? ''
   const files = draftFiles[id] ?? []
   const reading = readingFiles.has(id)
@@ -511,7 +521,8 @@ function Workspace({ view, connected, command }: {
             <button type="button" disabled={disabled} onClick={() => void perform('terminate', { key: recovery.key })}>终止</button>
           </div>
         </div>}
-        {!modal && notice && <p className="notice" role="status">{notice}</p>}
+        {!modal && (compacting || notice || (!status.running && compactNotice)) &&
+          <p className="notice" role="status">{compacting ? '正在压缩上下文' : notice || compactNotice}</p>}
         <form className={`composer${dragging ? ' attachment-drop' : ''}`} onSubmit={(event) => { event.preventDefault(); void send() }}
           onDragEnter={(event) => {
             if (!event.dataTransfer.types.includes('Files')) return
@@ -590,6 +601,9 @@ function Workspace({ view, connected, command }: {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
               }}>系统提示词</button>
+              <button type="button" disabled={disabled || interrupted} onClick={() => void perform('compact')}>
+                {compacting ? '压缩中' : '压缩上下文'}
+              </button>
               <select aria-label="工具审批模式"
                 value={state.approval_mode} disabled={disabled}
                 onChange={(event) => {

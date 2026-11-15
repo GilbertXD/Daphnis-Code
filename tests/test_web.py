@@ -3,9 +3,12 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 from starlette.testclient import TestClient
@@ -57,6 +60,9 @@ class WebTests(unittest.TestCase):
         self.titles_at_reply = []
         self.overflowed = False
         self.resource_failed = False
+        self.summary_mode = ""
+        self.summary_started = threading.Event()
+        self.summary_stopped = threading.Event()
 
         async def provider(request):
             body = json.loads(request.content)
@@ -76,11 +82,20 @@ class WebTests(unittest.TestCase):
             self.titles_at_reply.append(self.history.load(self.bridge.ops.session.id).title)
             last = body["messages"][-1]
             if "Summarize the conversation" in body["messages"][0]["content"]:
+                if self.summary_mode == "hold":
+                    self.summary_started.set()
+                    try:
+                        await asyncio.Future()
+                    finally:
+                        self.summary_stopped.set()
+                summary = json.dumps({
+                    "goals": "continue", "progress": "recorded old state",
+                    "files": "", "next_steps": "reply",
+                })
                 return httpx.Response(200, json={"choices": [{
-                    "index": 0, "message": {"role": "assistant", "content": json.dumps({
-                        "goals": "continue", "progress": "recorded old state",
-                        "files": "", "next_steps": "reply",
-                    })}, "finish_reason": "stop",
+                    "index": 0, "message": {
+                        "role": "assistant", "content": "invalid summary" if self.summary_mode == "fail" else summary,
+                    }, "finish_reason": "stop",
                 }]})
             if last.get("content") == "overflow" and not self.overflowed:
                 self.overflowed = True
@@ -200,6 +215,145 @@ class WebTests(unittest.TestCase):
             {"role": message["role"], "content": "[内容已隐藏]"} for message in real_request["messages"]
         ])
         return data
+
+    def manual_compaction_outcome(self, expected, count=1):
+        frame = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertFalse(frame["status"]["compacting"])
+        self.assertIsNone(frame["run"])
+        finished = [event for event in frame["events"] if event["name"] == "compaction.finished"
+                    and event["data"].get("trigger") == "manual"]
+        self.assertEqual(len(finished), count)
+        self.assertEqual(finished[-1]["data"]["status"], expected)
+        return frame, finished[-1]
+
+    def test_manual_compaction_skips_an_empty_session(self):
+        sid = self.snapshot()["session_id"]
+        self.command("compact", sid, 202)
+        frame, _ = self.manual_compaction_outcome("skipped")
+        self.assertEqual(frame["state"]["messages"], [])
+        self.assertEqual(frame["status"]["compacted_through"], 0)
+        self.assertEqual(self.history.list_sessions(), ())
+        self.assertEqual(self.requests, [])
+
+    def test_manual_compaction_persists_and_advances_existing_checkpoint(self):
+        sid = self.snapshot()["session_id"]
+        app = self.bridge.ops._app
+        app._compaction_settings = replace(app._compaction_settings, recent_tokens=256)
+        old = "first historical task " * 350
+        for text in (old, "Recent task"):
+            self.command("send", sid, 202, prompt=text)
+            self.wait_for(lambda frame: not frame["status"]["running"])
+        before = self.history.load(sid).messages.snapshot()
+
+        self.command("compact", sid, 202)
+        frame, outcome = self.manual_compaction_outcome("committed")
+        self.assertEqual(frame["state"]["messages"], before)
+        first = self.history.load(sid).compaction
+        self.assertIsNotNone(first)
+        self.assertEqual(frame["status"]["compacted_through"], first.through)
+        self.assertEqual(outcome["data"]["through"], first.through)
+        summary = next(event for event in frame["events"] if event["name"] == "model.request"
+                       and event["data"].get("purpose") == "compaction")
+        self.assertEqual(summary["turn_id"], outcome["turn_id"])
+        self.assertEqual(self.history.load(sid).messages.snapshot(), before)
+
+        for text in ("additional historical details " * 350, "Continue the saved task"):
+            self.command("send", sid, 202, prompt=text)
+            self.wait_for(lambda frame: not frame["status"]["running"])
+            context = self.requests[-1]["messages"]
+            self.assertIn("recorded old state", context[1]["content"])
+            self.assertNotIn(old, [message["content"] for message in context])
+        raw = self.history.load(sid).messages.snapshot()
+
+        self.summary_mode = "fail"
+        self.command("compact", sid, 202)
+        failed, error = self.manual_compaction_outcome("failed", count=2)
+        self.assertEqual(error["data"]["reason"], "summary_json")
+        self.assertEqual(failed["status"]["compacted_through"], first.through)
+        self.assertEqual(self.history.load(sid).compaction, first)
+        self.assertEqual(self.history.load(sid).messages.snapshot(), raw)
+
+        self.summary_mode = ""
+        request_count = len(self.requests)
+        self.command("compact", sid, 202)
+        advanced, _ = self.manual_compaction_outcome("committed", count=3)
+        saved = self.history.load(sid)
+        self.assertGreater(saved.compaction.through, first.through)
+        self.assertEqual(advanced["status"]["compacted_through"], saved.compaction.through)
+        self.assertEqual(saved.messages.snapshot(), raw)
+        self.assertIn("recorded old state", self.requests[request_count]["messages"][-1]["content"])
+
+    def test_manual_compaction_reconnects_and_waits_for_cancellation(self):
+        sid = self.snapshot()["session_id"]
+        for text in ("old task details " * 350, "Recent task"):
+            self.command("send", sid, 202, prompt=text)
+            self.wait_for(lambda frame: not frame["status"]["running"])
+        before = self.history.load(sid).messages.snapshot()
+
+        self.summary_mode = "hold"
+        self.command("compact", sid, 202)
+        self.assertTrue(self.summary_started.wait(2))
+        # Each snapshot opens a new WebSocket connection.
+        running = self.snapshot()
+        self.assertTrue(running["status"]["running"])
+        self.assertTrue(running["status"]["compacting"])
+        run = running["run"]
+        self.assertEqual(run["kind"], "compaction")
+        started = next(event for event in running["events"] if event["name"] == "compaction.started")
+        self.assertEqual(run["turn_id"], started["turn_id"])
+        self.command("compact", sid, 409)
+        self.command("send", sid, 409, prompt="Wait for compaction")
+        self.command("model", sid, 409, provider="mimo", model_id="mimo-v2.6-pro")
+        self.command("cancel", sid, 409, run_id="stale")
+        self.command("cancel", sid, run_id=run["id"])
+        self.assertTrue(self.summary_stopped.is_set())
+
+        frame, _ = self.manual_compaction_outcome("cancelled")
+        self.assertFalse(self.bridge.ops.running)
+        self.assertEqual(frame["state"]["messages"], before)
+        self.assertIsNone(self.history.load(sid).compaction)
+        self.command("send", sid, 202, prompt="Continue without a checkpoint")
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertNotIn("Daphnis history summary", self.requests[-1]["messages"][1]["content"])
+
+    def test_manual_compaction_late_cancel_preserves_the_committed_checkpoint(self):
+        sid = self.snapshot()["session_id"]
+        for text in ("old task details " * 350, "Recent task"):
+            self.command("send", sid, 202, prompt=text)
+            self.wait_for(lambda frame: not frame["status"]["running"])
+        before = self.history.load(sid).messages.snapshot()
+        entered = threading.Event()
+        cancelling = threading.Event()
+        original_save = self.history.save_async
+
+        async def hold_save(candidate, **options):
+            self.finish_checkpoint_save = asyncio.Event()
+            entered.set()
+            await self.finish_checkpoint_save.wait()
+            await original_save(candidate, **options)
+
+        async def cancel():
+            cancelling.set()
+            await self.bridge.cancel()
+
+        with patch.object(self.history, "save_async", side_effect=hold_save):
+            self.command("compact", sid, 202)
+            self.assertTrue(entered.wait(2))
+            stopped = self.client.portal.start_task_soon(cancel)
+            try:
+                self.assertTrue(cancelling.wait(2))
+                self.assertTrue(self.snapshot()["status"]["compacting"])
+                self.assertFalse(stopped.done())
+                self.assertIsNone(self.history.load(sid).compaction)
+            finally:
+                self.client.portal.call(self.finish_checkpoint_save.set)
+            stopped.result(timeout=2)
+
+        frame, _ = self.manual_compaction_outcome("committed")
+        saved = self.history.load(sid)
+        self.assertIsNotNone(saved.compaction)
+        self.assertEqual(frame["status"]["compacted_through"], saved.compaction.through)
+        self.assertEqual(saved.messages.snapshot(), before)
 
     def test_context_status_and_diagnostics_preserve_the_full_transcript(self):
         initial = self.snapshot()
@@ -523,6 +677,7 @@ class WebTests(unittest.TestCase):
         self.command("send", session_id, 202, prompt="test patch")
         waiting = self.wait_for(lambda frame: frame["status"]["approval"])
         approval = waiting["status"]["approval"]
+        self.command("compact", session_id, 409)
         self.command("confirm_full", session_id, 409)
         self.assertEqual(self.snapshot()["state"]["approval_mode"], "auto")
         self.assertFalse((self.workspace / "new.txt").exists())
@@ -829,6 +984,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], ["user", "assistant", "tool"])
         self.assertTrue(json.loads(messages[-1]["content"])["ok"])
         self.assertEqual(paused["state"]["sessions"][0]["recovery_kind"], "INTERRUPTED_TURN")
+        self.command("compact", session_id, 409)
         self.command("move", session_id, 409, **move)
 
         self.command("new", session_id)

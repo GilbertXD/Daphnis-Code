@@ -151,6 +151,12 @@ class Bridge:
             if event.name == "turn.started" and self.run and self.run["session_id"] == event.session_id:
                 self.run["turn_id"] = event.turn_id
                 data = {**data, "base_count": self.run["base_count"]}
+            if (
+                event.name == "compaction.started" and data.get("trigger") == "manual"
+                and self.run and self.run.get("kind") == "compaction"
+                and self.run["session_id"] == event.session_id
+            ):
+                self.run["turn_id"] = event.turn_id
             if event.name == "model.finished" and self.run and event.turn_id == self.run["turn_id"]:
                 item = self.live.get(data["request_number"])
                 if item is not None:
@@ -251,7 +257,7 @@ class Bridge:
                     "hard_limit": budget.hard_limit,
                     "threshold_blocked_by_reserve": budget.threshold_blocked_by_reserve,
                 } if budget else None,
-                "compacting": ops.compacting,
+                "compacting": ops.compacting or (self.run is not None and self.run.get("kind") == "compaction"),
                 "compacted_through": ops.compacted_through,
             }),
             "run": self.redactor.json(self.run),
@@ -334,6 +340,28 @@ class Bridge:
             self.prompt_run = None
             self.run = None
             self.live.clear()
+            self._notify(state=True)
+
+    def start_compaction(self):
+        session_id = self.ops.session.id
+        self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "kind": "compaction"}
+        self.task = asyncio.create_task(self._compact(session_id))
+        self._notify(state=True)
+
+    async def _compact(self, session_id):
+        try:
+            checkpoint = await self.ops.compact()
+            result = {"status": "skipped"} if checkpoint is None else {"status": "committed", "through": checkpoint.through}
+        except asyncio.CancelledError:
+            result = {"status": "cancelled"}
+        except Exception as exc:  # noqa: BLE001 - Report failures across the detached operation boundary.
+            result = {"status": "failed", "error": type(exc).__name__}
+        finally:
+            # Once Operations has started, its terminal event reflects the persisted state,
+            # including a checkpoint committed while a late cancellation was waiting.
+            if not self.run["turn_id"]:
+                self._record("compaction.finished", session_id, self.run["id"], {"trigger": "manual", **result})
+            self.run = None
             self._notify(state=True)
 
     async def cancel(self):

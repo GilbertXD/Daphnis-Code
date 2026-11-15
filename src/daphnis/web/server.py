@@ -53,6 +53,7 @@ _FIELDS = {
     "set_approval_mode": {"mode": str},
     "confirm_full": {},
     "send": {"prompt": str},
+    "compact": {},
     "send_attachments": {"prompt": str, "attachments": list, "submission_id": str},
     "retry": {"key": str},
     "continue": {"key": str},
@@ -60,7 +61,7 @@ _FIELDS = {
     "cancel": {"run_id": str},
     "approve": {"request_id": str, "decision": str},
 }
-_RUN_ACTIONS = {"send", "retry", "continue", "terminate"}
+_RUN_ACTIONS = {"send", "retry", "continue", "terminate", "compact"}
 _PROMPT_ACTIONS = {"mcp_list_prompts", "mcp_get_prompt"}
 
 
@@ -291,10 +292,13 @@ async def _execute(bridge, action, session, args, discovery):
             ops.set_approval_mode(args["mode"])
         case "confirm_full":
             ops.set_approval_mode(ApprovalMode.FULL)
-        case "send":
+        case "send" | "compact":
             if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
-            bridge.start(args["prompt"])
+            if action == "compact":
+                bridge.start_compaction()
+            else:
+                bridge.start(args["prompt"])
         case "retry" | "continue" | "terminate":
             recovery = ops.recovery
             kind = RecoveryKind.FAILED_USER if action == "retry" else RecoveryKind.INTERRUPTED_TURN

@@ -253,7 +253,8 @@ export function Transcript({ view, tools, retry }: { view: View; tools: TraceToo
       { id: event.turn_id, start: start.data.base_count, end: event.data.committed_count },
     ]
   })
-  const { run, live, events } = view
+  const { live, events } = view
+  const run = view.run?.kind === 'compaction' ? null : view.run
   const promptGroups = view.state.prompt_groups
   const activeGroup = run && promptGroups?.find((group) => group.start === run.base_count)
   const committed = run ? view.state.messages.slice(0, activeGroup ? activeGroup.end : run.base_count) : view.state.messages
