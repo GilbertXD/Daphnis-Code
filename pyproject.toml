@@ -14,7 +14,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-web = ["starlette>=1.10,<2", "uvicorn>=0.54,<1", "websockets>=15,<17"]
+web = [
+    "python-multipart>=0.0.33,<1",
+    "starlette>=1.10,<2",
+    "uvicorn>=0.54,<1",
+    "websockets>=15,<17",
+]
 
 [project.scripts]
 daphnis-web = "daphnis.web.__main__:main"

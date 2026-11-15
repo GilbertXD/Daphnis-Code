@@ -18,6 +18,7 @@ from .attachments import (
     TextResourceInput,
     prepare_attachments,
     resource_snapshot_id,
+    valid_id,
 )
 from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
@@ -489,6 +490,14 @@ class Operations:
         current = self.session
         return await self._new_session(current.workspace, current.project_id)
 
+    async def remember_current_session(self) -> None:
+        """Keep a blank session restorable while a client holds an unsent draft."""
+        app = self._app
+        app._ensure_idle()
+        async with app._state_lock:
+            if app._session._saved_revision is None:
+                await finish_io(app._save_session(app._session))
+
     async def _new_session(self, workspace: Path | str, project_id: str | None) -> SessionSnapshot:
         app = self._app
         current = app._session
@@ -608,11 +617,34 @@ class Operations:
             await finish_io(delete_and_select())
         return self.session
 
-    def attachment_snapshot(self) -> dict[int, list[dict[str, str]]]:
+    def attachment_snapshot(self) -> dict[int, list[dict[str, str | int]]]:
         return {
-            index: [{"id": item.id, "name": item.name} for item in batch.files]
+            index: [
+                {"id": item.id, "name": item.name, "type": "image", "mime_type": item.mime_type,
+                 "width": item.width, "height": item.height}
+                if isinstance(item, ImageAttachment)
+                else {"id": item.id, "name": item.name, "type": "text", "mime_type": item.mime_type}
+                for item in batch.files
+            ]
             for index, batch in self._app._session.attachment_refs.items()
         }
+
+    async def read_attachment_image(self, session_id: str, message_index: int, attachment_id: str) -> tuple[bytes, str]:
+        app = self._app
+        session = app._session
+        if session.id != session_id or not valid_id(attachment_id) or type(message_index) is not int:
+            raise FileNotFoundError("图片不可用。")
+        batch = session.attachment_refs.get(message_index)
+        image = next((item for item in batch.images if item.id == attachment_id), None) if batch else None
+        if image is None:
+            raise FileNotFoundError("图片不可用。")
+        try:
+            data = await asyncio.to_thread(app._history.attachments.read_image, session.id, image)
+        except (OSError, ValueError):
+            raise FileNotFoundError("图片不可用。") from None
+        if app._session.id != session_id:
+            raise FileNotFoundError("图片不可用。")
+        return data, image.mime_type
 
     def attachment_submitted(
         self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str],

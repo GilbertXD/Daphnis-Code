@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { AttachmentLabels, MAX_FILES, MAX_TOTAL, readTextFiles, textFileTypes } from './attachments'
+import { AttachmentLabels, MAX_FILES, MAX_TOTAL, imageFileTypes, isImageFile, readFiles, textFileTypes } from './attachments'
 import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, Command, Model, Project, ResourceDraft, Session, View } from './protocol'
+import type { Approval, Command, LoadAttachmentImage, Model, Project, ResourceDraft, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
@@ -343,10 +343,11 @@ type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system'; sessi
   | { action: 'move'; session: Session }
   | { action: 'remove_project'; projectId: string; name: string }
 
-function Workspace({ view, connected, command }: {
+function Workspace({ view, connected, command, loadImage }: {
   view: View
   connected: boolean
   command: Command
+  loadImage: LoadAttachmentImage
 }) {
   const [open, setOpen] = useState(false)
   const [sidebar, setSidebar] = useState(false)
@@ -355,6 +356,9 @@ function Workspace({ view, connected, command }: {
   const [title, setTitle] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   const [draftFiles, setDraftFiles] = useState<Record<string, DraftAttachment[]>>({})
+  const previewUrls = useRef(new Set<string>())
+  const mounted = useRef(false)
+  const deletedSessions = useRef(new Set<string>())
   const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({})
   const [readingFiles, setReadingFiles] = useState<Set<string>>(() => new Set())
   const fileReads = useRef(new Set<string>())
@@ -362,6 +366,8 @@ function Workspace({ view, connected, command }: {
   const [dragging, setDragging] = useState(false)
   const dragDepth = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
+  const imageInput = useRef<HTMLInputElement>(null)
+  const attachmentMenu = useRef<HTMLDetailsElement>(null)
   const [busy, setBusy] = useState(false)
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
   const inFlight = useRef(false)
@@ -371,7 +377,26 @@ function Workspace({ view, connected, command }: {
     setModal((current) => current?.action === 'prompts' && current.sessionId !== id ? null : current)
     dragDepth.current = 0
     setDragging(false)
+    if (attachmentMenu.current) attachmentMenu.current.open = false
   }, [id])
+  useEffect(() => {
+    mounted.current = true
+    const urls = previewUrls.current
+    return () => {
+      mounted.current = false
+      urls.forEach((url) => URL.revokeObjectURL(url))
+      urls.clear()
+    }
+  }, [])
+  useEffect(() => {
+    const retained = new Set(Object.values(draftFiles).flat()
+      .flatMap((file) => file.kind === 'image' ? [file.previewUrl] : []))
+    for (const url of previewUrls.current) {
+      if (retained.has(url)) continue
+      URL.revokeObjectURL(url)
+      previewUrls.current.delete(url)
+    }
+  }, [draftFiles])
   const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
   const recovery = state.recovery
   const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
@@ -388,6 +413,10 @@ function Workspace({ view, connected, command }: {
   const draft = drafts[id] ?? ''
   const files = draftFiles[id] ?? []
   const reading = readingFiles.has(id)
+  const keepDraftSession = !!(draft || files.length || reading)
+  const allowsImages = state.model.supports_image === true
+  const imagesBlocked = !allowsImages && files.some((file) => file.kind === 'image')
+  const imageNotice = state.model.supports_image === false ? '当前模型不支持图片。' : '当前模型的图片能力未确认。'
   const tools = useMemo(() => collectTools(view.events), [view.events])
   const sessions = state.sessions.some((session) => session.id === id)
     ? state.sessions : [state.session, ...state.sessions]
@@ -397,7 +426,7 @@ function Workspace({ view, connected, command }: {
       : state.sessions.find((session) => session.id === modal.session.id)
   )
 
-  async function perform(action: string, fields?: Record<string, unknown>) {
+  async function perform(action: string, fields?: Record<string, unknown> | FormData) {
     if (inFlight.current) return false
     inFlight.current = true
     setBusy(true)
@@ -426,22 +455,32 @@ function Workspace({ view, connected, command }: {
     setReadingFiles(new Set(fileReads.current))
     setUploadErrors((current) => ({ ...current, [id]: '' }))
     try {
-      const result = await readTextFiles(added, files)
-      if (result.added.length) setDraftFiles((current) => ({ ...current, [id]: [...(current[id] ?? []), ...result.added] }))
+      const result = await readFiles(added, files, allowsImages)
+      if (!mounted.current || deletedSessions.current.has(id)) return
+      const additions = result.added.map((file): DraftAttachment => {
+        if (file.kind !== 'image') return file
+        const previewUrl = URL.createObjectURL(file.file)
+        previewUrls.current.add(previewUrl)
+        return { ...file, previewUrl }
+      })
+      if (additions.length) setDraftFiles((current) => ({ ...current, [id]: [...(current[id] ?? []), ...additions] }))
       setUploadErrors((current) => ({ ...current, [id]: result.error }))
     } finally {
       fileReads.current.delete(id)
-      setReadingFiles(new Set(fileReads.current))
+      if (mounted.current) setReadingFiles(new Set(fileReads.current))
     }
   }
 
   function addResources(resources: ResourceDraft[]) {
     if (disabled || fileReads.current.has(id)) return '请等待当前操作结束。'
     const added = resources.filter((resource) => !files.some((file) => file.id === resource.id))
-      .map((resource) => ({ id: resource.id, name: resource.name, size: resource.size_bytes, resourceId: resource.id }))
+      .map((resource): DraftAttachment => ({
+        kind: 'resource', id: resource.id, name: resource.name, size: resource.size_bytes, resourceId: resource.id,
+      }))
     const next = [...files, ...added]
     if (!added.length) return '所选资源已在待发送附件中。'
-    if (next.length > MAX_FILES || next.reduce((sum, file) => sum + file.size, 0) > MAX_TOTAL) {
+    const texts = next.filter((file) => file.kind !== 'image')
+    if (texts.length > MAX_FILES || texts.reduce((sum, file) => sum + file.size, 0) > MAX_TOTAL) {
       return '每次最多发送 10 份附件或资源，总计最多 256 KiB。'
     }
     setDraftFiles((current) => ({ ...current, [id]: next }))
@@ -451,17 +490,35 @@ function Workspace({ view, connected, command }: {
   }
 
   async function send() {
-    if (disabled || interrupted || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
+    if (disabled || interrupted || imagesBlocked || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
     if (files.length) {
       const pending = submissions.current.get(id)
       const ids = files.map((file) => file.id)
       const submission = pending?.text === draft && pending.ids.length === ids.length && pending.ids.every((value, index) => value === ids[index])
         ? pending : { id: crypto.randomUUID().replaceAll('-', ''), text: draft, ids }
       submissions.current.set(id, submission)
-      const accepted = await perform('send_attachments', {
-        submission_id: submission.id, prompt: draft, attachments: files.map((file) => 'resourceId' in file
-          ? { resource_id: file.resourceId } : { name: file.name, text: file.text }),
-      })
+      let accepted: boolean
+      if (files.some((file) => file.kind === 'image')) {
+        const form = new FormData()
+        form.set('submission_id', submission.id)
+        form.set('prompt', draft)
+        const manifest = files.map((file, index) => {
+          if (file.kind === 'resource') return { kind: file.kind, resource_id: file.resourceId }
+          if (file.kind === 'text') return { kind: file.kind, name: file.name, text: file.text }
+          const field = `image_${index}`
+          const content = file.file.type === file.mimeType ? file.file : file.file.slice(0, file.size, file.mimeType)
+          form.set(field, content, file.name)
+          return { kind: file.kind, name: file.name, field }
+        })
+        form.set('manifest', JSON.stringify(manifest))
+        accepted = await perform('send_attachments', form)
+      } else {
+        accepted = await perform('send_attachments', {
+          submission_id: submission.id, prompt: draft,
+          attachments: files.filter((file) => file.kind !== 'image').map((file) => file.kind === 'resource'
+            ? { resource_id: file.resourceId } : { name: file.name, text: file.text }),
+        })
+      }
       if (!accepted) return
       submissions.current.delete(id)
       const sent = new Set(ids)
@@ -498,15 +555,17 @@ function Workspace({ view, connected, command }: {
         setNotice('')
         setModal({ action: 'remove_project', projectId, name })
       }}
-      onNew={(projectId) => void perform('project_open', { project_id: projectId })}
-      onSelect={async (target) => { if (target === id || await perform('restore', { id: target })) setSidebar(false) }}
+      onNew={(projectId) => void perform('project_open', { project_id: projectId, keep_draft_session: keepDraftSession })}
+      onSelect={async (target) => {
+        if (target === id || await perform('restore', { id: target, keep_draft_session: keepDraftSession })) setSidebar(false)
+      }}
       onEdit={(action, session) => {
         setNotice('')
         setTitle(session.title ?? sessionTitle(session))
         setModal({ action, session })
       }} />
     <main className="conversation" aria-label="Agent 对话">
-      <Transcript key={id} view={view} tools={tools} retry={recovery?.kind === 'FAILED_USER'
+      <Transcript key={id} view={view} tools={tools} loadImage={loadImage} retry={recovery?.kind === 'FAILED_USER'
         ? { index: recovery.message_index, disabled, run: () => void perform('retry', { key: recovery.key }) }
         : undefined} />
       <div className="composer-zone">
@@ -550,14 +609,26 @@ function Workspace({ view, connected, command }: {
             ...current, [id]: (current[id] ?? []).filter((file) => file.id !== fileId),
           }))} />
           {reading && <p className="muted" role="status">正在读取附件…</p>}
+          {imagesBlocked && <p className="notice" role="status">{imageNotice}请切换模型或移除图片后再发送。</p>}
           {uploadErrors[id] && <p className="notice" role="alert">{uploadErrors[id]}</p>}
           <input ref={fileInput} type="file" hidden multiple accept={textFileTypes} onChange={(event) => {
             const selected = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             void addFiles(selected)
           }} />
+          <input ref={imageInput} type="file" hidden multiple accept={imageFileTypes} onChange={(event) => {
+            const selected = Array.from(event.currentTarget.files ?? [])
+            event.currentTarget.value = ''
+            void addFiles(selected)
+          }} />
           <textarea aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
             onChange={(event) => updateDraft(event.currentTarget.value)}
+            onPaste={(event) => {
+              const images = Array.from(event.clipboardData.files).filter(isImageFile)
+              if (!images.length) return
+              if (!event.clipboardData.getData('text/plain')) event.preventDefault()
+              void addFiles(images)
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
                 event.preventDefault()
@@ -566,8 +637,21 @@ function Workspace({ view, connected, command }: {
             }} />
           <div className="composer-controls">
             <div className="selectors">
-              <button className="attachment-picker" type="button" aria-label="添加文本附件" disabled={reading}
-                onClick={() => fileInput.current?.click()}>+</button>
+              <details className="attachment-menu" ref={attachmentMenu}>
+                <summary className="attachment-picker" aria-label="添加附件" aria-disabled={reading}
+                  onClick={(event) => { if (reading) event.preventDefault() }}>+</summary>
+                <div>
+                  <button type="button" disabled={reading} onClick={() => {
+                    if (attachmentMenu.current) attachmentMenu.current.open = false
+                    fileInput.current?.click()
+                  }}>上传文件</button>
+                  <button type="button" disabled={reading || !allowsImages} onClick={() => {
+                    if (attachmentMenu.current) attachmentMenu.current.open = false
+                    imageInput.current?.click()
+                  }}>上传图片</button>
+                  {!allowsImages && <small className="muted">{imageNotice}</small>}
+                </div>
+              </details>
               <select aria-label="模型" title={`${state.model.provider} / ${state.model.id}`}
                 value={modelKey(state.model)} disabled={disabled} onChange={(event) => {
                   const model = state.models.find((candidate) => modelKey(candidate) === event.target.value)
@@ -623,7 +707,8 @@ function Workspace({ view, connected, command }: {
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
                 onClick={() => void perform('cancel', { run_id: view.run?.id })} aria-label="停止" title="停止">■</button>
-              : <button className="primary send" type="submit" disabled={disabled || interrupted || reading || (!draft.trim() && !files.length)}
+              : <button className="primary send" type="submit"
+                disabled={disabled || interrupted || reading || imagesBlocked || (!draft.trim() && !files.length)}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
         </form>
@@ -691,7 +776,14 @@ function Workspace({ view, connected, command }: {
         if (await perform(modal.action, modal.action === 'rename'
           ? { id: modal.session.id, title }
           : { id: modal.session.id })) {
-          if (modal.action === 'delete') setDrafts(({ [modal.session.id]: _deleted, ...rest }) => rest)
+          if (modal.action === 'delete') {
+            const target = modal.session.id
+            deletedSessions.current.add(target)
+            submissions.current.delete(target)
+            setDrafts(({ [target]: _deleted, ...rest }) => rest)
+            setDraftFiles(({ [target]: _deleted, ...rest }) => rest)
+            setUploadErrors(({ [target]: _deleted, ...rest }) => rest)
+          }
           setModal(null)
         }
       }}>
@@ -710,7 +802,7 @@ function Workspace({ view, connected, command }: {
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem(tokenKey) ?? '')
   const [entry, setEntry] = useState('')
-  const { view, connected, error, command } = useConnection(token)
+  const { view, connected, error, command, loadImage } = useConnection(token)
   function login(event: FormEvent) {
     event.preventDefault()
     const value = entry.trim()
@@ -720,7 +812,7 @@ function App() {
     setEntry('')
   }
 
-  if (view) return <Workspace view={view} connected={connected} command={command} />
+  if (view) return <Workspace view={view} connected={connected} command={command} loadImage={loadImage} />
   return <main className="access">
     <section className="access-card">
       <p className="eyebrow">DAPHNIS / LOCAL WORKSPACE</p>

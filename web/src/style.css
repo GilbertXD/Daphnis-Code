@@ -149,7 +149,34 @@ th, td { border: 1px solid var(--line); padding: 4px 8px; }
   .attachment-labels-pending li button { opacity: 0; }
   .attachment-labels-pending li:hover button, .attachment-labels-pending li:focus-within button { opacity: 1; }
 }
-.selectors .attachment-picker { font-size: 1.13rem; padding-block: 0; }
+.attachment-labels .attachment-entry-image {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 3px; max-width: 86px;
+}
+.attachment-entry-image > .image-thumb, .history-thumbnail { grid-column: 1 / -1; }
+.attachment-labels .attachment-entry-image > button { opacity: 1; }
+.attachment-labels .image-thumb {
+  display: grid; place-items: center; width: 80px; height: 64px; padding: 0; border: 1px solid var(--line); background: #fff;
+}
+.image-thumb, .image-thumb img { object-fit: contain; }
+.image-thumb img { display: block; width: 100%; height: 100%; }
+.attachment-labels .image-status { font-size: .7rem; }
+dialog.image-viewer { width: max-content; max-width: 94vw; padding: 10px; }
+.image-viewer header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+.image-viewer header span { max-width: 66vw; }
+.image-viewer > img { display: block; max-width: calc(94vw - 22px); max-height: 72dvh; object-fit: contain; }
+.attachment-menu { position: relative; flex-shrink: 0; }
+.selectors .attachment-picker {
+  list-style: none; font-size: 1.13rem; line-height: 1.4; padding: 0 9px; border: 1px solid var(--line);
+}
+.attachment-picker::-webkit-details-marker { display: none; }
+.attachment-picker:hover { background: var(--soft); }
+.attachment-picker[aria-disabled="true"] { opacity: .46; cursor: default; }
+.attachment-menu > div {
+  position: absolute; z-index: 3; bottom: calc(100% + 5px); left: 0; display: grid; min-width: max-content;
+  border: 1px solid var(--line); background: #fff; padding: 3px;
+}
+.attachment-menu > div button { text-align: left; border: 0; padding: 5px 10px; }
+.attachment-menu > div small { padding: 2px 10px; }
 .composer-controls, .selectors { display: flex; align-items: center; min-width: 0; }
 .composer-controls { justify-content: space-between; gap: 10px; margin-top: 7px; }
 .selectors { flex-wrap: wrap; row-gap: 3px; }

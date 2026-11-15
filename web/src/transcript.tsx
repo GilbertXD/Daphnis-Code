@@ -4,7 +4,7 @@ import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { AttachmentLabels } from './attachments'
 import { readableJson } from './protocol'
-import type { AgentEvent, Message, View } from './protocol'
+import type { AgentEvent, AttachmentInfo, LoadAttachmentImage, Message, View } from './protocol'
 
 export function Copy({ text }: { text: string }) {
   const [label, setLabel] = useState('复制')
@@ -138,14 +138,15 @@ function AssistantMessage({ text, thinking }: { text: string; thinking?: string 
 
 type Retry = { index: number; disabled: boolean; run: () => void }
 
-function UserMessage({ text, state, retry, attachments = [] }: {
-  text: string; state?: Message['daphnis_turn_state']; retry?: Retry; attachments?: { id: string; name: string }[]
+function UserMessage({ text, state, retry, attachments = [], history }: {
+  text: string; state?: Message['daphnis_turn_state']; retry?: Retry; attachments?: AttachmentInfo[]
+  history?: { sessionId: string; messageIndex: number; loadImage: LoadAttachmentImage }
 }) {
   return <article className={`user-message${state === 'ABANDONED' ? ' abandoned' : ''}`}>
     {retry && <button type="button" className="retry-mark" disabled={retry.disabled}
       aria-label="重试此消息" title="尚无已保存回复，点击重试" onClick={retry.run}>!</button>}
     <RichText text={text} />
-    <AttachmentLabels files={attachments} />
+    <AttachmentLabels files={attachments} history={history} />
     {state === 'ABANDONED' && <small>已作废</small>}
     {state === 'TERMINATED' && <small>任务已终止</small>}
   </article>
@@ -165,7 +166,9 @@ function savedResult(message: Message): { status: string; error?: unknown } {
   return { status: '已保存' }
 }
 
-const Committed = memo(function Committed({ messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups }: {
+const Committed = memo(function Committed({
+  messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups, sessionId, loadImage,
+}: {
   messages: Message[]
   tools: TraceTool[]
   turns: { id: string; start: number; end: number }[]
@@ -173,6 +176,8 @@ const Committed = memo(function Committed({ messages, tools, turns, retry, recov
   recoveryTurn?: string
   attachmentRefs: View['state']['attachment_refs']
   promptGroups: View['state']['prompt_groups']
+  sessionId: string
+  loadImage: LoadAttachmentImage
 }) {
   let calls: Message['tool_calls'] = null
   let request = 0
@@ -213,6 +218,7 @@ const Committed = memo(function Committed({ messages, tools, turns, retry, recov
       calls = null
       return <UserMessage key={index} text={messageText(message)}
         attachments={attachmentRefs?.[index]}
+        history={{ sessionId, messageIndex: index, loadImage }}
         state={message.daphnis_turn_state} retry={retry?.index === index ? retry : undefined} />
     }
     if (message.role === 'assistant') {
@@ -240,7 +246,9 @@ const Committed = memo(function Committed({ messages, tools, turns, retry, recov
   })
 })
 
-export function Transcript({ view, tools, retry }: { view: View; tools: TraceTool[]; retry?: Retry }) {
+export function Transcript({ view, tools, retry, loadImage }: {
+  view: View; tools: TraceTool[]; retry?: Retry; loadImage: LoadAttachmentImage
+}) {
   const scroll = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   useEffect(() => {
@@ -257,7 +265,10 @@ export function Transcript({ view, tools, retry }: { view: View; tools: TraceToo
   const run = view.run?.kind === 'compaction' ? null : view.run
   const promptGroups = view.state.prompt_groups
   const activeGroup = run && promptGroups?.find((group) => group.start === run.base_count)
-  const committed = run ? view.state.messages.slice(0, activeGroup ? activeGroup.end : run.base_count) : view.state.messages
+  const committedInput = run && run.prompt !== null && view.state.messages[run.base_count]?.role === 'user'
+  const committed = run
+    ? view.state.messages.slice(0, activeGroup?.end ?? run.base_count + Number(!!committedInput))
+    : view.state.messages
   const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id && tool.number > 0) : []
   const finished = run?.turn_id
     ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
@@ -279,9 +290,10 @@ export function Transcript({ view, tools, retry }: { view: View; tools: TraceToo
       </div>}
       <Committed messages={committed} tools={tools} turns={turns} retry={retry}
         attachmentRefs={view.state.attachment_refs} promptGroups={promptGroups}
+        sessionId={view.session_id} loadImage={loadImage}
         recoveryTurn={run?.prompt === null && !activeGroup ? run.turn_id : undefined} />
       {run && <>
-        {run.prompt !== null && <UserMessage text={run.prompt}
+        {run.prompt !== null && !committedInput && <UserMessage text={run.prompt}
           attachments={run.attachments?.map((name, index) => ({ id: String(index), name }))} />}
         {requests.map((number) => {
           const message = finished.find((event) => event.data.request_number === number)?.data.response?.choices?.[0]?.message

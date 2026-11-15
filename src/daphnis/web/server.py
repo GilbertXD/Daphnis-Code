@@ -7,15 +7,27 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 
+from python_multipart.exceptions import MultipartParseError
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from ..attachments import MAX_FILES, TextAttachmentInput, TextResourceInput, valid_id
+from ..attachments import (
+    MAX_FILES,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGE_TOTAL_BYTES,
+    MAX_IMAGES,
+    ImageAttachmentInput,
+    TextAttachmentInput,
+    TextResourceInput,
+    valid_id,
+)
 from ..mcp.resources import resource_template, text_resource
 from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..prompt_groups import MAX_PROMPT_MESSAGES, PROMPT_ROLES, PromptInput
@@ -24,7 +36,9 @@ from ..turn_state import RecoveryKind
 
 _MAX_BODY_BYTES = 256 * 1024
 _ATTACHMENT_PATH = "/api/attachments/send"
+_IMAGE_PATH = "/api/attachments/image"
 _MAX_ATTACHMENT_BODY_BYTES = 2 * 1024 * 1024
+_MAX_MULTIPART_BODY_BYTES = MAX_IMAGE_TOTAL_BYTES + _MAX_ATTACHMENT_BODY_BYTES
 _FIELDS = {
     "new": {},
     "project_create": {"name": str, "workspace": (str, type(None))},
@@ -63,6 +77,7 @@ _FIELDS = {
 }
 _RUN_ACTIONS = {"send", "retry", "continue", "terminate", "compact"}
 _PROMPT_ACTIONS = {"mcp_list_prompts", "mcp_get_prompt"}
+_SESSION_SWITCHES = {"new", "project_open", "restore"}
 
 
 class RequestError(ValueError):
@@ -71,15 +86,22 @@ class RequestError(ValueError):
         self.status = status
 
 
+async def _limited_stream(request: Request, limit: int):
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise RequestError("请求过大。", 413)
+        yield chunk
+
+
 async def _command(request: Request):
     if request.headers.get("content-type", "").partition(";")[0] != "application/json":
         raise RequestError("需要 application/json 请求。", 415)
     body = bytearray()
     upload = request.url.path == _ATTACHMENT_PATH
     limit = _MAX_ATTACHMENT_BODY_BYTES if upload else _MAX_BODY_BYTES
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > limit:
-            raise RequestError("请求过大。", 413)
+    async for chunk in _limited_stream(request, limit):
         body.extend(chunk)
     try:
         value = json.loads(body.decode())
@@ -94,9 +116,11 @@ async def _command(request: Request):
         raise RequestError("未知操作。")
     if upload != (action == "send_attachments"):
         raise RequestError("请求地址和操作不匹配。")
+    keep_draft = value.pop("keep_draft_session", False) if action in _SESSION_SWITCHES else False
     fields = _FIELDS[action]
     if (
         not isinstance(session, str) or not 0 < len(session) <= 255
+        or not isinstance(keep_draft, bool)
         or value.keys() != fields.keys()
         or any(not isinstance(value[key], kind) for key, kind in fields.items())
     ):
@@ -126,14 +150,79 @@ async def _command(request: Request):
             raise RequestError("启用 FULL 前需要确认风险。")
         if value["mode"] not in tuple(ApprovalMode):
             raise RequestError("审批模式无效。")
+    if keep_draft:
+        value["keep_draft_session"] = True
     return action, session, value
 
 
-async def _send_attachments(bridge, session, args):
-    prompt = args["prompt"]
-    submission_id = args["submission_id"]
-    entries = tuple(item["resource_id"] if "resource_id" in item else TextAttachmentInput(**item)
-                    for item in args["attachments"])
+async def _multipart_attachments(request: Request):
+    parser = MultiPartParser(
+        request.headers, _limited_stream(request, _MAX_MULTIPART_BODY_BYTES),
+        max_files=MAX_IMAGES, max_fields=4, max_part_size=_MAX_ATTACHMENT_BODY_BYTES,
+    )
+    try:
+        form = await parser.parse()
+    except MultiPartException as exc:
+        status = 413 if exc.message.startswith("Part exceeded") else 400
+        raise RequestError("上传表单无效或超过限制。", status) from None
+    except MultipartParseError:
+        raise RequestError("上传表单无效。") from None
+    try:
+        fields = dict(form.multi_items())
+        if len(form.multi_items()) != len(fields):
+            raise RequestError("上传字段重复。")
+        session = fields.pop("session_id", None)
+        submission = fields.pop("submission_id", None)
+        prompt = fields.pop("prompt", None)
+        manifest = fields.pop("manifest", None)
+        if (
+            not isinstance(session, str) or not 0 < len(session) <= 255 or not valid_id(submission)
+            or not isinstance(prompt, str) or len(prompt.encode()) > _MAX_BODY_BYTES
+            or not isinstance(manifest, str)
+        ):
+            raise RequestError("附件发送字段无效。")
+        try:
+            parts = json.loads(manifest)
+            json.dumps(parts, ensure_ascii=False, allow_nan=False).encode()
+        except (ValueError, RecursionError):
+            raise RequestError("附件清单无效。") from None
+        if not isinstance(parts, list) or not 0 < len(parts) <= MAX_FILES + MAX_IMAGES:
+            raise RequestError("附件清单无效。")
+
+        entries = []
+        image_count = text_count = image_size = 0
+        for index, item in enumerate(parts):
+            if not isinstance(item, dict):
+                raise RequestError("附件清单无效。")
+            match item:
+                case {"kind": "text", "name": str(name), "text": str(text)} if len(item) == 3:
+                    entries.append(TextAttachmentInput(name, text))
+                    text_count += 1
+                case {"kind": "resource", "resource_id": str(resource)} if len(item) == 2 and valid_id(resource):
+                    entries.append(resource)
+                    text_count += 1
+                case {"kind": "image", "name": str(name), "field": str(field)} if len(item) == 3 and field == f"image_{index}":
+                    upload = fields.pop(field, None)
+                    if not isinstance(upload, UploadFile):
+                        raise RequestError("图片二进制字段缺失。")
+                    if upload.size is not None and upload.size > MAX_IMAGE_BYTES:
+                        raise RequestError("每张图片最多 5 MiB。", 413)
+                    data = await upload.read(MAX_IMAGE_BYTES + 1)
+                    image_size += len(data)
+                    if len(data) > MAX_IMAGE_BYTES or image_size > MAX_IMAGE_TOTAL_BYTES:
+                        raise RequestError("单张图片最多 5 MiB，图片总计最多 20 MiB。", 413)
+                    entries.append(ImageAttachmentInput(name, data, upload.content_type or ""))
+                    image_count += 1
+                case _:
+                    raise RequestError("附件清单条目无效。")
+        if fields or not 0 < image_count <= MAX_IMAGES or text_count > MAX_FILES:
+            raise RequestError("附件清单或数量无效。")
+        return session, prompt, submission, tuple(entries)
+    finally:
+        await form.close()
+
+
+async def _send_attachments(bridge, session, prompt, submission_id, entries):
     resource_ids = [item for item in entries if isinstance(item, str)]
     if len(set(resource_ids)) != len(resource_ids):
         raise RequestError("不能重复添加同一份 MCP 资源草稿。")
@@ -232,6 +321,8 @@ async def _execute(bridge, action, session, args, discovery):
         return None
     if bridge.run is not None or ops.running:
         raise RequestError("请先等待或停止当前轮。", 409)
+    if args.get("keep_draft_session") and (action != "restore" or args["id"] != session):
+        await ops.remember_current_session()
     match action:
         case "new":
             await ops.new_session()
@@ -437,6 +528,10 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             token.encode(), candidate.encode(errors="replace")
         )
 
+    def bearer_authenticated(headers):
+        scheme, _, candidate = headers.get("authorization", "").partition(" ")
+        return scheme.lower() == "bearer" and authenticated(candidate)
+
     @asynccontextmanager
     async def lifespan(app):
         bridge = await open_bridge()
@@ -449,14 +544,17 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
     async def command(request: Request):
         if not trusted(request.headers):
             return JSONResponse({"error": "请求来源不受信任。"}, 403)
-        scheme, _, candidate = request.headers.get("authorization", "").partition(" ")
-        if scheme.lower() != "bearer" or not authenticated(candidate):
+        if not bearer_authenticated(request.headers):
             return JSONResponse({"error": "访问令牌无效。"}, 401)
         bridge = request.app.state.bridge
         try:
+            if request.url.path == _ATTACHMENT_PATH and request.headers.get("content-type", "").partition(";")[0].lower() == "multipart/form-data":
+                return await _send_attachments(bridge, *await _multipart_attachments(request))
             action, session, args = await _command(request)
             if action == "send_attachments":
-                return await _send_attachments(bridge, session, args)
+                entries = tuple(item["resource_id"] if "resource_id" in item else TextAttachmentInput(**item)
+                                for item in args["attachments"])
+                return await _send_attachments(bridge, session, args["prompt"], args["submission_id"], entries)
             if action == "mcp_run_prompt":
                 return await _run_prompt(bridge, session, args)
             if action in {"mcp_list_resources", "mcp_read_resource"}:
@@ -491,6 +589,27 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             return JSONResponse({"error": bridge.redactor.text(str(exc))}, 409)
         except Exception as exc:  # noqa: BLE001 - Report a redacted transport failure.
             return JSONResponse({"error": bridge.redactor.text(str(exc))}, 500)
+
+    async def attachment_image(request: Request):
+        headers = request.headers
+        if headers.get("origin", origin) != origin or headers.get("sec-fetch-site", "same-origin") != "same-origin":
+            return JSONResponse({"error": "请求来源不受信任。"}, 403)
+        if not bearer_authenticated(headers):
+            return JSONResponse({"error": "访问令牌无效。"}, 401)
+        params = request.query_params
+        if (
+            len(params.multi_items()) != 3 or params.keys() != {"session_id", "message_index", "attachment_id"}
+            or len(params["session_id"]) > 255 or not valid_id(params["attachment_id"])
+            or not 0 < len(index := params["message_index"]) <= 10 or not index.isascii() or not index.isdecimal()
+        ):
+            return JSONResponse({"error": "图片引用无效。"}, 400)
+        try:
+            data, mime_type = await request.app.state.bridge.ops.read_attachment_image(
+                params["session_id"], int(index), params["attachment_id"],
+            )
+        except FileNotFoundError:
+            return JSONResponse({"error": "图片不可用。"}, 404)
+        return Response(data, media_type=mime_type)
 
     async def events(socket: WebSocket):
         if not trusted(socket.headers):
@@ -541,6 +660,7 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         routes=[
             Route("/api/command", command, methods=["POST"]),
             Route(_ATTACHMENT_PATH, command, methods=["POST"]),
+            Route(_IMAGE_PATH, attachment_image, methods=["GET"]),
             WebSocketRoute("/api/events", events),
             Mount("/", app=StaticFiles(directory=assets, html=True)),
         ],
@@ -553,7 +673,7 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         response.headers.update({
             "Cache-Control": "no-store",
             "Content-Security-Policy": (
-                f"default-src 'none'; script-src 'self'; style-src 'self'; "
+                f"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob:; "
                 f"connect-src 'self' ws://{host}; base-uri 'none'; frame-ancestors 'none'; "
                 "form-action 'none'"
             ),

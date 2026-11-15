@@ -238,6 +238,7 @@ dependencies = [
 
 [package.optional-dependencies]
 web = [
+    { name = "python-multipart" },
     { name = "starlette" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -254,6 +255,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=2,<3" },
     { name = "pillow", specifier = ">=12.3,<14" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
+    { name = "python-multipart", marker = "extra == 'web'", specifier = ">=0.0.33,<1" },
     { name = "saturnus-llm", specifier = "==0.1.1" },
     { name = "starlette", marker = "extra == 'web'", specifier = ">=1.10,<2" },
     { name = "uritemplate", specifier = ">=4.2,<5" },

@@ -6,17 +6,21 @@ import tempfile
 import threading
 import time
 import unittest
+from base64 import b64encode
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from PIL import Image
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from daphnis import History, Operations, Session
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
+from daphnis.attachments import MAX_IMAGE_BYTES, TextResourceInput
 from daphnis.history import SessionLease
 from daphnis.model_io import preview_request
 from daphnis.tool_state import PENDING, TOOL_STATE
@@ -37,6 +41,13 @@ def chunk(delta, finish=None, usage=None):
             **({"usage": usage} if usage else {}),
         }) + "\n\n"
     ).encode()
+
+
+def image_bytes(fmt, color="red"):
+    output = BytesIO()
+    with Image.new("RGB", (16, 24), color) as image:
+        image.save(output, fmt)
+    return output.getvalue()
 
 
 class PausedReply(httpx.AsyncByteStream):
@@ -100,7 +111,8 @@ class WebTests(unittest.TestCase):
             if last.get("content") == "overflow" and not self.overflowed:
                 self.overflowed = True
                 return httpx.Response(400, json={"error": {"code": "context_window_exceeded"}})
-            if last.get("content") == "pause":
+            content = last.get("content")
+            if content == "pause" or (isinstance(content, list) and content[0]["text"].startswith("pause-images")):
                 self.resume = asyncio.Event()
                 return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedReply(
                     chunk({"role": "assistant", "content": "prefix " + API_KEY[:17]}),
@@ -933,7 +945,9 @@ class WebTests(unittest.TestCase):
         self.assertEqual(len(frame["state"]["messages"]), 2)
         self.assertEqual(len(self.requests), 1)
         self.assertIn(marker, self.requests[0]["messages"][-1]["content"])
-        self.assertEqual(frame["state"]["attachment_refs"], {"0": [{"id": item.id, "name": "notes.txt"}]})
+        self.assertEqual(frame["state"]["attachment_refs"], {
+            "0": [{"id": item.id, "name": "notes.txt", "type": "text", "mime_type": "text/plain"}],
+        })
         self.assertNotIn(marker, json.dumps(frame))
 
         oversized_command = self.client.post("/api/command", headers=self.headers, json={
@@ -956,6 +970,156 @@ class WebTests(unittest.TestCase):
         self.assertIn(marker, self.requests[-1]["messages"][-1]["content"])
         self.assert_safe_context(frame, self.requests[-1])
         self.assertNotIn(marker, json.dumps(frame["events"]))
+
+    def test_multipart_images_commit_in_order_and_history_reads_are_scoped(self):
+        session = self.snapshot()["session_id"]
+        resource = TextResourceInput("Remote notes", "resource body", "demo", "notes://test",
+                                     "text/plain", "standalone")
+        resource_id = self.client.portal.call(self.bridge.cache_resource_draft, session, resource)
+        data = {
+            "session_id": session, "submission_id": "b" * 32, "prompt": "pause-images",
+            "manifest": json.dumps([
+                {"kind": "image", "name": "red.png", "field": "image_0"},
+                {"kind": "text", "name": "note.txt", "text": "text body"},
+                {"kind": "resource", "resource_id": resource_id},
+                {"kind": "image", "name": "blue.jpg", "field": "image_3"},
+                {"kind": "image", "name": "green.webp", "field": "image_4"},
+            ]),
+        }
+        images = [
+            ("red.png", image_bytes("PNG"), "image/png"),
+            ("blue.jpg", image_bytes("JPEG", "blue"), "image/jpeg"),
+            ("green.webp", image_bytes("WEBP", "green"), "image/webp"),
+        ]
+        files = dict(zip(("image_0", "image_3", "image_4"), images, strict=True))
+        send_path = "/api/attachments/send"
+        response = self.client.post(send_path, headers=self.headers, data=data, files=files)
+        self.assertEqual(response.status_code, 202, response.text)
+        saved = self.history.load(session)
+        self.assertEqual(saved.messages.get(0), {"role": "user", "content": "pause-images"})
+        items = saved.attachment_refs[0].files
+        self.assertEqual([item.name for item in items], ["red.png", "note.txt", "Remote notes", "blue.jpg", "green.webp"])
+        self.assertEqual(self.history.attachments.read(session, items[2]), "resource body")
+        self.assertEqual(self.client.post(send_path, headers=self.headers, data=data, files=files).status_code, 202)
+        different = {**files, "image_0": ("red.png", image_bytes("PNG", "white"), "image/png")}
+        self.assertEqual(self.client.post(send_path, headers=self.headers, data=data, files=different).status_code, 409)
+        self.assertEqual(self.client.post(
+            send_path, headers=self.headers, data={**data, "submission_id": "c" * 32}, files=files,
+        ).status_code, 409)
+
+        running = self.wait_for(lambda frame: any(e["name"] == "model.request" for e in frame["events"]))
+        self.assertTrue(running["state"]["model"]["supports_image"])
+        self.assertEqual([item["type"] for item in running["state"]["attachment_refs"]["0"]],
+                         ["image", "text", "text", "image", "image"])
+        self.assertEqual(running["state"]["attachment_refs"]["0"][0],
+                         {"id": items[0].id, "name": "red.png", "type": "image",
+                          "mime_type": "image/png", "width": 16, "height": 24})
+        last = self.requests[-1]["messages"][-1]["content"]
+        self.assertIn("text body", last[0]["text"])
+        self.assertIn("resource body", last[0]["text"])
+        for part, (_, raw, mime) in zip(last[1:], images, strict=True):
+            encoded = b64encode(raw).decode()
+            self.assertEqual(part, {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+            self.assertNotIn(encoded, json.dumps(running))
+            self.assertNotIn(encoded, (self.history.directory / f"{session}.json").read_text())
+        self.client.portal.call(self.resume.set)
+        frame = self.wait_for(lambda frame: frame["run"] is None)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(frame["state"]["messages"]), 2)
+        self.assertNotIn("data:image/", json.dumps(frame))
+
+        path = "/api/attachments/image"
+        query = {"session_id": session, "message_index": 0, "attachment_id": items[0].id}
+        same_origin = {"Authorization": "Bearer " + ACCESS, "Sec-Fetch-Site": "same-origin"}
+        self.assertEqual(self.client.get(path, params=query).status_code, 401)
+        self.assertEqual(self.client.get(path, params=query, headers={**same_origin, "Host": "other.test"}).status_code, 403)
+        self.assertEqual(self.client.get(path, params=query, headers={**same_origin, "Origin": "https://other.test"}).status_code, 403)
+        self.assertEqual(self.client.get(path, params=query, headers={**same_origin, "Sec-Fetch-Site": "cross-site"}).status_code, 403)
+        for item, (_, raw, mime) in zip((items[0], *items[3:]), images, strict=True):
+            response = self.client.get(path, params={**query, "attachment_id": item.id}, headers=same_origin)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, raw)
+            self.assertEqual(response.headers["content-type"], mime)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+            self.assertIn("img-src 'self' blob:", response.headers["content-security-policy"])
+        for changes, status in (
+            ({"attachment_id": "../.env"}, 400), ({"attachment_id": "a" * 32}, 404),
+            ({"attachment_id": items[1].id}, 404), ({"message_index": 1}, 404),
+        ):
+            self.assertEqual(self.client.get(path, params={**query, **changes}, headers=same_origin).status_code, status)
+
+        self.command("new", session)
+        other = self.snapshot()["session_id"]
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 404)
+        self.command("restore", other, id=session)
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 200)
+        snapshot = self.history.attachments.directory / session / (items[0].id + ".png")
+        snapshot.chmod(0o600)
+        raw = images[0][1]
+        snapshot.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        snapshot.chmod(0o400)
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 404)
+        snapshot.unlink()
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 404)
+        self.command("delete", session, id=session)
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 404)
+
+    def test_multipart_limits_and_invalid_uploads(self):
+        session = self.snapshot()["session_id"]
+        path = "/api/attachments/send"
+        data = {
+            "session_id": session, "submission_id": "b" * 32, "prompt": "Image",
+            "manifest": json.dumps([{"kind": "image", "name": "file.png", "field": "image_0"}]),
+        }
+        png = image_bytes("PNG")
+        for raw, mime, expected in (
+            (png, "image/jpeg", 409),
+            (png[:-10], "image/png", 409),
+            (b"x" * (MAX_IMAGE_BYTES + 1), "image/png", 413),
+        ):
+            result = self.client.post(path, headers=self.headers, data=data, files={"image_0": ("file.png", raw, mime)})
+            self.assertEqual(result.status_code, expected, result.text)
+        self.assertEqual(self.snapshot()["state"]["messages"], [])
+
+        def oversized_body():
+            yield b'--length-test\r\nContent-Disposition: form-data; name="image_0"; filename="img.png"\r\n\r\n'
+            for _ in range(23):
+                yield b"x" * (1024 * 1024)
+            yield b"\r\n--length-test--\r\n"
+
+        result = self.client.post(path, headers={
+            **self.headers, "Content-Type": "multipart/form-data; boundary=length-test",
+        }, content=oversized_body())
+        self.assertNotIn("Content-Length", result.request.headers)
+        self.assertEqual(result.status_code, 413, result.text)
+        self.assertEqual(self.requests, [])
+        self.command("model", session, provider="deepseek", model_id="deepseek-v4-pro")
+        files = {"image_0": ("file.png", png, "image/png")}
+        result = self.client.post(path, headers=self.headers, data=data, files=files)
+        self.assertEqual(result.status_code, 409, result.text)
+        self.assertEqual(self.snapshot()["state"]["messages"], [])
+
+        self.command("model", session, provider="deepseek", model_id="deepseek-flash")
+        self.command("send", session, 202, prompt="test patch")
+        waiting = self.wait_for(lambda frame: frame["status"]["approval"])
+        self.command("cancel", session, run_id=waiting["run"]["id"])
+        self.wait_for(lambda frame: (frame["state"]["recovery"] or {}).get("kind") == "INTERRUPTED_TURN")
+        result = self.client.post(path, headers=self.headers, data=data, files=files)
+        self.assertEqual(result.status_code, 409, result.text)
+        self.assertEqual(self.history.load(session).attachment_refs, {})
+
+    def test_switch_keeps_unsent_draft_session_restorable_without_saving_attachments(self):
+        session = self.snapshot()["session_id"]
+        self.assertFalse((self.history.directory / f"{session}.json").exists())
+        self.command("project_open", session, project_id=None, keep_draft_session=True)
+        other = self.snapshot()["session_id"]
+        self.assertNotEqual(other, session)
+        saved = self.history.load(session)
+        self.assertEqual(saved.messages.snapshot(), [])
+        self.assertEqual(saved.attachment_refs, {})
+        self.command("restore", other, id=session)
+        self.assertEqual(self.snapshot()["session_id"], session)
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)

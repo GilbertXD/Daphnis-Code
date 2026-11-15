@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 export type Model = {
   id: string
   provider: string
   context_window: number | null
   supports_tools: boolean | null
+  supports_image: boolean | null
   thinking_modes: string[] | null
   configured?: boolean
 }
@@ -194,6 +195,19 @@ export type EventData = {
 export type AgentEvent = { id: number; name: string; turn_id: string; time: number; data: EventData }
 export type LiveText = { content: string; reasoning: string; count: number }
 
+export type AttachmentInfo = {
+  id: string
+  name: string
+  type?: 'text' | 'image'
+  mime_type?: string
+  width?: number
+  height?: number
+}
+
+export type LoadAttachmentImage = (
+  sessionId: string, messageIndex: number, attachmentId: string, signal: AbortSignal,
+) => Promise<Blob>
+
 type State = {
   session: Session
   sessions: Session[]
@@ -207,7 +221,7 @@ type State = {
   history_error: string | null
   messages: Message[]
   prompt_groups: PromptGroup[]
-  attachment_refs?: Record<number, { id: string; name: string }[]>
+  attachment_refs?: Record<number, AttachmentInfo[]>
   recovery: Recovery | null
   model: Model
   models: Model[]
@@ -236,7 +250,7 @@ type Frame = {
 export type View = Omit<Frame, 'state'> & { state: State }
 export type Command = (
   action: string,
-  fields?: Record<string, unknown>,
+  fields?: Record<string, unknown> | FormData,
 ) => Promise<{
   notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer
   mcp_prompts?: MCPPrompt[]; mcp_prompt_result?: MCPPromptResult
@@ -306,21 +320,38 @@ export function useConnection(token: string) {
 
   const command: Command = async (action, fields = {}) => {
     if (!connected || !view) throw new Error('连接中断，请等待重新连接。')
+    const multipart = fields instanceof FormData
+    if (multipart) fields.set('session_id', view.session_id)
     let response: Response
     try {
       response = await fetch(action === 'send_attachments' ? '/api/attachments/send' : '/api/command', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-        body: JSON.stringify({ action, session_id: view.session_id, ...fields }),
+        headers: {
+          Authorization: 'Bearer ' + token,
+          ...(multipart ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: multipart ? fields : JSON.stringify({ action, session_id: view.session_id, ...fields }),
       })
     } catch {
       throw new Error('请求结果未知。请在连接恢复后查看当前状态。')
     }
     const result = await response.json()
     if (!response.ok) throw new Error(result.error || '操作失败。')
+    if (action === 'send_attachments' && response.status !== 202) throw new Error('附件提交结果未知。请重试。')
     return result
   }
-  return { view, connected, error, command }
+  const loadImage: LoadAttachmentImage = useCallback(async (sessionId, messageIndex, attachmentId, signal) => {
+    const query = new URLSearchParams({
+      session_id: sessionId, message_index: String(messageIndex), attachment_id: attachmentId,
+    })
+    const response = await fetch('/api/attachments/image?' + query, {
+      headers: { Authorization: 'Bearer ' + token },
+      mode: 'same-origin', redirect: 'error', cache: 'no-store', signal,
+    })
+    if (!response.ok) throw new Error('图片不可用')
+    return response.blob()
+  }, [token])
+  return { view, connected, error, command, loadImage }
 }
 
 export function sessionTitle(session: Session) {
