@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -10,8 +11,14 @@ from typing import Any
 import httpx2
 
 from .mcp import MCPConnection
+from .redaction import Redactor
 
-_OPTIONS = {"transport", "command", "args", "cwd", "env", "url", "auth"}
+_OPTIONS = {"transport", "command", "args", "cwd", "env", "url", "auth", "public_only"}
+_CREDENTIAL_FLAG = re.compile(
+    r"--?(?:api[-_]key|token|access[-_]token|bearer[-_]token|password|client[-_]secret|authorization)(?:=|$)",
+    re.IGNORECASE,
+)
+_REDACTOR = Redactor(())
 
 
 @dataclass(frozen=True)
@@ -20,20 +27,26 @@ class MCPServerConfig:
     enabled: bool
     options: dict[str, Any]
 
-    def connection(self) -> MCPConnection:
+    def connection(self, redactor: Redactor = _REDACTOR) -> MCPConnection:
         if type(self.enabled) is not bool or self.options.keys() - _OPTIONS:
             raise ValueError("MCP 服务配置字段无效。")
         connection = MCPConnection(self.name, **self.options)
         if (url := self.options.get("url")) and b"?" in httpx2.URL(url).raw_path:
             raise ValueError("保存的 MCP URL 不能包含查询参数，请通过环境变量配置认证。")
+        args = self.options.get("args", [])
+        values = [*args, self.options.get("command"), self.options.get("cwd"), url]
+        if any(_CREDENTIAL_FLAG.match(arg) for arg in args) or any(
+            value is not None and redactor.text(str(value)) != str(value) for value in values
+        ):
+            raise ValueError("请通过环境变量引用提供 MCP 凭据。")
         return connection
 
     @classmethod
-    def from_json(cls, name: str, value: Any) -> "MCPServerConfig":
+    def from_json(cls, name: str, value: Any, redactor: Redactor = _REDACTOR) -> "MCPServerConfig":
         if not isinstance(value, dict) or value.keys() != {"enabled", "options"} or not isinstance(value["options"], dict):
             raise ValueError("MCP 服务配置格式无效。")
         config = cls(name, value["enabled"], value["options"])
-        config.connection()
+        config.connection(redactor)
         return config
 
 

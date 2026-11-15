@@ -31,6 +31,7 @@ export type MCPOptions = {
   env?: Record<string, string>
   url?: string
   auth?: { type: 'bearer'; env: string }
+  public_only?: boolean
 }
 
 export type MCPServer = {
@@ -41,6 +42,28 @@ export type MCPServer = {
   tool_count: number
   error: string | null
 }
+
+export type RegistryRemote = {
+  transport: string
+  url: string
+  auth: 'none' | 'bearer' | 'unsupported'
+  reason: string | null
+}
+
+export type RegistryServer = {
+  name: string
+  version: string
+  publisher: string
+  title: string
+  description: string
+  repository: string
+  source: string
+  status: string
+  remotes: RegistryRemote[]
+  packages: { type: string; identifier: string; version: string }[]
+}
+
+export type RegistryPage = { servers: RegistryServer[]; cursor: string | null }
 
 type HistoryIssue = { filename: string; error: string }
 
@@ -163,7 +186,7 @@ export type View = Omit<Frame, 'state'> & { state: State }
 export type Command = (
   action: string,
   fields?: Record<string, unknown>,
-) => Promise<{ notice: string | null; revision: number }>
+) => Promise<{ notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer }>
 
 export function useConnection(token: string) {
   const [view, setView] = useState<View | null>(null)

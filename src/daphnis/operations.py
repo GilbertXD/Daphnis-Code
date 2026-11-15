@@ -244,6 +244,7 @@ class Operations:
         transport: str = "stdio",
         url: str | None = None,
         auth: Mapping[str, str] | None = None,
+        public_only: bool = False,
     ) -> None:
         """Connect an explicitly configured server."""
         await self._app._connect_mcp(
@@ -256,6 +257,7 @@ class Operations:
                 transport=transport,
                 url=url,
                 auth=auth,
+                public_only=public_only,
             )
         )
 
@@ -295,7 +297,9 @@ class Operations:
                 for name, options in load_mcp_config(path).items():
                     if isinstance(options.get("cwd"), Path):
                         options["cwd"] = str(options["cwd"])
-                    configs[name] = MCPServerConfig.from_json(name, {"enabled": True, "options": options})
+                    configs[name] = MCPServerConfig.from_json(
+                        name, {"enabled": True, "options": options}, app._history_redactor,
+                    )
                 store.write(configs)
 
     async def save_mcp(
@@ -315,8 +319,11 @@ class Operations:
                     raise ValueError("MCP 服务不存在。")
                 if options is None and current is None:
                     raise ValueError("请提供 MCP 服务配置。")
-                config = MCPServerConfig(name, enabled, deepcopy(options if options is not None else current.options))
-                connection = config.connection()
+                options = deepcopy(options if options is not None else current.options)
+                if current and current.options.get("public_only"):
+                    options["public_only"] = True
+                config = MCPServerConfig(name, enabled, options)
+                connection = config.connection(app._history_redactor)
                 if config == current:
                     return None
                 configs[name] = config

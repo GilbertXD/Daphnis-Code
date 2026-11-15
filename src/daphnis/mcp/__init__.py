@@ -26,6 +26,7 @@ from mcp.types import (
 )
 
 from ..terminal_text import sanitize_terminal
+from .public_http import public_transport, public_url
 
 logger = logging.getLogger(__name__)
 TOOL_PREFIX = "mcp__"
@@ -198,6 +199,7 @@ class MCPConnection:
         transport: str = "stdio",
         url: str | None = None,
         auth: Mapping[str, str] | None = None,
+        public_only: bool = False,
     ) -> None:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,20}", name):
             raise ValueError("MCP Server 名称须为 1–20 位字母、数字或连字符。")
@@ -235,6 +237,11 @@ class MCPConnection:
         self._command, self._args, self._cwd = command, tuple(args), cwd
         self._env = dict(env or {})
         self._url = _http_url(url) if transport == "streamable_http" else None
+        if type(public_only) is not bool or (public_only and self._url is None):
+            raise ValueError("在线发现的 MCP 服务须使用 Streamable HTTP。")
+        if public_only:
+            public_url(self._url)
+        self._public_only = public_only
         if auth is not None and (
             not isinstance(auth, Mapping)
             or set(auth) != {"type", "env"}
@@ -366,9 +373,10 @@ class MCPConnection:
         async def check_response(response):
             status = response.status_code
             if status in (401, 403):
+                suffix = "在线发现仅支持 Bearer Token。" if self._public_only else ""
                 self._http_error = (
                     "mcp_auth_failed",
-                    f"MCP 认证失败（HTTP {status}）。",
+                    f"MCP 认证失败（HTTP {status}）。{suffix}",
                 )
             elif response.is_redirect:
                 self._http_error = (
@@ -380,10 +388,16 @@ class MCPConnection:
             # Stop before the SDK can follow or log a server-controlled Location.
             raise httpx2.RequestError(self._http_error[1])
 
+        try:
+            transport = await public_transport(self._url) if self._public_only else None
+        except ValueError as exc:
+            raise _MCPConfigError(str(exc)) from None
+
         async with (
             httpx2.AsyncClient(
                 timeout=httpx2.Timeout(8, read=300),
                 trust_env=False,
+                transport=transport,
                 event_hooks={"request": [authorize], "response": [check_response]},
             ) as http,
             streamable_http_client(str(self._url), http_client=http) as (read, write),

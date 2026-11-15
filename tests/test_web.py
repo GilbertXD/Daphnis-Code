@@ -516,6 +516,8 @@ class WebTests(unittest.TestCase):
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
             "env": {"DEMO_TOKEN": "PATH"},
         }
+        self.command("mcp_save", sid, 409, name="demo", enabled=False, create=True,
+                     options={"transport": "streamable_http", "url": f"https://mcp.example/{API_KEY}"})
         self.command("mcp_save", sid, name="demo", enabled=False, options=options, create=True)
         (server,) = self.snapshot()["state"]["mcp_servers"]
         self.assertFalse(server["enabled"])

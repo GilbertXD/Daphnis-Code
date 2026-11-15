@@ -14,6 +14,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..tools.approval import ApprovalMode
 from ..turn_state import RecoveryKind
 
@@ -35,6 +36,9 @@ _FIELDS = {
     "mcp_enable": {"name": str, "enabled": bool},
     "mcp_restart": {"name": str},
     "mcp_delete": {"name": str},
+    "registry_search": {"query": str, "cursor": (str, type(None))},
+    "registry_detail": {"registry_name": str, "version": str},
+    "mcp_add_registry": {"name": str, "registry_name": str, "version": str, "url": str, "auth_env": (str, type(None))},
     "set_approval_mode": {"mode": str},
     "confirm_full": {},
     "send": {"prompt": str},
@@ -98,7 +102,7 @@ async def _command(request: Request):
     return action, session, value
 
 
-async def _execute(bridge, action, session, args):
+async def _execute(bridge, action, session, args, discovery):
     ops = bridge.ops
     if ops.session.id != session:
         raise RequestError("当前会话已切换，请重新操作。", 409)
@@ -158,6 +162,22 @@ async def _execute(bridge, action, session, args):
             return await ops.restart_mcp(args["name"])
         case "mcp_delete":
             await ops.delete_mcp(args["name"])
+        case "mcp_add_registry":
+            server = await discovery.detail(args["registry_name"], args["version"])
+            remote = next((item for item in server["remotes"] if (
+                item["url"] == args["url"] and item["auth"] != "unsupported"
+            )), None)
+            if server["status"] != "active" or remote is None:
+                raise RequestError("该地址无法通过在线发现添加。")
+            auth_env = args["auth_env"]
+            if remote["auth"] == "bearer" and not auth_env:
+                raise RequestError("请填写 Bearer Token 环境变量名。")
+            options = {
+                "transport": "streamable_http", "url": remote["url"], "public_only": True,
+            }
+            if auth_env:
+                options["auth"] = {"type": "bearer", "env": auth_env}
+            return await ops.save_mcp(args["name"], enabled=True, options=options, create=True)
         case "set_approval_mode":
             ops.set_approval_mode(args["mode"])
         case "confirm_full":
@@ -183,6 +203,7 @@ async def _execute(bridge, action, session, args):
 def create_app(open_bridge, *, token: str, port: int, assets: Path):
     host = f"127.0.0.1:{port}"
     origin = f"http://{host}"
+    discovery = RegistryDiscovery()
 
     def trusted(headers):
         return headers.get("host") == host and headers.get("origin") == origin
@@ -210,13 +231,19 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         bridge = request.app.state.bridge
         try:
             action, session, args = await _command(request)
+            if action in {"registry_search", "registry_detail"}:
+                if bridge.ops.session.id != session:
+                    raise RequestError("当前会话已切换，请重新操作。", 409)
+                if action == "registry_search":
+                    return JSONResponse({"registry_page": await discovery.search(args["query"], args["cursor"])})
+                return JSONResponse({"registry_server": await discovery.detail(args["registry_name"], args["version"])})
             if action in {"approve", "cancel"}:
-                notice = await _execute(bridge, action, session, args)
+                notice = await _execute(bridge, action, session, args, discovery)
             else:
                 if bridge.lock.locked():
                     raise RequestError("正在更新会话，请稍后重试。", 409)
                 async with bridge.lock:
-                    notice = await _execute(bridge, action, session, args)
+                    notice = await _execute(bridge, action, session, args, discovery)
             bridge._notify(state=action not in _RUN_ACTIONS | {"cancel", "approve"})
             return JSONResponse(
                 {"notice": bridge.redactor.json(notice), "revision": bridge.revision},
@@ -224,6 +251,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             )
         except RequestError as exc:
             return JSONResponse({"error": str(exc)}, exc.status)
+        except RegistryError as exc:
+            return JSONResponse({"error": str(exc)}, 502)
         except FileNotFoundError:
             return JSONResponse({"error": "会话不存在。"}, 404)
         except (RuntimeError, ValueError, TypeError) as exc:

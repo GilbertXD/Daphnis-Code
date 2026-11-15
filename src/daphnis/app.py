@@ -271,9 +271,11 @@ class Application:
                             enabled_tools=(*self._session.enabled_tools, *discovered),
                         )
                         await finish_io(self._save_and_publish_session(session))
-                except (SessionBusyError, SessionConflictError, asyncio.CancelledError):
+                except (SessionBusyError, SessionConflictError, asyncio.CancelledError) as exc:
                     connection.tools = previous_tools
                     await finish_io(connection.aclose())
+                    if not isinstance(exc, asyncio.CancelledError):
+                        connection.state, connection.error = "Error", "无法保存 MCP 工具启用偏好。"
                     raise
                 except (OSError, TypeError, ValueError):
                     error = "无法保存 MCP 工具启用偏好。"
