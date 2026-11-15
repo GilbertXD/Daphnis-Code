@@ -4,21 +4,16 @@ import { createRoot } from 'react-dom/client'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, ApprovalMode, Command, Model, Project, Session, View } from './protocol'
+import type { Approval, Command, Model, Project, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
 const tokenKey = 'daphnis.access'
 const modelKey = (model: Model) => JSON.stringify([model.provider, model.id])
 const sessionActions = [
-  ['rename', '重命名'], ['move', '移动到项目'], ['delete', '删除'],
+  ['rename', '重命名'], ['move', '移动'], ['delete', '删除'],
 ] as const
 type SessionAction = (typeof sessionActions)[number][0]
-const approvalModeText: Record<ApprovalMode, string> = {
-  ask: '每次工具调用都需确认。',
-  auto: '低风险操作自动执行，其余按规则审批，可授予会话信任。',
-  full: '允许读取敏感文件并自动执行工具。新建会话或重启后恢复 AUTO。',
-}
 
 function Dialog({ title, close, children }: { title: string; close: () => void; children: ReactNode }) {
   const dialog = useRef<HTMLDialogElement>(null)
@@ -46,10 +41,23 @@ function Sidebar({ projects, sessions, selected, disabled, visible, projectsErro
   onEdit: (action: SessionAction, session: Session) => void
 }) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set())
+  const sessionList = useRef<HTMLElement>(null)
   const selectedRow = useRef<HTMLDivElement>(null)
   useEffect(() => {
     selectedRow.current?.scrollIntoView({ block: 'nearest' })
   }, [selected, visible])
+  useEffect(() => {
+    function closeMenusOnOutsideClick(event: MouseEvent) {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      sessionList.current?.querySelectorAll<HTMLDetailsElement>('.session-menu[open]').forEach((menu) => {
+        if (!menu.contains(target)) menu.open = false
+      })
+    }
+
+    document.addEventListener('click', closeMenusOnOutsideClick, true)
+    return () => document.removeEventListener('click', closeMenusOnOutsideClick, true)
+  }, [])
   const groups: { id?: string | null; name: string; workspace?: string; sessions: Session[] }[] = [
     { id: null, name: '无项目', sessions: sessions.filter((session) => session.project_id === null) },
     ...projects.map((project) => ({
@@ -76,17 +84,14 @@ function Sidebar({ projects, sessions, selected, disabled, visible, projectsErro
     {projectsError && <p className="history-notice" role="alert">{projectsError}</p>}
     {historyError && <p className="history-notice" role="alert">{historyError}</p>}
     {historyIssueCount > 0 && <p className="history-notice muted" role="status">{historyIssueCount} 个历史会话无法加载。</p>}
-    <nav>
+    <nav ref={sessionList}>
       {groups.map(({ id, name, workspace, sessions }) => {
         const key = id === null ? 'personal' : id ?? 'unlisted'
         const expanded = !collapsedGroups.has(key)
         return <section className="session-group" key={key} aria-label={name}>
           <div className="session-group-heading">
             <h3><button className="session-group-toggle" type="button" title={workspace}
-              aria-expanded={expanded} onClick={() => {
-                toggleGroup(key)
-                if (!expanded && typeof id === 'string' && !disabled) onNew(id)
-              }}>
+              aria-expanded={expanded} onClick={() => toggleGroup(key)}>
               <span aria-hidden="true">{expanded ? '▾' : '▸'}</span><span>{name}</span>
             </button></h3>
             {id !== undefined && <button className="icon" type="button" onClick={() => {
@@ -410,7 +415,7 @@ function Workspace({ view, connected, command }: {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
               }}>系统提示词</button>
-              <select aria-label="工具审批模式" aria-describedby="approval-mode-description"
+              <select aria-label="工具审批模式"
                 value={state.approval_mode} disabled={disabled}
                 onChange={(event) => {
                   const mode = event.currentTarget.value
@@ -432,7 +437,6 @@ function Workspace({ view, connected, command }: {
               : <button className="primary send" type="submit" disabled={disabled || interrupted || !draft.trim()}
                 aria-label="发送" title="发送 · Ctrl / ⌘ + Enter">↑</button>}
           </div>
-          <p id="approval-mode-description" className="approval-mode-description muted">{approvalModeText[state.approval_mode]}</p>
         </form>
       </div>
     </main>
