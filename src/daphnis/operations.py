@@ -12,6 +12,7 @@ from saturnus import ValidationError
 from .attachments import (
     ATTACHMENT_ONLY_PROMPT,
     TextAttachmentInput,
+    TextResourceInput,
     prepare_attachments,
 )
 from .compaction import CompactionCheckpoint
@@ -19,6 +20,7 @@ from .config import load_mcp_config
 from .events import Callback
 from .history import SessionLease, finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
+from .mcp.resources import expand_resource_template
 from .mcp_store import MCPServerConfig
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .project import Project
@@ -28,7 +30,7 @@ from .tools import ApprovalDecision, ApprovalMode
 from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
 
 if TYPE_CHECKING:
-    from mcp.types import GetPromptResult, Prompt
+    from mcp.types import GetPromptResult, Prompt, Resource, ResourceTemplate
 
     from .agent import TurnResult
     from .app import Application
@@ -388,6 +390,29 @@ class Operations:
             if server.available
             for tool in server.tools
         )
+
+    def list_mcp_resource_servers(self) -> tuple[str, ...]:
+        return tuple(server.name for server in self._app._mcp.values() if server.supports_resources)
+
+    async def list_mcp_resources(self, server: str) -> "tuple[Resource, ...]":
+        return await self._app._mcp_resource_connection(server).list_resources()
+
+    async def list_mcp_resource_templates(self, server: str) -> "tuple[ResourceTemplate, ...]":
+        return await self._app._mcp_resource_connection(server).list_resource_templates()
+
+    async def read_mcp_resource(
+        self, server: str, uri: str, arguments: dict[str, str] | None = None,
+    ) -> tuple[TextResourceInput, ...]:
+        connection = self._app._mcp_resource_connection(server)
+        if arguments is None:
+            entry = next((item for item in await connection.list_resources() if str(item.uri) == uri), None)
+            target = uri
+        else:
+            entry = next((item for item in await connection.list_resource_templates() if item.uri_template == uri), None)
+            target = expand_resource_template(uri, arguments)
+        if entry is None:
+            raise ValueError("未找到该 MCP 资源，请刷新目录。")
+        return await connection.read_resource(target, name=entry.title or entry.name, mime_type=entry.mime_type)
 
     def list_mcp_prompt_servers(self) -> tuple[str, ...]:
         return tuple(server.name for server in self._app._mcp.values() if server.supports_prompts)

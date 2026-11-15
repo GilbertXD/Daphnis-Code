@@ -13,7 +13,7 @@ import httpx
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
-from daphnis.mcp import MCPConnection, MCPPromptError
+from daphnis.mcp import MCPConnection, MCPPromptError, MCPResourceError
 from daphnis.runtime import open_operations
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
@@ -90,6 +90,48 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ops.list_sessions(), ())
             finally:
                 await ops.close()
+
+    async def test_resources_use_catalog_templates_and_text_only_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plain = root / "plain"
+            plain.mkdir()
+            (root / "resources").touch()
+            ops = Operations(Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash",
+                connections={"deepseek": {"base_url": "https://model.test"}},
+                history=History(root / "sessions"),
+            ))
+            self.addAsyncCleanup(ops.close)
+            await ops.connect_mcp("demo", sys.executable, [str(DEMO), str(root)])
+            await ops.connect_mcp("plain", sys.executable, [str(DEMO), str(plain)])
+            self.assertEqual(ops.list_mcp_resource_servers(), ("demo",))
+            with self.assertRaisesRegex(MCPResourceError, "不支持资源"):
+                await ops.list_mcp_resources("plain")
+            resources = await ops.list_mcp_resources("demo")
+            self.assertEqual(len(resources), 6)
+            templates = await ops.list_mcp_resource_templates("demo")
+            template = templates[0].uri_template
+            item, = await ops.read_mcp_resource("demo", template, {"name": "中文/a ?%"})
+            self.assertEqual(item.uri, "notes://pages/%E4%B8%AD%E6%96%87%2Fa%20%3F%25")
+            with self.assertRaisesRegex(ValueError, "模板参数"):
+                await ops.read_mcp_resource("demo", template, {"wrong": "a"})
+            item, = await ops.read_mcp_resource("demo", "notes://architecture")
+            self.assertEqual((item.name, item.mime_type), ("Architecture", "text/markdown"))
+            self.assertEqual(len(await ops.read_mcp_resource("demo", "notes://bundle")), 2)
+            for name, error in (("blob", "Blob"), ("fail", "响应无效"), ("bad-mime", "MIME")):
+                with self.subTest(name=name), self.assertRaisesRegex(MCPResourceError, error):
+                    await ops.read_mcp_resource("demo", f"notes://{name}")
+            with patch("daphnis.mcp._RESOURCE_TIMEOUT", 0.15), self.assertRaisesRegex(MCPResourceError, "超时"):
+                await ops.read_mcp_resource("demo", "notes://slow")
+            with self.assertRaisesRegex(ValueError, "未找到"):
+                await ops.read_mcp_resource("demo", "file:///not-in-catalog")
+            (root / "resource-cursor").touch()
+            with self.assertRaisesRegex(MCPResourceError, "Cursor"):
+                await ops.list_mcp_resources("demo")
+            await ops.disconnect_mcp("demo")
+            with self.assertRaisesRegex(MCPResourceError, "未连接"):
+                await ops.list_mcp_resources("demo")
 
     async def test_runtime_persists_and_restores_mcp_with_isolated_connection_failures(self):
         with tempfile.TemporaryDirectory() as directory:

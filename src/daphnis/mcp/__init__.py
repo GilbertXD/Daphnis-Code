@@ -1,4 +1,4 @@
-"""MCP tools and prompts over SDK transports."""
+"""MCP tools, prompts and resources over SDK transports."""
 
 import asyncio
 import json
@@ -22,13 +22,22 @@ from mcp.types import (
     GetPromptResult,
     PingRequest,
     Prompt,
+    Resource,
+    ResourceTemplate,
     TextContent,
     Tool,
     ToolListChangedNotification,
 )
 
+from ..attachments import (
+    MAX_FILES,
+    MAX_TOTAL_BYTES,
+    TextResourceInput,
+    validate_resource_uri,
+)
 from ..terminal_text import sanitize_terminal
 from .public_http import public_transport, public_url
+from .resources import text_resource, validate_resource_batch
 
 logger = logging.getLogger(__name__)
 TOOL_PREFIX = "mcp__"
@@ -39,6 +48,10 @@ _PROMPT_TIMEOUT = 10
 _PROMPT_BYTES = 65_536
 _PROMPT_PAGES = 32
 _PROMPT_FIELDS = 64
+_RESOURCE_TIMEOUT = 10
+_RESOURCE_PAGES = 32
+_RESOURCE_COUNT = 512
+_RESOURCE_RESULT_BYTES = 2 * MAX_TOTAL_BYTES + 64 * 1024
 _HTTP_HEALTH_INTERVAL = 15
 _HTTP_HEALTH_TIMEOUT = 5
 _STDERR_LIMIT = 16 * 1024
@@ -139,6 +152,10 @@ class MCPStatus:
 
 class MCPPromptError(RuntimeError):
     """A safe diagnostic for a failed prompt request."""
+
+
+class MCPResourceError(RuntimeError):
+    """A safe diagnostic for a failed resource request."""
 
 
 def _valid_prompt_name(name: str) -> bool:
@@ -316,6 +333,11 @@ class MCPConnection:
         client = self._client
         return self.available and client is not None and client.server_capabilities.prompts is not None
 
+    @property
+    def supports_resources(self) -> bool:
+        client = self._client
+        return self.available and client is not None and client.server_capabilities.resources is not None
+
     def _can_publish(self) -> bool:
         return self.state == "Connecting" and self._live
 
@@ -422,7 +444,8 @@ class MCPConnection:
             if response.request.method == "POST":
                 with suppress(ValueError, httpx2.RequestNotRead):
                     method = json.loads(response.request.content).get("method")
-                    if method in {"prompts/list", "prompts/get"}:
+                    if method in {"prompts/list", "prompts/get", "resources/list",
+                                  "resources/templates/list", "resources/read"}:
                         # Let the SDK reject just this request without following a redirect.
                         response.status_code = 403
                         response.headers.pop("Location", None)
@@ -502,28 +525,88 @@ class MCPConnection:
             seen_cursors.add(cursor)
 
     @asynccontextmanager
-    async def _prompt_request(self) -> AsyncIterator[Client]:
+    async def _read_request(self, capability: str) -> AsyncIterator[Client]:
         client = self._client
+        prompts = capability == "prompts"
+        error = MCPPromptError if prompts else MCPResourceError
+        label = "模板" if prompts else "资源"
         if not self.available or client is None:
-            raise MCPPromptError("MCP 连接不可用。")
-        if client.server_capabilities.prompts is None:
-            raise MCPPromptError("此 MCP 服务不支持模板。")
+            raise error("MCP 连接不可用。")
+        if getattr(client.server_capabilities, capability) is None:
+            raise error(f"此 MCP 服务不支持{label}。")
         try:
-            async with asyncio.timeout(_PROMPT_TIMEOUT):
+            async with asyncio.timeout(_PROMPT_TIMEOUT if prompts else _RESOURCE_TIMEOUT):
                 yield client
         except TimeoutError:
-            raise MCPPromptError("MCP 模板请求超时。") from None
-        except MCPPromptError:
+            raise error(f"MCP {label}请求超时。") from None
+        except (MCPPromptError, MCPResourceError):
             raise
         except Exception:  # noqa: BLE001 - SDK failures may contain server data or user arguments.
             if not self.available or self._client is not client:
-                raise MCPPromptError("MCP 连接已中断。") from None
-            raise MCPPromptError("MCP 模板请求失败或响应无效。") from None
+                raise error("MCP 连接已中断。") from None
+            raise error(f"MCP {label}请求失败或响应无效。") from None
         if not self.available or self._client is not client:
-            raise MCPPromptError("MCP 连接已中断。")
+            raise error("MCP 连接已中断。")
+
+    async def _list_resources(self, *, templates: bool):
+        async with self._read_request("resources") as client:
+            fetch = client.list_resource_templates if templates else client.list_resources
+            items = {}
+            cursor = None
+            seen = set()
+            remaining = 128 * 1024
+            for _ in range(_RESOURCE_PAGES):
+                page = await fetch(cursor=cursor, cache_mode="bypass")
+                size = _json_size(page.model_dump(mode="json", by_alias=True), remaining)
+                if size is None:
+                    raise MCPResourceError("MCP 资源目录超出大小上限。")
+                remaining -= size
+                if page.result_type != "complete":
+                    raise MCPResourceError("MCP 资源目录响应无效。")
+                entries = page.resource_templates if templates else page.resources
+                if len(items) + len(entries) > _RESOURCE_COUNT:
+                    raise MCPResourceError("MCP 资源目录超出条目上限。")
+                for entry in entries:
+                    identifier = entry.uri_template if templates else str(entry.uri)
+                    if not templates:
+                        validate_resource_uri(identifier)
+                    if identifier in items:
+                        raise MCPResourceError("MCP 资源目录包含重复标识。")
+                    items[identifier] = entry
+                cursor = page.next_cursor
+                if cursor is None:
+                    return tuple(items.values())
+                if cursor in seen or len(cursor) > 2048:
+                    raise MCPResourceError("MCP 资源目录分页 Cursor 无效或重复。")
+                seen.add(cursor)
+            raise MCPResourceError("MCP 资源目录超出分页上限。")
+
+    async def list_resources(self) -> tuple[Resource, ...]:
+        return await self._list_resources(templates=False)
+
+    async def list_resource_templates(self) -> tuple[ResourceTemplate, ...]:
+        return await self._list_resources(templates=True)
+
+    async def read_resource(self, uri: str, *, name="", mime_type=None) -> tuple[TextResourceInput, ...]:
+        validate_resource_uri(uri)
+        async with self._read_request("resources") as client:
+            result = await client.session.read_resource(uri)
+            if (not 0 < len(result.contents) <= MAX_FILES
+                or _json_size(result.model_dump(mode="json", by_alias=True), _RESOURCE_RESULT_BYTES) is None):
+                raise MCPResourceError("MCP 资源内容超出上限，或响应为空。")
+            try:
+                resources = tuple(
+                    text_resource(self.name, content, "standalone", name=name if str(content.uri) == uri else "",
+                                  mime_type=mime_type if str(content.uri) == uri else None)
+                    for content in result.contents
+                )
+                validate_resource_batch(resources)
+            except (TypeError, ValueError) as exc:
+                raise MCPResourceError(str(exc)) from None
+            return resources
 
     async def list_prompts(self) -> tuple[Prompt, ...]:
-        async with self._prompt_request() as client:
+        async with self._read_request("prompts") as client:
             prompts: dict[str, Prompt] = {}
             cursor = None
             seen_cursors: set[str] = set()
@@ -555,7 +638,7 @@ class MCPConnection:
 
     async def get_prompt(self, name: str, arguments: dict[str, str]) -> GetPromptResult:
         validate_prompt_request(name, arguments)
-        async with self._prompt_request() as client:
+        async with self._read_request("prompts") as client:
             # Do not drive server-requested sampling, elicitation, or additional input.
             result = await client.session.get_prompt(name, arguments)
             if result.result_type != "complete" or not result.messages:

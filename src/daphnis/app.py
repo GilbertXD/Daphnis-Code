@@ -29,7 +29,7 @@ from .history import (
     SessionLease,
     finish_io,
 )
-from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError
+from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError, MCPResourceError
 from .mcp_store import MCPStore
 from .model_io import ObservedChatClient
 from .models import (
@@ -226,6 +226,15 @@ class Application:
             raise MCPPromptError("MCP 服务未连接。")
         if not connection.supports_prompts:
             raise MCPPromptError("此 MCP 服务不支持模板。")
+        return connection
+
+    def _mcp_resource_connection(self, server: str) -> MCPConnection:
+        self._ensure_open()
+        connection = self._mcp.get(server) if isinstance(server, str) else None
+        if connection is None or not connection.available:
+            raise MCPResourceError("MCP 服务未连接。")
+        if not connection.supports_resources:
+            raise MCPResourceError("此 MCP 服务不支持资源。")
         return connection
 
     def _mcp_catalog(self, connecting: MCPConnection | None = None) -> ToolExecutor:

@@ -9,15 +9,22 @@ from mcp import MCPError
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
+    BlobResourceContents,
     CallToolResult,
     GetPromptResult,
     ImageContent,
     ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
     ListToolsResult,
     Prompt,
     PromptArgument,
     PromptMessage,
+    ReadResourceResult,
+    Resource,
+    ResourceTemplate,
     TextContent,
+    TextResourceContents,
     Tool,
 )
 
@@ -107,6 +114,44 @@ async def get_prompt(ctx, params):
     )
 
 
+async def list_resources(ctx, params):
+    if (root / "resource-cursor").exists():
+        return ListResourcesResult(resources=[], next_cursor="loop")
+    if not params or not params.cursor:
+        return ListResourcesResult(resources=[
+            Resource(name="Architecture", uri="notes://architecture", mime_type="text/markdown"),
+        ], next_cursor="remaining")
+    return ListResourcesResult(resources=[
+        Resource(name=name, uri=f"notes://{name}") for name in ("bundle", "blob", "slow", "fail", "bad-mime")
+    ])
+
+
+async def list_resource_templates(ctx, params):
+    return ListResourceTemplatesResult(resource_templates=[
+        ResourceTemplate(name="Note", uri_template="notes://pages/{name}", mime_type="text/plain")
+    ])
+
+
+async def read_resource(ctx, params):
+    uri = str(params.uri)
+    with (root / "resource-reads").open("a") as log:
+        log.write(uri + "\n")
+    if uri == "notes://slow":
+        await asyncio.sleep(60)
+    if uri == "notes://fail":
+        raise MCPError(-32602, "fixture upstream error")
+    if uri == "notes://blob":
+        return ReadResourceResult(contents=[BlobResourceContents(uri=uri, mime_type="image/png", blob="AA==")])
+    if uri == "notes://bundle":
+        return ReadResourceResult(contents=[
+            TextResourceContents(uri="notes://bundle/a", text="first"),
+            TextResourceContents(uri="notes://bundle/b", mime_type="application/json", text='{"second":true}'),
+        ])
+    mime_type = "image/png" if uri == "notes://bad-mime" else None
+    text = (root / "resource-text").read_text() if (root / "resource-text").exists() else uri
+    return ReadResourceResult(contents=[TextResourceContents(uri=uri, text=text, mime_type=mime_type)])
+
+
 async def main():
     if any(name in os.environ for name in ("LLM_API_KEY", "MIMO_API_KEY")):
         raise RuntimeError("Parent API keys reached the MCP process.")
@@ -127,6 +172,7 @@ async def main():
     if (root / "stderr-stall").exists():
         await asyncio.Event().wait()
     supports_prompts = (root / "prompts").exists()
+    supports_resources = (root / "resources").exists()
     tools_enabled = not (root / "prompts-only").exists()
     server = Server(
         "demo",
@@ -135,6 +181,9 @@ async def main():
         get_tool_input_schema=lambda name: (
             tools[name].input_schema if name in tools else None
         ),
+        on_list_resources=list_resources if supports_resources else None,
+        on_list_resource_templates=list_resource_templates if supports_resources else None,
+        on_read_resource=read_resource if supports_resources else None,
         on_list_prompts=list_prompts if supports_prompts else None,
         on_get_prompt=get_prompt if supports_prompts else None,
     )
