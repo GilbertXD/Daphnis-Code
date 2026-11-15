@@ -15,7 +15,10 @@ from saturnus import ChatClient
 from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
     ATTACHMENT_ONLY_PROMPT,
+    IMAGE_ATTACHMENT_ONLY_PROMPT,
     AttachmentBatch,
+    AttachmentInput,
+    ImageAttachmentInput,
     TextAttachmentInput,
     TextResourceInput,
     prepare_attachments,
@@ -41,6 +44,7 @@ from .models import (
     resolve_model,
 )
 from .models.models import validate_catalog
+from .models.requests import require_image_input
 from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
@@ -432,11 +436,13 @@ class Application:
         self, prompt: str | None = None, *, stream: bool = True,
         recovery_action: RecoveryAction | None = None, recovery_key: str | None = None,
         prompt_input: PromptInput | None = None,
-        attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
+        attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
         self._ensure_idle()
         session = self._session
         uploads = tuple(attachments)
+        if any(isinstance(item, ImageAttachmentInput) for item in uploads):
+            require_image_input(self._model)
         batch = prepare_attachments(uploads, submission_id) if uploads else None
         if prompt_input and (uploads or submission_id is not None):
             raise ValueError("MCP Prompt 必须作为独立任务运行。")
@@ -448,7 +454,7 @@ class Application:
             ):
                 raise ValueError("MCP 资源包含未确认的敏感内容。")
         if batch and isinstance(prompt, str) and not prompt.strip():
-            prompt = ATTACHMENT_ONLY_PROMPT
+            prompt = IMAGE_ATTACHMENT_ONLY_PROMPT if batch.images else ATTACHMENT_ONLY_PROMPT
         if self._mcp_pending:
             async with self._state_lock:
                 await self._refresh_pending_mcp()
@@ -507,7 +513,7 @@ class Application:
                                 raise OSError("无法持久化附件快照。") from None
                             excerpts = {
                                 item.id: upload.text for item, upload in zip(snapshots.files, uploads, strict=True)
-                                if item.source
+                                if isinstance(upload, TextResourceInput)
                             }
                         if candidate.title is None and recovery_action is None and len(session.messages) == input_start:
                             source = build_title_source(
@@ -536,7 +542,9 @@ class Application:
                         output_limit=self._output_limits.get((provider, session.model_id)),
                         persist=persist,
                         attachment_batch=batch,
-                        attachment_texts=tuple(item.text for item in uploads) if batch else (),
+                        attachment_texts=tuple(
+                            item.text for item in uploads if isinstance(item, TextAttachmentInput)
+                        ) if batch else (),
                         attachment_store=self._history.attachments,
                     )
                     if result.status is TurnStatus.COMPLETED and title_source is not None:

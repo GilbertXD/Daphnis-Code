@@ -75,7 +75,7 @@ class Session:
                 or not isinstance(batch, AttachmentBatch)
             ):
                 raise ValueError("Attachment refers to an invalid message index.")
-            if any(item.source == "embedded" for item in batch.files):
+            if any(item.source == "embedded" for item in batch.texts):
                 embedded_indices.add(index)
                 if (len(batch.files) != 1 or batch.submission_id is not None
                     or self.messages.get(index).get("content") != ""):

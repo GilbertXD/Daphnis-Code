@@ -1,4 +1,4 @@
-"""Validate uploaded text and store immutable, Session-scoped snapshots."""
+"""Validate uploads and store immutable, Session-scoped snapshots."""
 
 import os
 import re
@@ -7,16 +7,25 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
+
+from PIL import Image
 
 from .text import decode_text
 
 MAX_FILE_BYTES = 128 * 1024
 MAX_TOTAL_BYTES = 256 * 1024
 MAX_FILES = 10
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_IMAGE_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_IMAGES = 4
+MAX_IMAGE_PIXELS = 20_000_000
 ATTACHMENT_ONLY_PROMPT = "已附上文本文件。"
+IMAGE_ATTACHMENT_ONLY_PROMPT = "已附上图片。"
 ATTACHMENT_TOOLS = frozenset({"read_attachment", "search_attachment"})
 _ID = re.compile(r"[0-9a-f]{32}")
 _BINARY = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -27,20 +36,26 @@ _EXTENSIONS = {
     ".cpp", ".hpp", ".cc", ".cs", ".rb", ".php", ".swift", ".vue", ".svelte", ".tex", ".diff", ".patch",
 }
 _PRIVATE_NAMES = {"credentials.json", "application_default_credentials.json", "secrets.json"}
+_IMAGE_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
+_IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+_PNG_END = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
 
 
 def valid_id(value: str) -> bool:
     return isinstance(value, str) and _ID.fullmatch(value) is not None
 
 
-def _name(name: str) -> None:
+def _name(name: str, *, image: bool = False) -> None:
     if (
         not isinstance(name, str) or not 0 < len(name) <= 255 or name != name.strip()
         or any(char in name for char in "/\\") or any(ord(char) < 32 for char in name)
-        or _BINARY.search(name) or Path(name).suffix.lower() not in _EXTENSIONS
+        or _BINARY.search(name) or name in {".", ".."}
+        or (not image and Path(name).suffix.lower() not in _EXTENSIONS)
         or name.lower().startswith((".env", "id_rsa.", "id_ed25519.", "id_ecdsa.", "id_dsa."))
         or name.lower() in _PRIVATE_NAMES
     ):
+        if image:
+            raise ValueError("图片附件名称无效，不能包含路径或使用已知的凭据文件名。")
         raise ValueError("附件须为受支持的文本文件，不能包含路径或使用已知的凭据文件名。")
     try:
         name.encode("utf-8")
@@ -52,6 +67,16 @@ def _name(name: str) -> None:
 class TextAttachmentInput:
     name: str
     text: str
+
+
+@dataclass(frozen=True)
+class ImageAttachmentInput:
+    name: str
+    data: bytes
+    mime_type: str
+
+
+AttachmentInput = TextAttachmentInput | ImageAttachmentInput
 
 
 def validate_resource_uri(uri: str) -> None:
@@ -150,18 +175,81 @@ class TextAttachment:
             raise ValueError("附件元数据无效。")
 
 
+def _valid_dimensions(width: int, height: int) -> bool:
+    return (
+        type(width) is int and type(height) is int
+        and width > 0 and height > 0 and width * height <= MAX_IMAGE_PIXELS
+    )
+
+
+def _image_dimensions(data: bytes, mime_type: str) -> tuple[int, int]:
+    if not isinstance(mime_type, str) or mime_type not in _IMAGE_EXTENSIONS:
+        raise ValueError("图片附件仅支持 PNG、JPEG 和 WebP。")
+    try:
+        with Image.open(BytesIO(data), formats=tuple(_IMAGE_FORMATS)) as image:
+            if _IMAGE_FORMATS[image.format] != mime_type:
+                raise ValueError("图片内容与声明的 MIME 类型不一致。")
+            size = image.size
+            if not _valid_dimensions(*size):
+                raise ValueError("图片最多 2000 万像素。")
+            if getattr(image, "n_frames", 1) != 1 or image.get_format_mimetype() == "image/apng":
+                raise ValueError("图片附件不支持动图。")
+            # Pillow's PNG verifier stops before checking the IEND checksum.
+            if image.format == "PNG" and not data.endswith(_PNG_END):
+                raise ValueError("PNG 图片结束块缺失或损坏。")
+            image.verify()
+        with Image.open(BytesIO(data), formats=tuple(_IMAGE_FORMATS)) as image:
+            image.load()
+    except Image.DecompressionBombError:
+        raise ValueError("图片最多 2000 万像素。") from None
+    except (OSError, SyntaxError, EOFError, IndexError, OverflowError):
+        raise ValueError("图片已损坏或格式不受支持。") from None
+    return size
+
+
+@dataclass(frozen=True)
+class ImageAttachment:
+    id: str
+    name: str
+    size_bytes: int
+    sha256: str
+    mime_type: str
+    width: int
+    height: int
+
+    def __post_init__(self) -> None:
+        _name(self.name, image=True)
+        if (
+            not valid_id(self.id)
+            or type(self.size_bytes) is not int or not 0 < self.size_bytes <= MAX_IMAGE_BYTES
+            or not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256)
+            or not isinstance(self.mime_type, str) or self.mime_type not in _IMAGE_EXTENSIONS
+            or not _valid_dimensions(self.width, self.height)
+        ):
+            raise ValueError("图片附件元数据无效。")
+
+    def to_json(self) -> dict:
+        return {"type": "image", **asdict(self)}
+
+
 @dataclass(frozen=True)
 class AttachmentBatch:
-    files: tuple[TextAttachment, ...]
+    files: tuple[TextAttachment | ImageAttachment, ...]
     submission_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.files, tuple) or not 0 < len(self.files) <= MAX_FILES or not all(
-            isinstance(item, TextAttachment) for item in self.files
+        if not isinstance(self.files, tuple) or not self.files or not all(
+            isinstance(item, (TextAttachment, ImageAttachment)) for item in self.files
         ):
             raise TypeError("附件引用无效。")
-        if sum(item.size_bytes for item in self.files) > MAX_TOTAL_BYTES:
+        if len(self.texts) > MAX_FILES:
+            raise ValueError("每次最多可发送 10 个文本附件。")
+        if sum(item.size_bytes for item in self.texts) > MAX_TOTAL_BYTES:
             raise ValueError("附件总大小超过 256 KiB。")
+        if len(self.images) > MAX_IMAGES:
+            raise ValueError("每次最多可发送 4 张图片。")
+        if sum(item.size_bytes for item in self.images) > MAX_IMAGE_TOTAL_BYTES:
+            raise ValueError("图片附件总大小超过 20 MiB。")
         if self.submission_id is not None and not valid_id(self.submission_id):
             raise ValueError("附件发送标识无效。")
 
@@ -172,14 +260,51 @@ class AttachmentBatch:
     def from_json(cls, data: dict) -> "AttachmentBatch":
         if not isinstance(data, dict) or not isinstance(data.get("files"), list):
             raise TypeError("附件引用无效。")
-        return cls(tuple(TextAttachment(**item) for item in data["files"]), data.get("submission_id"))
+        files = []
+        for entry in data["files"]:
+            if not isinstance(entry, dict):
+                raise TypeError("附件引用无效。")
+            item = entry.copy()
+            match item.pop("type", "text"):
+                case "text":
+                    files.append(TextAttachment(**item))
+                case "image":
+                    files.append(ImageAttachment(**item))
+                case _:
+                    raise ValueError("附件类型无效。")
+        return cls(tuple(files), data.get("submission_id"))
+
+    @property
+    def texts(self) -> tuple[TextAttachment, ...]:
+        return tuple(item for item in self.files if isinstance(item, TextAttachment))
+
+    @property
+    def images(self) -> tuple[ImageAttachment, ...]:
+        return tuple(item for item in self.files if isinstance(item, ImageAttachment))
 
 
-def prepare_attachments(uploads: Sequence[TextAttachmentInput], submission_id: str | None) -> AttachmentBatch:
-    if not 0 < len(uploads) <= MAX_FILES:
-        raise ValueError("每次最多可发送 10 个附件。")
+def prepare_attachments(uploads: Sequence[AttachmentInput], submission_id: str | None) -> AttachmentBatch:
+    if not 0 < len(uploads) <= MAX_FILES + MAX_IMAGES:
+        raise ValueError("每次最多可发送 10 个文本附件和 4 张图片。")
+    image_count = sum(isinstance(upload, ImageAttachmentInput) for upload in uploads)
+    if image_count > MAX_IMAGES:
+        raise ValueError("每次最多可发送 4 张图片。")
+    if len(uploads) - image_count > MAX_FILES:
+        raise ValueError("每次最多可发送 10 个文本附件。")
     files = []
     for upload in uploads:
+        if isinstance(upload, ImageAttachmentInput):
+            _name(upload.name, image=True)
+            if not isinstance(upload.data, bytes):
+                raise TypeError("图片附件必须提供 bytes。")
+            if not 0 < len(upload.data) <= MAX_IMAGE_BYTES:
+                raise ValueError("图片附件不能为空，且每张最多 5 MiB。")
+            width, height = _image_dimensions(upload.data, upload.mime_type)
+            files.append(ImageAttachment(
+                uuid4().hex, upload.name, len(upload.data), sha256(upload.data).hexdigest(),
+                upload.mime_type, width, height,
+            ))
+            continue
         if not isinstance(upload, TextAttachmentInput) or not isinstance(upload.text, str):
             raise TypeError("附件内容必须是 UTF-8 文本。")
         source = {}
@@ -203,7 +328,7 @@ def prepare_attachments(uploads: Sequence[TextAttachmentInput], submission_id: s
 def attachment_metadata(batch: AttachmentBatch) -> list[dict]:
     return [
         {"id": item.id, "name": item.model_name, "size_bytes": item.size_bytes, "lines": item.lines}
-        if item.source else item.to_json()
+        if isinstance(item, TextAttachment) and item.source else item.to_json()
         for item in batch.files
     ]
 
@@ -252,8 +377,12 @@ class AttachmentStore:
         if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise PermissionError("附件存储必须由当前用户独占。")
 
-    def _read(self, directory: int, item: TextAttachment) -> str:
-        fd = os.open(item.id + ".txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    @staticmethod
+    def _filename(item: TextAttachment | ImageAttachment) -> str:
+        return item.id + (_IMAGE_EXTENSIONS[item.mime_type] if isinstance(item, ImageAttachment) else ".txt")
+
+    def _read(self, directory: int, item: TextAttachment | ImageAttachment) -> bytes:
+        fd = os.open(self._filename(item), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(fd, "rb") as stream:
             self._private(stream.fileno())
             info = os.fstat(stream.fileno())
@@ -262,32 +391,40 @@ class AttachmentStore:
             data = stream.read(item.size_bytes + 1)
         if len(data) != item.size_bytes or sha256(data).hexdigest() != item.sha256:
             raise OSError("附件快照校验失败。")
-        return decode_text(data)
+        if isinstance(item, ImageAttachment) and _image_dimensions(data, item.mime_type) != (item.width, item.height):
+            raise OSError("图片快照尺寸校验失败。")
+        return data
 
     def read(self, session_id: str, item: TextAttachment) -> str:
         with self._session_directory(session_id) as (_, directory):
+            return decode_text(self._read(directory, item))
+
+    def read_image(self, session_id: str, item: ImageAttachment) -> bytes:
+        with self._session_directory(session_id) as (_, directory):
             return self._read(directory, item)
 
-    def write(self, session_id: str, batch: AttachmentBatch, uploads: Sequence[TextAttachmentInput]) -> None:
+    def write(self, session_id: str, batch: AttachmentBatch, uploads: Sequence[AttachmentInput]) -> None:
         with self._session_directory(session_id, create=True) as (_, directory):
             for item, upload in zip(batch.files, uploads, strict=True):
                 temporary = ".tmp-" + item.id
                 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
                 try:
                     with os.fdopen(fd, "wb") as stream:
-                        stream.write(upload.text.encode("utf-8"))
+                        stream.write(upload.data if isinstance(upload, ImageAttachmentInput) else upload.text.encode("utf-8"))
                         stream.flush()
                         os.fchmod(stream.fileno(), 0o400)
                         os.fsync(stream.fileno())
                     # Publish without overwriting an existing immutable snapshot.
                     try:
-                        os.link(temporary, item.id + ".txt", src_dir_fd=directory,
+                        os.link(temporary, self._filename(item), src_dir_fd=directory,
                                 dst_dir_fd=directory, follow_symlinks=False)
                     except FileExistsError:
                         # A retried submission may already have published this snapshot.
                         pass
                     os.unlink(temporary, dir_fd=directory)
-                    self._read(directory, item)
+                    verified = self._read(directory, item)
+                    if isinstance(item, TextAttachment):
+                        decode_text(verified)
                 finally:
                     try:
                         os.unlink(temporary, dir_fd=directory)

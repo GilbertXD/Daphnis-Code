@@ -11,7 +11,10 @@ from saturnus import ValidationError
 
 from .attachments import (
     ATTACHMENT_ONLY_PROMPT,
-    TextAttachmentInput,
+    IMAGE_ATTACHMENT_ONLY_PROMPT,
+    AttachmentInput,
+    ImageAttachment,
+    TextAttachment,
     TextResourceInput,
     prepare_attachments,
     resource_snapshot_id,
@@ -612,9 +615,15 @@ class Operations:
         }
 
     def attachment_submitted(
-        self, submission_id: str, prompt: str, attachments: Sequence[TextAttachmentInput | str],
+        self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str],
     ) -> bool:
         session = self._app._session
+
+        def identity(item: TextAttachment | ImageAttachment):
+            if isinstance(item, ImageAttachment):
+                return (item.name, item.sha256, item.mime_type)
+            return item.id if item.source else (item.name, item.sha256)
+
         for index, batch in session.attachment_refs.items():
             if batch.submission_id != submission_id:
                 continue
@@ -624,9 +633,10 @@ class Operations:
                     received.append(resource_snapshot_id(submission_id, entry))
                 else:
                     item, = prepare_attachments((entry,), submission_id).files
-                    received.append(item.id if item.source else (item.name, item.sha256))
-            committed = [item.id if item.source else (item.name, item.sha256) for item in batch.files]
-            if (session.messages.get(index)["content"] != (prompt if prompt.strip() else ATTACHMENT_ONLY_PROMPT)
+                    received.append(identity(item))
+            committed = [identity(item) for item in batch.files]
+            default = IMAGE_ATTACHMENT_ONLY_PROMPT if batch.images else ATTACHMENT_ONLY_PROMPT
+            if (session.messages.get(index)["content"] != (prompt if prompt.strip() else default)
                 or committed != received):
                 raise ValueError("该附件发送标识已用于不同内容。")
             return True
@@ -634,7 +644,7 @@ class Operations:
 
     async def send(
         self, prompt: str, *, stream: bool = True,
-        attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
+        attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> "TurnResult":
         return await self._app._run_turn(prompt, stream=stream, attachments=attachments, submission_id=submission_id)
 

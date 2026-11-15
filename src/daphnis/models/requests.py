@@ -20,6 +20,13 @@ class CapabilityError(ValueError):
     """A requested capability is unknown or unsupported for this model."""
 
 
+def require_image_input(model: ModelInfo) -> None:
+    if (model.provider, model.id) not in {
+        ("mimo", "mimo-v2.6-flash"), ("mimo", "mimo-v2.6-pro"), ("deepseek", "deepseek-flash"),
+    }:
+        raise CapabilityError(f"当前模型 {model.id!r} 不支持 Daphnis 图片输入。")
+
+
 def require_tools(model: ModelInfo) -> None:
     if model.supports_tools is not True:
         reason = "unknown" if model.supports_tools is None else "unsupported"

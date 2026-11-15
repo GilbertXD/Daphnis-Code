@@ -65,7 +65,7 @@ def prepare_attachments(name: str, args: dict, session: Session, store: Attachme
     if store is None:
         raise ToolError("attachment_unavailable", "Attachment storage is unavailable.")
     files = {
-        item.id: item for index, batch in session.attachment_refs.items() for item in batch.files
+        item.id: item for index, batch in session.attachment_refs.items() for item in batch.texts
         if item.source != "embedded" or session.messages.get(index).get(TURN_STATE) != ABANDONED
     }
     requested = args.get("id")

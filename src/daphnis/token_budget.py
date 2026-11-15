@@ -87,9 +87,10 @@ def request_budget(
     counter: TokenCounter = DEFAULT_COUNTER,
     settings: CompactionSettings | None = None,
     default_output_tokens: int | None = None,
+    image_reserve: int = 0,
 ) -> TokenBudget:
     # Only prompt-bearing options are counted as input. Allow for chat framing.
-    input_tokens = counter.count(messages) + 4 * len(messages) + 3
+    input_tokens = counter.count(messages) + 4 * len(messages) + 3 + image_reserve
     for field in ("tools", "response_format"):
         if field in body:
             input_tokens += counter.count(body[field])

@@ -27,6 +27,7 @@ from saturnus import (
 
 from .attachments import (
     ATTACHMENT_TOOLS,
+    MAX_IMAGE_REQUEST_BYTES,
     AttachmentBatch,
     AttachmentStore,
     prepare_attachments,
@@ -39,11 +40,19 @@ from .compaction import (
     safe_boundaries,
 )
 from .compaction_settings import CompactionSettings
-from .context import Context, annotate_attachments, attachment_note, history_range_hint
+from .context import (
+    IMAGE_REFS,
+    Context,
+    annotate_attachments,
+    attachment_note,
+    history_range_hint,
+    materialize_images,
+)
 from .events import EventBus
 from .history import finish_io
 from .model_io import (
     ContextOverflowError,
+    hide_image_echo,
     is_context_overflow,
     is_http_context_overflow,
 )
@@ -55,6 +64,7 @@ from .models import (
     resolve_model,
 )
 from .models.models import validate_catalog
+from .models.requests import require_image_input
 from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
 from .token_budget import TokenBudget, request_budget
@@ -210,6 +220,7 @@ class Agent:
         event_fields: dict[str, Any],
         extra_body: dict[str, Any],
         extra_headers: dict[str, str] | None,
+        image_payloads: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if not stream:
             response = await self._client.create(
@@ -220,6 +231,8 @@ class Agent:
             )
             if "error" in response and is_context_overflow(response):
                 raise ContextOverflowError
+            if image_payloads:
+                response = hide_image_echo(response, image_payloads)
             if response.get("usage") is not None:
                 await self.events.emit(
                     "model.usage", **event_fields, usage=response["usage"]
@@ -247,14 +260,23 @@ class Agent:
                     if isinstance(refusal, str) and refusal:
                         refusals.setdefault(choice["index"], []).append(refusal)
                 if chunk.get("usage") is not None:
+                    usage = chunk["usage"]
                     await self.events.emit(
-                        "model.usage", **event_fields, usage=chunk["usage"]
+                        "model.usage", **event_fields, usage=hide_image_echo(usage, image_payloads) if image_payloads else usage,
                     )
-                await self.events.emit("model.delta", **event_fields, chunk=chunk)
+                if not image_payloads:
+                    await self.events.emit("model.delta", **event_fields, chunk=chunk)
         response = accumulator.finalize()
         for choice in response["choices"]:
             if choice["index"] in refusals:
                 choice["message"]["refusal"] = "".join(refusals[choice["index"]])
+        if image_payloads:
+            # An echoed Data URL can be split across any number of SSE events.
+            response = hide_image_echo(response, image_payloads)
+            await self.events.emit("model.delta", **event_fields, chunk={
+                "choices": [{"index": choice["index"], "delta": choice["message"]}
+                            for choice in response["choices"]],
+            })
         return response
 
     @staticmethod
@@ -277,7 +299,7 @@ class Agent:
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             Agent._validate_tool_calls(calls)
-        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT):
+        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT, IMAGE_REFS):
             message.pop(field, None)
         return message, reason
 
@@ -307,13 +329,13 @@ class Agent:
     def _model_context(
         self, history: Messages, checkpoint: CompactionCheckpoint | None,
         *, history_lookup: bool = False, attachment_notes: dict[int, str] | None = None,
+        attachment_refs: dict[int, AttachmentBatch] | None = None,
         prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> list[dict[str, Any]]:
-        if checkpoint is None:
-            return self.context.build(history, attachment_notes=attachment_notes, prompt_groups=prompt_groups)
         return self.context.build(
             history, checkpoint, summary_reasoning=self._provider == "deepseek",
-            history_lookup=history_lookup, attachment_notes=attachment_notes, prompt_groups=prompt_groups,
+            history_lookup=history_lookup, attachment_notes=attachment_notes, attachment_refs=attachment_refs,
+            prompt_groups=prompt_groups,
         )
 
     def _summary_response_format(self) -> dict[str, str] | None:
@@ -325,8 +347,11 @@ class Agent:
         self, messages: Messages, checkpoint: CompactionCheckpoint | None, body: dict[str, Any],
         model: ModelInfo, notes: dict[int, str], inline: dict[int, str], can_read: bool,
         prompt_groups: tuple[PromptGroup, ...] = (),
+        *, attachment_refs: dict[int, AttachmentBatch],
     ) -> dict[int, str]:
-        base = self._request_budget(self._model_context(messages, checkpoint, attachment_notes=notes, prompt_groups=prompt_groups), body, model)
+        base = self._request_budget(self._model_context(
+            messages, checkpoint, attachment_notes=notes, attachment_refs=attachment_refs, prompt_groups=prompt_groups,
+        ), body, model)
         added = sum(max(0, model.token_counter.count(note) - model.token_counter.count(notes[index]))
                     for index, note in inline.items())
         limit = 4000
@@ -334,7 +359,10 @@ class Agent:
             limit = min(limit, max(0, base.hard_input_limit - base.input_tokens) // 20)
         if added <= limit:
             candidate = {**notes, **inline}
-            projected = self._model_context(messages, checkpoint, attachment_notes=candidate, prompt_groups=prompt_groups)
+            projected = self._model_context(
+                messages, checkpoint, attachment_notes=candidate, attachment_refs=attachment_refs,
+                prompt_groups=prompt_groups,
+            )
             if self._request_budget(projected, body, model).fits:
                 return candidate
         if not can_read:
@@ -433,7 +461,9 @@ class Agent:
             response_format=self._summary_response_format(),
         )
         notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
-        raw = annotate_attachments(session.messages.snapshot(), notes)
+        raw = annotate_attachments(session.messages.snapshot(), {
+            index: attachment_note(batch, include_images=True) for index, batch in session.attachment_refs.items()
+        })
         fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
         if notes:
             fields["attachment_sensitive"] = True
@@ -446,7 +476,10 @@ class Agent:
             return None
         def budget(candidate):
             return self._request_budget(
-                self._model_context(session.messages, candidate, attachment_notes=notes, prompt_groups=session.prompt_groups), {}, model,
+                self._model_context(
+                    session.messages, candidate, attachment_notes=notes,
+                    attachment_refs=session.attachment_refs, prompt_groups=session.prompt_groups,
+                ), {}, model,
             ).input_tokens
 
         before = budget(previous)
@@ -505,11 +538,23 @@ class Agent:
     def _request_budget(
         self, messages: list[dict[str, Any]], body: dict[str, Any], model: ModelInfo,
     ) -> TokenBudget:
+        image_reserve = 0
+        text_messages = []
+        for message in messages:
+            if IMAGE_REFS in message:
+                # Reserve double the larger of a 32 px tile estimate and 1024 tokens.
+                for image in message[IMAGE_REFS]:
+                    tiles = ((image.width + 31) // 32) * ((image.height + 31) // 32)
+                    image_reserve += 2 * max(1024, tiles)
+                text_messages.append({key: value for key, value in message.items() if key != IMAGE_REFS})
+            else:
+                text_messages.append(message)
         return request_budget(
-            messages, body, model.context_window, counter=model.token_counter,
+            text_messages, body, model.context_window, counter=model.token_counter,
             provider=None if self._custom_compatibility else self._provider,
             default_output_tokens=None if self._custom_compatibility else model.default_output_tokens,
             settings=self.compaction_settings,
+            image_reserve=image_reserve,
         )
 
     async def _compact_request(
@@ -528,7 +573,7 @@ class Agent:
         trigger: str = "pressure",
         history_lookup: bool = False,
         attachment_notes: dict[int, str] | None = None,
-        attachment_refs: dict[int, str] | None = None,
+        attachment_refs: dict[int, AttachmentBatch] | None = None,
         prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
@@ -539,7 +584,10 @@ class Agent:
         error = None
         failure_reason = None
         try:
-            raw = (annotate_attachments(history.snapshot(), attachment_refs)
+            raw = (annotate_attachments(history.snapshot(), {
+                       index: attachment_note(batch, include_images=True)
+                       for index, batch in (attachment_refs or {}).items()
+                   })
                    if history_lookup or self.compaction_settings.auto_enabled else [])
             history_tool_ids = {}
             if history_lookup:
@@ -585,7 +633,7 @@ class Agent:
                         return compactor.prune(
                             self._model_context(
                                 history, candidate, history_lookup=history_lookup, attachment_notes=attachment_notes,
-                                prompt_groups=prompt_groups,
+                                attachment_refs=attachment_refs, prompt_groups=prompt_groups,
                             ),
                             history_tool_ids=history_tool_ids,
                         )
@@ -676,6 +724,10 @@ class Agent:
                     "Session provider does not match the ChatClient connection."
                 )
             model = resolve_model(provider, model_id, catalog=self._catalog)
+            if attachment_batch and attachment_batch.images:
+                require_image_input(model)
+                if attachment_store is None or persist is None:
+                    raise ValueError("图片附件需要持久化存储。")
             recovery = recovery_state(committed, session_id, session.prompt_groups)
             if recovery_action is None:
                 if prompt_input is None:
@@ -710,8 +762,8 @@ class Agent:
             can_read_attachments = model.supports_tools is True and ATTACHMENT_TOOLS.issubset(
                 item["function"]["name"] for item in definitions
             )
-            attachment_refs = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
-            attachment_notes = attachment_refs
+            reference_notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
+            attachment_notes = reference_notes
 
             def request_options():
                 return prepare_request_options(
@@ -863,6 +915,16 @@ class Agent:
                 messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
                 nonlocal requests, primary_requests
+                images = [item for message in messages for item in message.get(IMAGE_REFS, ())]
+                image_payloads = ()
+                if images:
+                    if sum(item.size_bytes for item in images) > MAX_IMAGE_REQUEST_BYTES:
+                        raise ValueError("当前上下文中的图片超过 32 MiB，请先压缩历史。")
+                    if attachment_store is None:
+                        raise ValueError("原始图片附件快照不可用。")
+                    messages, image_payloads = await asyncio.to_thread(
+                        materialize_images, messages, attachment_store, session.id,
+                    )
                 primary_requests += 1
                 requests += 1
                 request_fields = {**fields, "request_number": requests}
@@ -877,6 +939,7 @@ class Agent:
                     response = await self._request(
                         model=model_id, messages=messages, stream=stream,
                         event_fields=request_fields, extra_body=body, extra_headers=extra_headers,
+                        image_payloads=image_payloads,
                     )
                 except (APIError, ResponseError) as exc:
                     if is_http_context_overflow(exc):
@@ -903,7 +966,8 @@ class Agent:
                 if attachment_batch:
                     index = len(snapshot) - 1
                     refs_update[index] = attachment_batch
-                    inline[index] = attachment_note(attachment_batch, attachment_texts)
+                    if attachment_batch.texts:
+                        inline[index] = attachment_note(attachment_batch, attachment_texts)
                 elif prompt_input and (resources := prompt_input.resources):
                     batch = prepare_attachments(tuple(resources.values()), None)
                     for (offset, resource), item in zip(resources.items(), batch.files, strict=True):
@@ -911,12 +975,13 @@ class Agent:
                         refs_update[index] = AttachmentBatch((item,))
                         inline[index] = attachment_note(refs_update[index], (resource.text,))
                 if refs_update:
-                    attachment_refs.update((index, attachment_note(batch)) for index, batch in refs_update.items())
                     body = request_options()
+                if inline:
+                    reference_notes.update((index, attachment_note(batch)) for index, batch in refs_update.items())
                     groups = (*session.prompt_groups, group) if group else session.prompt_groups
                     attachment_notes = self._choose_attachment_notes(
-                        Messages(snapshot), checkpoint, body, model, attachment_refs, inline,
-                        can_read_attachments, groups,
+                        Messages(snapshot), checkpoint, body, model, reference_notes, inline,
+                        can_read_attachments, groups, attachment_refs={**session.attachment_refs, **refs_update},
                     )
                 await commit(snapshot, refs_update=refs_update, group=group)
             else:
@@ -924,16 +989,18 @@ class Agent:
                 terminating = recovery_action is RecoveryAction.TERMINATE
                 start = recovery.message_index
                 end = next((group.end for group in session.prompt_groups if group.start == start), start + 1)
-                input_refs = {index: session.attachment_refs[index] for index in range(start, end)
-                              if index in session.attachment_refs}
+                input_refs = {index: batch.texts for index in range(start, end)
+                              if (batch := session.attachment_refs.get(index)) and batch.texts}
                 if not terminating and input_refs:
                     if attachment_store is None:
                         raise ValueError("附件快照不可用。")
 
                     def saved_notes():
                         return {
-                            index: attachment_note(batch, tuple(attachment_store.read(session.id, item) for item in batch.files))
-                            for index, batch in input_refs.items()
+                            index: attachment_note(session.attachment_refs[index], tuple(
+                                attachment_store.read(session.id, item) for item in items
+                            ))
+                            for index, items in input_refs.items()
                         }
 
                     try:
@@ -946,8 +1013,8 @@ class Agent:
                         resolve_tool_placeholders(snapshot, interrupted[1], terminate=True)[0]
                     )
                     attachment_notes = self._choose_attachment_notes(
-                        projected, checkpoint, body, model, attachment_refs, inline,
-                        can_read_attachments, session.prompt_groups,
+                        projected, checkpoint, body, model, reference_notes, inline,
+                        can_read_attachments, session.prompt_groups, attachment_refs=session.attachment_refs,
                     )
                 if interrupted is not None:
                     calls, indices = interrupted
@@ -990,14 +1057,18 @@ class Agent:
                 maintenance_limited = False
                 messages = self._model_context(
                     session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
-                    prompt_groups=session.prompt_groups,
+                    attachment_refs=session.attachment_refs, prompt_groups=session.prompt_groups,
                 )
+                if any(IMAGE_REFS in message for message in messages):
+                    require_image_input(model)
+                    if model.context_window is None:
+                        raise ValueError("模型上下文上限未知，无法安全发送图片。")
                 budget = self._request_budget(messages, body, model)
-                if not budget.fits and can_read_attachments and attachment_notes is not attachment_refs:
-                    attachment_notes = attachment_refs
+                if not budget.fits and can_read_attachments and attachment_notes is not reference_notes:
+                    attachment_notes = reference_notes
                     messages = self._model_context(
                         session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
-                        prompt_groups=session.prompt_groups,
+                        attachment_refs=session.attachment_refs, prompt_groups=session.prompt_groups,
                     )
                     budget = self._request_budget(messages, body, model)
                 if budget.threshold_blocked_by_reserve and not warned_about_reserve:
@@ -1012,7 +1083,7 @@ class Agent:
                         history=session.messages, checkpoint=checkpoint, messages=messages,
                         body=body, model=model, compactor=compactor, summarize=summarize,
                         fields=fields, history_lookup=history_lookup,
-                        attachment_notes=attachment_notes, attachment_refs=attachment_refs,
+                        attachment_notes=attachment_notes, attachment_refs=session.attachment_refs,
                         prompt_groups=session.prompt_groups,
                         can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                     )
@@ -1045,7 +1116,7 @@ class Agent:
                                 history=session.messages, checkpoint=checkpoint, messages=messages,
                                 body=body, model=model, compactor=compactor, summarize=summarize,
                                 fields=failure_fields, trigger="overflow", history_lookup=history_lookup,
-                                attachment_notes=attachment_notes, attachment_refs=attachment_refs,
+                                attachment_notes=attachment_notes, attachment_refs=session.attachment_refs,
                                 prompt_groups=session.prompt_groups,
                                 can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                             )
