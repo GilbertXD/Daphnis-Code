@@ -59,7 +59,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 await ops.connect_mcp("both", sys.executable, [str(DEMO), str(both_root)])
                 connection = app._mcp["both"]
                 prompts = await connection.list_prompts()
-                self.assertEqual([prompt.name for prompt in prompts], ["greet", "bundle", "slow", "fail", "large"])
+                self.assertEqual([prompt.name for prompt in prompts], ["greet", "bundle", "slow", "fail", "large", "dialogue"])
                 self.assertEqual([(arg.name, arg.required) for arg in prompts[0].arguments],
                                  [("who", True), ("tone", False)])
                 greeting = await connection.get_prompt("greet", {"who": "Ada", "tone": "casual"})

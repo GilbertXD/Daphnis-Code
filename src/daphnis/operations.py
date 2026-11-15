@@ -22,7 +22,7 @@ from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
 from .mcp_store import MCPServerConfig
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .project import Project
-from .prompt_groups import PromptGroup, PromptInput, input_matches
+from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
 from .tools import ApprovalDecision, ApprovalMode
 from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
@@ -610,11 +610,11 @@ class Operations:
     def prompt_groups(self) -> tuple[PromptGroup, ...]:
         return self._app._session.prompt_groups
 
-    def prompt_submitted(self, group_id: str, messages: tuple[tuple[str, str], ...]) -> bool:
+    def prompt_submitted(self, group_id: str, texts: tuple[str, ...]) -> bool:
         group = next((group for group in self.prompt_groups if group.id == group_id), None)
         if group is None:
             return False
-        if not input_matches(group, self.message_snapshot(), messages):
+        if texts != tuple(self._app._session.messages.get(i)['content'] for i in range(group.start, group.end)):
             raise ValueError("该 MCP Prompt 运行标识已用于不同内容。")
         return True
 

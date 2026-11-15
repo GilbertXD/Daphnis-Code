@@ -91,6 +91,18 @@ class PromptGroupTurnTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                     self.assertEqual(requests[0], template.snapshot())
 
+    async def test_failed_persistence_leaves_no_partial_input(self):
+        async def persist(_):
+            raise OSError("save failed")
+
+        async with make_client(lambda _: self.fail("unexpected model request")) as client:
+            task = session()
+            prompt = PromptInput("failed-write", "example", "review", MESSAGES)
+            result = await make_agent(client).run(session=task, prompt_input=prompt, persist=persist)
+            self.assertEqual(result.status, TurnStatus.FAILED)
+            self.assertEqual(task.messages.snapshot(), [])
+            self.assertEqual(task.prompt_groups, ())
+
     async def test_assistant_tail_is_recognized_but_requires_user_input(self):
         async with make_client(lambda _: self.fail("unexpected model request")) as client:
             agent = make_agent(client)

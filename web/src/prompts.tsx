@@ -2,7 +2,9 @@ import { useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { Command, MCPPrompt, MCPPromptResult } from './protocol'
 
-const MAX_INSERT_BYTES = 16 * 1024
+const MAX_PROMPT_BYTES = 64 * 1024
+const MAX_PROMPT_MESSAGES = 64
+type RunPrompt = (previewId: string, texts: string[]) => Promise<void>
 
 function PromptGroup({ server, connected, command, select }: {
   server: string
@@ -49,13 +51,14 @@ function PromptGroup({ server, connected, command, select }: {
   </details>
 }
 
-function PromptForm({ server, prompt, connected, command, back, insert }: {
+function PromptForm({ server, prompt, connected, command, back, run, runDisabled }: {
   server: string
   prompt: MCPPrompt
   connected: boolean
   command: Command
   back: () => void
-  insert: (text: string) => void
+  run: RunPrompt
+  runDisabled: boolean
 }) {
   const [values, setValues] = useState(new Map<string, string>())
   const [result, setResult] = useState<MCPPromptResult | null>(null)
@@ -107,42 +110,68 @@ function PromptForm({ server, prompt, connected, command, back, insert }: {
       </fieldset>
     </form>
     {error && <p role="alert">{error}</p>}
-    {result && <PromptPreview result={result} insert={insert} disabled={disabled} />}
+    {result && <PromptPreview result={result} run={run} disabled={runDisabled || disabled} />}
   </div>
 }
 
-function PromptPreview({ result, insert, disabled }: {
+function PromptPreview({ result, run, disabled }: {
   result: MCPPromptResult
-  insert: (text: string) => void
+  run: RunPrompt
   disabled: boolean
 }) {
-  const message = result.messages.length === 1 ? result.messages[0] : null
-  const text = message?.content.type === 'text' ? message.content.text ?? '' : ''
-  const unsupported = !message ? '当前仅支持插入恰好一条消息的模板。'
-    : message.role !== 'user' ? '当前仅支持插入用户角色的消息。'
-    : message.content.type !== 'text' ? '当前仅支持插入纯文本消息。'
-    : !text.trim() ? '模板返回了空文本。'
-    : new TextEncoder().encode(text).length > MAX_INSERT_BYTES ? '文本超过 16 KiB，无法插入。' : ''
+  const [texts, setTexts] = useState(() => result.messages.map(({ content }) => content.text ?? ''))
+  const appended = texts.length > result.messages.length
+  const roles = result.messages.map(({ role }) => role)
+  if (appended) roles.push('user')
+  const hasNonText = result.messages.some(({ content }) => content.type !== 'text')
+  const nonEmpty = texts.every((text) => text.trim())
+  const bytes = texts.reduce((size, text, index) =>
+    size + new TextEncoder().encode(JSON.stringify({ role: roles[index], content: text })).length + 3, 0)
+  const needsUser = roles.at(-1) === 'assistant'
+  const unavailable = hasNonText ? '此 Prompt 包含暂不支持的内容类型，无法完整运行。'
+    : !result.preview_id ? '此 Prompt 没有可运行的消息，或消息数量超出限制。'
+    : needsUser ? '当前模型接口需要以 User 消息结束。请补充一条 User 消息。'
+    : !nonEmpty ? '请填写每条消息的正文。'
+    : bytes > MAX_PROMPT_BYTES ? '消息组超过 64 KiB。请缩短正文。' : ''
 
-  return <section className="prompt-preview" aria-label="模板预览">
-    <h3>生成结果</h3>
+  function update(index: number, text: string) {
+    setTexts((current) => current.map((value, i) => i === index ? text : value))
+  }
+
+  return <section className="prompt-preview" aria-label="Prompt 预览">
+    <h3>预览与编辑</h3>
     {result.description && <p>{result.description}</p>}
-    {result.redacted && <p className="muted">预览和插入内容中的凭据已隐藏。</p>}
+    {result.redacted && <p className="muted">预览已隐藏检测到的凭据。运行时只会提交下方可见的正文。</p>}
     {result.messages.map(({ role, content }, index) => <div className="prompt-message" key={index}>
-      <p className="muted">{role === 'user' ? '用户' : '助手'} · {content.type}</p>
-      {content.type === 'text' ? <pre>{content.text}</pre> : <p className="muted">非文本内容仅显示类型。</p>}
+      {content.type === 'text' ? <label className="field">
+        <span>{role === 'user' ? 'User' : 'Assistant'}</span>
+        <textarea rows={3} readOnly={!result.preview_id} value={texts[index]}
+          onChange={(event) => update(index, event.target.value)} />
+      </label> : <p className="muted">{role === 'user' ? 'User' : 'Assistant'} · {content.type}</p>}
     </div>)}
-    {unsupported && <p role="status">{unsupported}</p>}
-    <div className="actions"><button type="button" className="primary" disabled={disabled || !!unsupported}
-      onClick={() => insert(text)}>插入输入框</button></div>
+    {appended && <div className="prompt-message">
+      <label className="field">
+        <span>User</span>
+        <textarea rows={3} value={texts.at(-1)} onChange={(event) => update(texts.length - 1, event.target.value)} />
+      </label>
+      <button type="button" className="mcp-text-button" onClick={() => setTexts((current) => current.slice(0, -1))}
+        disabled={disabled}>移除补充消息</button>
+    </div>}
+    {result.preview_id && !appended && texts.length < MAX_PROMPT_MESSAGES &&
+      <button type="button" className="mcp-text-button" disabled={disabled}
+        onClick={() => setTexts((current) => [...current, ''])}>补充 User 消息</button>}
+    {unavailable && <p role="status">{unavailable}</p>}
+    <div className="actions"><button type="button" className="primary" disabled={disabled || !!unavailable}
+      onClick={() => result.preview_id && void run(result.preview_id, texts)}>运行</button></div>
   </section>
 }
 
-export function PromptPicker({ servers, connected, command, insert }: {
+export function PromptPicker({ servers, connected, command, run, runDisabled }: {
   servers: string[]
   connected: boolean
   command: Command
-  insert: (text: string) => void
+  run: RunPrompt
+  runDisabled: boolean
 }) {
   const [selected, setSelected] = useState<{ server: string; prompt: MCPPrompt } | null>(null)
   return <>
@@ -153,6 +182,6 @@ export function PromptPicker({ servers, connected, command, insert }: {
     </div>
     {selected && <PromptForm {...selected}
       connected={connected && servers.includes(selected.server)} command={command}
-      back={() => setSelected(null)} insert={insert} />}
+      back={() => setSelected(null)} run={run} runDisabled={runDisabled} />}
   </>
 }

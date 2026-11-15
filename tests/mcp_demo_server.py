@@ -72,7 +72,7 @@ async def call_tool(ctx, params):
 
 async def list_prompts(ctx, params):
     if params and params.cursor == "more":
-        return ListPromptsResult(prompts=[Prompt(name=name) for name in ("bundle", "slow", "fail", "large")])
+        return ListPromptsResult(prompts=[Prompt(name=name) for name in ("bundle", "slow", "fail", "large", "dialogue")])
     return ListPromptsResult(
         prompts=[Prompt(name="greet", description="Create a greeting.", arguments=[
             PromptArgument(name="who", required=True, description="Name to greet."),
@@ -90,6 +90,11 @@ async def get_prompt(ctx, params):
         return GetPromptResult(messages=[
             PromptMessage(role="user", content=TextContent(type="text", text="first")),
             PromptMessage(role="assistant", content=ImageContent(type="image", data="AA==", mime_type="image/png")),
+        ])
+    if params.name == "dialogue":
+        return GetPromptResult(messages=[
+            PromptMessage(role="user", content=TextContent(type="text", text="Review the project.")),
+            PromptMessage(role="assistant", content=TextContent(type="text", text="I will check tests.")),
         ])
     if params.name == "large":
         text = "界" * 30_000

@@ -570,13 +570,42 @@ class WebTests(unittest.TestCase):
             {"role": "user", "content": {"type": "text", "text": "first"}},
             {"role": "assistant", "content": {"type": "image"}},
         ])
+        self.assertIsNone(bundle["preview_id"])
+        self.command("mcp_run_prompt", sid, 409, preview_id="a" * 32, texts=["first"])
         self.command("mcp_get_prompt", sid, 409, server="demo", name="greet", arguments={"who": 7})
         after = self.snapshot()
         self.assertEqual(after["state"]["messages"], before["state"]["messages"])
         self.assertEqual(after["state"]["enabled_tools"], before["state"]["enabled_tools"])
         self.assertEqual(self.requests, [])
+        self.command("mcp_run_prompt", sid, 400, preview_id=result["preview_id"], texts=[API_KEY])
+        visible_text = result["messages"][0]["content"]["text"]
+        self.command("mcp_run_prompt", sid, 202, preview_id=result["preview_id"], texts=[visible_text])
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(self.requests[0]["messages"][1:], [{"role": "user", "content": visible_text}])
+
+        dialogue = self.command("mcp_get_prompt", sid, server="demo", name="dialogue",
+                                arguments={})["mcp_prompt_result"]
+        preview_id = dialogue["preview_id"]
+        texts = ["Review this code.", "I will look for regressions.", "Begin."]
+        self.command("mcp_run_prompt", sid, 400, preview_id=preview_id, texts=texts[:2])
+        self.command("mcp_run_prompt", sid, 202, preview_id=preview_id, texts=texts)
+        saved = self.history.load(sid)
+        group = saved.prompt_groups[-1]
+        self.assertEqual((group.server, group.prompt, group.edited), ("demo", "dialogue", True))
+        expected = [{"role": role, "content": text} for role, text in zip(("user", "assistant", "user"), texts)]
+        self.assertEqual(saved.messages.snapshot()[group.start:group.end], expected)
+        self.command("mcp_run_prompt", sid, 202, preview_id=preview_id, texts=texts)
+        self.command("mcp_run_prompt", sid, 409, preview_id=preview_id, texts=[*texts[:2], "Different."])
+        reconnected = self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.requests[-1]["messages"][-3:], expected)
+        self.assertEqual(reconnected["state"]["prompt_groups"][-1]["id"], preview_id)
+
+        old_preview = self.command("mcp_get_prompt", sid, server="demo", name="dialogue",
+                                    arguments={})["mcp_prompt_result"]["preview_id"]
         self.command("new", sid)
         self.command("mcp_list_prompts", sid, 409, server="demo")
+        self.command("mcp_run_prompt", self.snapshot()["session_id"], 409, preview_id=old_preview, texts=texts)
 
     def test_attachment_send_is_committed_before_ack_and_deduplicated(self):
         sid = self.snapshot()["session_id"]

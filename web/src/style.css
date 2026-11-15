@@ -252,7 +252,10 @@ dialog fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .prompt-panel, .prompt-preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .prompt-panel > .mcp-text-button { justify-self: start; font-size: .87rem; }
 .prompt-preview { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 10px; }
-.prompt-message pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 0; padding: 8px; background: var(--soft); max-height: 28dvh; overflow: auto; }
+.prompt-message textarea { min-width: 0; max-height: 28dvh; }
+.prompt-preview > .mcp-text-button { justify-self: start; }
+.prompt-transcript { display: grid; gap: 10px; border-left: 1px solid var(--line); padding-left: 12px; min-width: 0; }
+.prompt-source { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 12px; font-size: .8rem; overflow-wrap: anywhere; }
 input[type=checkbox] { accent-color: #111; }
 
 .access { min-height: 100dvh; display: grid; place-items: center; padding: 20px; }

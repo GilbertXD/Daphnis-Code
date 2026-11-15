@@ -53,7 +53,17 @@ export type MCPPrompt = {
 export type MCPPromptResult = {
   description: string
   redacted: boolean
+  preview_id: string | null
   messages: { role: 'user' | 'assistant'; content: { type: string; text?: string } }[]
+}
+
+export type PromptGroup = {
+  id: string
+  server: string
+  prompt: string
+  start: number
+  end: number
+  edited: boolean
 }
 
 export type RegistryRemote = {
@@ -173,6 +183,7 @@ type State = {
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
+  prompt_groups: PromptGroup[]
   attachment_refs?: Record<number, { id: string; name: string }[]>
   recovery: Recovery | null
   model: Model

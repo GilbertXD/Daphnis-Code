@@ -78,16 +78,26 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         ops.subscribe("tool.approval_requested", approve)
 
     async def test_complete_tool_results_can_continue_or_terminate(self):
+        await self.check_complete_tool_recovery(grouped=False)
+
+    async def test_prompt_group_can_continue_or_terminate(self):
+        await self.check_complete_tool_recovery(grouped=True)
+
+    async def check_complete_tool_recovery(self, *, grouped):
         for terminate in (False, True):
             with self.subTest(terminate=terminate):
                 self.requests.clear()
                 ops = self.application(interactive=terminate, max_primary_requests=1)
                 if terminate:
                     self.approve_writes(ops)
-                prompt = PromptInput("writes", "test", "writes", (
-                    ("assistant", "Sample response"), ("user", "Write files"),
-                ))
-                paused = await asyncio.wait_for(ops.run_mcp_prompt(prompt, stream=False), 3)
+                if grouped:
+                    prompt = PromptInput("writes", "test", "writes", (
+                        ("assistant", "Sample response"), ("user", "Write files"),
+                    ))
+                    pending = ops.run_mcp_prompt(prompt, stream=False)
+                else:
+                    pending = ops.send("write files", stream=False)
+                paused = await asyncio.wait_for(pending, 3)
                 self.assertEqual(paused.status, TurnStatus.PAUSED_LIMIT)
                 original = tool_results(self.saved(ops))
                 resumed = self.application(restore=ops.session.id)

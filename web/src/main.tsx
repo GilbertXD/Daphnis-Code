@@ -366,7 +366,6 @@ function Workspace({ view, connected, command }: {
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
   const inFlight = useRef(false)
   const [notice, setNotice] = useState('')
-  const composerInput = useRef<HTMLTextAreaElement>(null)
   const { state, status, session_id: id } = view
   useEffect(() => {
     setModal((current) => current?.action === 'prompts' && current.sessionId !== id ? null : current)
@@ -530,7 +529,7 @@ function Workspace({ view, connected, command }: {
             event.currentTarget.value = ''
             void addFiles(selected)
           }} />
-          <textarea ref={composerInput} aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
+          <textarea aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
             onChange={(event) => updateDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
@@ -570,7 +569,7 @@ function Workspace({ view, connected, command }: {
               <button type="button" disabled={!connected} onClick={() => {
                 setNotice('')
                 setModal({ action: 'prompts', sessionId: id })
-              }}>模板</button>
+              }}>Prompts</button>
               <button type="button" disabled={disabled} onClick={() => {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
@@ -612,12 +611,14 @@ function Workspace({ view, connected, command }: {
         notice={notice} perform={perform} command={command} />
     </Dialog>}
     {modal?.action === 'prompts' && modal.sessionId === id &&
-      <Dialog title="MCP 模板" close={() => setModal(null)} className="mcp-dialog">
-        <PromptPicker servers={state.mcp_prompt_servers} connected={connected} command={command} insert={(text) => {
-          updateDraft((current) => current ? `${current}\n\n${text}` : text)
-          setModal(null)
-          requestAnimationFrame(() => composerInput.current?.focus())
-        }} />
+      <Dialog title="MCP Prompts" close={() => setModal(null)} className="mcp-dialog">
+        <PromptPicker servers={state.mcp_prompt_servers} connected={connected} command={command}
+          runDisabled={disabled || interrupted} run={async (previewId, texts) => {
+            if (await perform('mcp_run_prompt', { session_id: modal.sessionId, preview_id: previewId, texts })) {
+              setModal((current) => current === modal ? null : current)
+            }
+          }} />
+        {notice && <p role="alert">{notice}</p>}
       </Dialog>}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}

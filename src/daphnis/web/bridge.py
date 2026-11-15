@@ -5,15 +5,17 @@ import json
 import time
 from collections import OrderedDict, deque
 from dataclasses import asdict, fields
+from functools import partial
 from uuid import uuid4
 
 from ..attachments import ATTACHMENT_ONLY_PROMPT, ATTACHMENT_TOOLS
 from ..history import SessionScan
 from ..operations import Operations
+from ..prompt_groups import PromptInput
 from .redaction import Redactor
 
 _EVENT_NAMES = (
-    "turn.started", "turn.finished", "attachments.committed", "model.started", "model.request",
+    "turn.started", "turn.finished", "attachments.committed", "prompt.committed", "model.started", "model.request",
     "model.delta", "model.usage", "model.finished", "model.response_error",
     "tool.started", "tool.approval_requested", "tool.blocked", "tool.executing", "tool.finished",
     "mcp.error", "mcp.tools_changed",
@@ -74,6 +76,8 @@ class Bridge:
         self.task = None
         self.run = None
         self.upload = None
+        self.prompt_run = None
+        self.prompt_previews = OrderedDict()
         self.live = {}
         self.lock = asyncio.Lock()
         self._subscriptions = [ops.subscribe(name, self._forward) for name in _EVENT_NAMES]
@@ -109,6 +113,13 @@ class Bridge:
             if self.upload and self.run and self.run["session_id"] == event.session_id:
                 submission_id, _, _, accepted = self.upload
                 if submission_id == data["submission_id"] and not accepted.done():
+                    accepted.set_result(None)
+            self._notify(state=True)
+            return
+        if event.name == "prompt.committed":
+            if self.prompt_run and self.run and self.run["session_id"] == event.session_id:
+                prompt_input, accepted = self.prompt_run
+                if prompt_input.id == data["group_id"] and not accepted.done():
                     accepted.set_result(None)
             self._notify(state=True)
             return
@@ -183,6 +194,7 @@ class Bridge:
             "history_error": history_error,
             "messages": _browser_messages(ops.message_snapshot()),
             "attachment_refs": ops.attachment_snapshot(),
+            "prompt_groups": [asdict(group) for group in ops.prompt_groups],
             "recovery": asdict(recovery) if (recovery := ops.recovery) else None,
             "model": _model_view(ops.model),
             "models": [
@@ -254,7 +266,14 @@ class Bridge:
             frame["state"] = self.state()
         return frame
 
-    def start(self, prompt, *, operation=None, attachments=(), submission_id=None):
+    def cache_prompt_preview(self, session, server, name, messages):
+        preview_id = uuid4().hex
+        self.prompt_previews[preview_id] = (session, server, name, messages)
+        if len(self.prompt_previews) > 16:
+            self.prompt_previews.popitem(last=False)
+        return preview_id
+
+    def start(self, prompt, *, operation=None, attachments=(), submission_id=None, prompt_input: PromptInput | None = None):
         session_id = self.ops.session.id
         self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
                     "base_count": len(self.ops.message_snapshot())}
@@ -264,6 +283,10 @@ class Bridge:
             self.run["attachments"] = [item.name for item in attachments]
             accepted = asyncio.get_running_loop().create_future()
             self.upload = (submission_id, prompt, attachments, accepted)
+        elif prompt_input is not None:
+            accepted = asyncio.get_running_loop().create_future()
+            self.prompt_run = (prompt_input, accepted)
+            operation = partial(self.ops.run_mcp_prompt, prompt_input)
         self.live.clear()
         self.task = asyncio.create_task(self._send(prompt, session_id, operation, attachments, submission_id, accepted))
         self._notify()
@@ -290,9 +313,10 @@ class Bridge:
             result = {"status": "FAILED", "error": str(exc)}
         finally:
             if accepted is not None and not accepted.done():
-                accepted.set_result(self.redactor.text(result["error"] or "附件发送未成功。"))
+                accepted.set_result(self.redactor.text(result["error"] or "任务未能保存。"))
             self._record("web.send_finished", session_id, self.run["turn_id"], result)
             self.upload = None
+            self.prompt_run = None
             self.run = None
             self.live.clear()
             self._notify(state=True)

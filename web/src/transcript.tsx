@@ -165,17 +165,43 @@ function savedResult(message: Message): { status: string; error?: unknown } {
   return { status: '已保存' }
 }
 
-const Committed = memo(function Committed({ messages, tools, turns, retry, recoveryTurn, attachmentRefs }: {
+const Committed = memo(function Committed({ messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups }: {
   messages: Message[]
   tools: TraceTool[]
   turns: { id: string; start: number; end: number }[]
   retry?: Retry
   recoveryTurn?: string
   attachmentRefs: View['state']['attachment_refs']
+  promptGroups: View['state']['prompt_groups']
 }) {
   let calls: Message['tool_calls'] = null
   let request = 0
+  const groups = new Map((promptGroups ?? []).map((group) => [group.start, group]))
+  let promptEnd = 0
   return messages.map((message, index) => {
+    const group = groups.get(index)
+    if (group) {
+      promptEnd = group.end
+      request = 0
+      calls = null
+      const state = message.daphnis_turn_state
+      const taskRetry = retry?.index === index ? retry : undefined
+      return <section className="prompt-transcript" key={group.id} aria-label="MCP Prompt">
+        <div className="prompt-source muted">
+          <span>{group.server} / {group.prompt}</span>
+          {state === 'ABANDONED' && <small>已作废</small>}
+          {state === 'TERMINATED' && <small>任务已终止</small>}
+          {taskRetry && (messages[group.end - 1]?.role === 'user'
+            ? <button type="button" className="mcp-text-button" disabled={taskRetry.disabled}
+              onClick={taskRetry.run}>重试 Prompt</button>
+            : <small>当前模型无法续写 Assistant 结尾的 Prompt，请发送新消息。</small>)}
+        </div>
+        {messages.slice(index, group.end).map((item, offset) => item.role === 'user'
+          ? <UserMessage key={offset} text={messageText(item)} />
+          : <AssistantMessage key={offset} text={messageText(item)} />)}
+      </section>
+    }
+    if (index < promptEnd) return null
     if (message.role === 'user') {
       request = 0
       calls = null
@@ -222,7 +248,9 @@ export function Transcript({ view, tools, retry }: { view: View; tools: TraceToo
     ]
   })
   const { run, live, events } = view
-  const committed = run ? view.state.messages.slice(0, run.base_count) : view.state.messages
+  const promptGroups = view.state.prompt_groups
+  const activeGroup = run && promptGroups?.find((group) => group.start === run.base_count)
+  const committed = run ? view.state.messages.slice(0, activeGroup ? activeGroup.end : run.base_count) : view.state.messages
   const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id && tool.number > 0) : []
   const finished = run?.turn_id
     ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
@@ -243,8 +271,8 @@ export function Transcript({ view, tools, retry }: { view: View; tools: TraceToo
         <p>描述任务，或让 Agent 检查当前工作区。</p>
       </div>}
       <Committed messages={committed} tools={tools} turns={turns} retry={retry}
-        attachmentRefs={view.state.attachment_refs}
-        recoveryTurn={run?.prompt === null ? run.turn_id : undefined} />
+        attachmentRefs={view.state.attachment_refs} promptGroups={promptGroups}
+        recoveryTurn={run?.prompt === null && !activeGroup ? run.turn_id : undefined} />
       {run && <>
         {run.prompt !== null && <UserMessage text={run.prompt}
           attachments={run.attachments?.map((name, index) => ({ id: String(index), name }))} />}

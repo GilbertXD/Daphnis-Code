@@ -3,7 +3,6 @@
 import json
 import re
 from dataclasses import dataclass
-from typing import Any
 
 MAX_PROMPT_BYTES = 65_536
 MAX_PROMPT_MESSAGES = 64
@@ -12,7 +11,7 @@ PROMPT_ROLES = ("user", "assistant")
 
 def _identifier(value: str, *, limit: int = 256) -> None:
     if (not isinstance(value, str) or not value.strip() or len(value) > limit
-        or not value.isprintable()):
+        or re.search(r"[\x00-\x1f\x7f-\x9f]", value)):
         raise ValueError("无效的 MCP Prompt 标识。")
     value.encode("utf-8")
 
@@ -69,7 +68,3 @@ class PromptInput:
 
     def snapshot(self) -> list[dict[str, str]]:
         return [{"role": role, "content": text} for role, text in self.messages]
-
-
-def input_matches(group: PromptGroup, messages: list[dict[str, Any]], submitted: tuple[tuple[str, str], ...]) -> bool:
-    return submitted == tuple((m["role"], m["content"]) for m in messages[group.start:group.end])

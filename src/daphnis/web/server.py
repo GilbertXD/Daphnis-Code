@@ -16,6 +16,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from ..attachments import MAX_FILES, TextAttachmentInput, valid_id
 from ..mcp_registry import RegistryDiscovery, RegistryError
+from ..prompt_groups import MAX_PROMPT_MESSAGES, PROMPT_ROLES, PromptInput
 from ..tools.approval import ApprovalMode
 from ..turn_state import RecoveryKind
 
@@ -41,6 +42,7 @@ _FIELDS = {
     "mcp_delete": {"name": str},
     "mcp_list_prompts": {"server": str},
     "mcp_get_prompt": {"server": str, "name": str, "arguments": dict},
+    "mcp_run_prompt": {"preview_id": str, "texts": list},
     "registry_search": {"query": str, "cursor": (str, type(None))},
     "registry_detail": {"registry_name": str, "version": str},
     "mcp_add_registry": {"name": str, "registry_name": str, "version": str, "url": str, "auth_env": (str, type(None))},
@@ -140,6 +142,49 @@ async def _send_attachments(bridge, session, args):
             if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
             accepted = bridge.start(prompt, attachments=attachments, submission_id=submission_id)
+    error = await asyncio.shield(accepted)
+    if error is not None:
+        raise RequestError(error, 409)
+    return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
+
+
+async def _run_prompt(bridge, session, args):
+    preview_id = args["preview_id"]
+    texts = tuple(args["texts"])
+    if (not valid_id(preview_id) or not 0 < len(texts) <= MAX_PROMPT_MESSAGES
+        or any(not isinstance(text, str) for text in texts)):
+        raise RequestError("MCP Prompt 运行字段无效。")
+    async with bridge.lock:
+        ops = bridge.ops
+        if ops.session.id != session:
+            raise RequestError("当前会话已切换，请重新操作。", 409)
+        if ops.prompt_submitted(preview_id, texts):
+            return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
+        if bridge.prompt_run and bridge.prompt_run[0].id == preview_id:
+            previous, accepted = bridge.prompt_run
+            if texts != tuple(text for _, text in previous.messages):
+                raise RequestError("该 MCP Prompt 运行标识已用于不同内容。", 409)
+        else:
+            if bridge.run is not None or ops.running:
+                raise RequestError("请先等待或停止当前轮。", 409)
+            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+                raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
+            preview = bridge.prompt_previews.get(preview_id)
+            if preview is None or preview[0] != session:
+                raise RequestError("MCP Prompt 预览已失效，请重新生成。", 409)
+            _, server, name, original = preview
+            roles = tuple(role for role, _ in original)
+            if len(texts) == len(roles) + 1:
+                roles = (*roles, "user")
+            if len(texts) != len(roles):
+                raise RequestError("需保留预览中的全部消息及顺序。")
+            if roles[-1] != "user":
+                raise RequestError("当前模型接口需要以 User 消息结束。请补充一条 User 消息。")
+            if any(bridge.redactor.text(text) != text for text in texts):
+                raise RequestError("编辑内容中检测到凭据。请移除凭据并重新确认。")
+            messages = tuple(zip(roles, texts, strict=True))
+            prompt_input = PromptInput(preview_id, server, name, messages, edited=messages != original)
+            accepted = bridge.start(None, prompt_input=prompt_input)
     error = await asyncio.shield(accepted)
     if error is not None:
         raise RequestError(error, 409)
@@ -272,8 +317,19 @@ async def _prompt_response(bridge, action, session, args):
                 content["text"] = redactor.text(message.content.text)
                 redacted |= content["text"] != message.content.text
             messages.append({"role": message.role, "content": content})
+        if bridge.ops.session.id != session:
+            raise RequestError("当前会话已切换，请重新打开 Prompts。", 409)
+        runnable = (
+            0 < len(messages) <= MAX_PROMPT_MESSAGES
+            and all(message["role"] in PROMPT_ROLES and message["content"]["type"] == "text" for message in messages)
+        )
+        preview_id = bridge.cache_prompt_preview(
+            session, args["server"], args["name"],
+            tuple((message["role"], message["content"]["text"]) for message in messages),
+        ) if runnable else None
         response = {"mcp_prompt_result": {
             "description": redactor.text(result.description or ""), "messages": messages, "redacted": redacted,
+            "preview_id": preview_id,
         }}
     if bridge.ops.session.id != session:
         raise RequestError("当前会话已切换，请重新打开模板。", 409)
@@ -313,6 +369,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             action, session, args = await _command(request)
             if action == "send_attachments":
                 return await _send_attachments(bridge, session, args)
+            if action == "mcp_run_prompt":
+                return await _run_prompt(bridge, session, args)
             if action in _PROMPT_ACTIONS:
                 return await _prompt_response(bridge, action, session, args)
             if action in {"registry_search", "registry_detail"}:

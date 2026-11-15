@@ -1,10 +1,10 @@
 # MCP 路线图
 
-目前 Web 支持由用户选择 MCP Prompt、填写参数并预览结果。可以插入单条用户角色的纯文本消息。以下是后续工作记录。
+Web 支持从 MCP Prompt 生成、编辑并直接运行有序 User / Assistant 文本消息组，沿用 Session 历史、整轮恢复和压缩。
 
 ## A. Prompts 完整能力
 
-- **A1｜多消息 Prompt**：支持多条 User / Assistant 消息并保留角色和顺序。需要明确 Context 构造、Session 持久化、失败恢复、Compaction 与角色安全边界。
+- **A1｜Assistant 续写**：评估模型适配层的 Assistant 前缀能力。目前以 Assistant 结尾的 Prompt 需要用户补充一条 User 消息才能运行。
 - **A2｜非文本内容**：支持图片、嵌入资源等内容，并与 Daphnis 的多模态模型能力和消息表示协调。
 - **A3｜目录变化通知**：接收服务端的 Prompts 目录变化通知，按需刷新列表。
 - **A4｜参数自动补全**：接入 MCP Completions，为模板参数提供候选值。
