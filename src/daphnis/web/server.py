@@ -31,6 +31,10 @@ _FIELDS = {
     "thinking": {"mode": (str, type(None))},
     "system": {"prompt": (str, type(None))},
     "tools": {"names": list},
+    "mcp_save": {"name": str, "enabled": bool, "options": dict, "create": bool},
+    "mcp_enable": {"name": str, "enabled": bool},
+    "mcp_restart": {"name": str},
+    "mcp_delete": {"name": str},
     "set_approval_mode": {"mode": str},
     "confirm_full": {},
     "send": {"prompt": str},
@@ -148,6 +152,12 @@ async def _execute(bridge, action, session, args):
                 await ops.set_system_prompt(args["prompt"])
         case "tools":
             await ops.set_tools(args["names"])
+        case "mcp_save" | "mcp_enable":
+            return await ops.save_mcp(**args)
+        case "mcp_restart":
+            return await ops.restart_mcp(args["name"])
+        case "mcp_delete":
+            await ops.delete_mcp(args["name"])
         case "set_approval_mode":
             ops.set_approval_mode(args["mode"])
         case "confirm_full":

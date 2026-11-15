@@ -145,7 +145,14 @@ class Bridge:
         except OSError as exc:
             projects = ()
             projects_error = f"无法读取项目目录（{type(exc).__name__}）。"
-        return self.redactor.json({
+        mcp_error = None
+        try:
+            servers = ops.managed_mcp()
+        except (OSError, TypeError, ValueError):
+            servers = ()
+            mcp_error = "无法读取已保存的 MCP 配置，请检查 mcp.json。"
+        statuses = {status.name: status for status in ops.mcp_status()}
+        state = self.redactor.json({
             "session": asdict(ops.session),
             "sessions": [asdict(session) for session in history.sessions],
             "projects": [asdict(project) for project in projects],
@@ -166,6 +173,21 @@ class Bridge:
             "effective_tools": ops.effective_tools,
             "approval_mode": ops.approval_mode,
         })
+        state["mcp_error"] = mcp_error
+        state["mcp_servers"] = []
+        for server in servers:
+            status = statuses.get(server.name)
+            options = self.redactor.json(server.options)
+            if "env" in options:
+                # These are variable names, not the resolved process environment.
+                options["env"] = server.options["env"]
+            state["mcp_servers"].append({
+                "name": server.name, "enabled": server.enabled, "options": options,
+                "state": status.state if status and server.enabled else "Disconnected",
+                "tool_count": status.tool_count if status and server.enabled else 0,
+                "error": self.redactor.text(status.error) if status and server.enabled and status.error else None,
+            })
+        return state
 
     def frame(self, previous_session="", revision=-1, cursor=0):
         ops = self.ops

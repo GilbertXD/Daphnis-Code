@@ -3,6 +3,7 @@ import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Debug } from './debug'
 import type { Tab } from './debug'
+import { MCPManager } from './mcp'
 import { sessionTitle, useConnection } from './protocol'
 import type { Approval, Command, Model, Project, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
@@ -267,7 +268,7 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
   </Dialog>
 }
 
-type Modal = { action: 'tools' | 'project' } | { action: 'system'; sessionId: string }
+type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system'; sessionId: string }
   | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
   | { action: 'move'; session: Session }
@@ -336,9 +337,15 @@ function Workspace({ view, connected, command }: {
       aria-expanded={sidebar} onClick={() => setSidebar(!sidebar)}>☰</button><strong>Daphnis</strong></header>
     <header className="topbar">
       <h1>{sessionTitle(state.session)}</h1>
-      <span className={`connection ${connected ? '' : 'offline'}`} role="status">
-        <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
-      </span>
+      <div className="topbar-actions">
+        <button type="button" aria-haspopup="dialog" onClick={() => {
+          setNotice('')
+          setModal({ action: 'mcp' })
+        }}>MCP</button>
+        <span className={`connection ${connected ? '' : 'offline'}`} role="status">
+          <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
+        </span>
+      </div>
     </header>
     <Sidebar projects={state.projects} sessions={sessions} selected={id} disabled={disabled} visible={sidebar}
       projectsError={state.projects_error} historyError={state.history_error}
@@ -446,6 +453,10 @@ function Workspace({ view, connected, command }: {
         onClick={() => setOpen(true)}><span aria-hidden="true">‹</span></button>}
     {modal?.action === 'tools' && <ToolsDialog view={view} close={() => setModal(null)} disabled={disabled}
       notice={notice} apply={(names) => perform('tools', { names })} />}
+    {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)}>
+      <MCPManager servers={state.mcp_servers} disabled={disabled} error={state.mcp_error}
+        notice={notice} perform={perform} />
+    </Dialog>}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
     {modal?.action === 'confirm_full' && modal.sessionId === id && <Dialog title="启用 FULL" close={() => setModal(null)}>

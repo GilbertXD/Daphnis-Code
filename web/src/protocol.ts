@@ -23,6 +23,25 @@ export type Session = {
 
 export type Project = { id: string; name: string; workspace: string }
 
+export type MCPOptions = {
+  transport: 'stdio' | 'streamable_http'
+  command?: string
+  args?: string[]
+  cwd?: string
+  env?: Record<string, string>
+  url?: string
+  auth?: { type: 'bearer'; env: string }
+}
+
+export type MCPServer = {
+  name: string
+  options: MCPOptions
+  enabled: boolean
+  state: string
+  tool_count: number
+  error: string | null
+}
+
 type HistoryIssue = { filename: string; error: string }
 
 export type ToolCall = { id: string; function: { name: string; arguments: string } }
@@ -112,6 +131,8 @@ type State = {
   sessions: Session[]
   projects: Project[]
   projects_error: string | null
+  mcp_servers: MCPServer[]
+  mcp_error: string | null
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]

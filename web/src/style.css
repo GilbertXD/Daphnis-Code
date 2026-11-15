@@ -43,6 +43,7 @@ a { color: inherit; text-underline-offset: 3px; }
 .brand strong { font-size: 1.72rem; letter-spacing: -.055em; }
 .topbar { grid-area: header; justify-content: space-between; gap: 12px; padding: 0 24px; }
 .topbar h1 { font-size: 1.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topbar-actions { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .menu-toggle { display: none; }
 .connection { white-space: nowrap; font: .74rem var(--mono); display: flex; align-items: center; gap: 7px; }
 .connection span { width: 7px; height: 7px; border: 1px solid #222; background: #222; }
@@ -180,9 +181,14 @@ dialog::backdrop { background: rgb(0 0 0 / 18%); }
 .dialog-heading { display: flex; align-items: center; justify-content: space-between; margin: -5px 0 10px; }
 .dialog-heading h2 { font-size: 1.06rem; }
 .field { display: grid; gap: 6px; font-size: .9rem; margin: 10px 0; }
-.field input, .field textarea { width: 100%; border: 1px solid var(--line); padding: 8px; background: #fff; }
+.field input, .field textarea, .field select { width: 100%; border: 1px solid var(--line); padding: 8px; background: #fff; }
 .field textarea { resize: vertical; }
 .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-top: 9px; font-size: .85rem; }
+.mcp-list { list-style: none; margin: 0; padding: 0; }
+.mcp-list li { border-bottom: 1px solid var(--line); padding: 10px 0; overflow-wrap: anywhere; }
+.mcp-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
+.mcp-summary label { margin-left: auto; }
+dialog fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .tool-options { max-height: 42dvh; overflow: auto; margin: 8px 0; }
 .tool-options label { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 input[type=checkbox] { accent-color: #111; }

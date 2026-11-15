@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -91,7 +92,13 @@ class WebTests(unittest.TestCase):
                 ))
             if last.get("content") == "force-error":
                 return httpx.Response(429, json={"error": {"api_key": API_KEY, "message": "Rate limit"}})
-            if last.get("content") == "test patch":
+            if last.get("content") == "test mcp":
+                payload = chunk({"role": "assistant", "tool_calls": [{
+                    "index": 0, "id": "mcp-call", "type": "function", "function": {
+                        "name": "mcp__demo__add", "arguments": '{"a":2,"b":3}',
+                    },
+                }]}, "tool_calls")
+            elif last.get("content") == "test patch":
                 payload = chunk({"role": "assistant", "tool_calls": [{
                     "index": 0, "id": "call", "type": "function", "function": {
                         "name": "apply_patch", "arguments": json.dumps({
@@ -501,6 +508,40 @@ class WebTests(unittest.TestCase):
         self.assertEqual((self.workspace / "new.txt").read_text(), "approved\n")
         self.assertIsNone(done["status"]["approval"])
         self.assertEqual(sum(e["name"] == "tool.approval_requested" for e in done["events"]), 1)
+
+    def test_mcp_management_updates_tools_and_preserves_approval(self):
+        sid = self.snapshot()["session_id"]
+        options = {
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+            "env": {"DEMO_TOKEN": "PATH"},
+        }
+        self.command("mcp_save", sid, name="demo", enabled=False, options=options, create=True)
+        (server,) = self.snapshot()["state"]["mcp_servers"]
+        self.assertFalse(server["enabled"])
+        self.assertEqual(server["options"]["env"], options["env"])
+        self.assertEqual(server["state"], "Disconnected")
+        self.command("mcp_enable", sid, name="demo", enabled=True)
+        state = self.snapshot()["state"]
+        self.assertEqual(state["mcp_servers"][0]["tool_count"], 2)
+        self.assertIn("mcp__demo__add", state["all_tools"])
+        self.command("tools", sid, names=["mcp__demo__add"])
+        self.command("send", sid, 202, prompt="test mcp")
+        approval = self.wait_for(lambda frame: frame["status"]["approval"])["status"]["approval"]
+        self.command("mcp_enable", sid, 409, name="demo", enabled=False)
+        self.command("approve", sid, request_id=approval["request_id"], decision="allow_once")
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual((self.workspace / "calls").read_text(), "add 2 3\n")
+        self.command("mcp_restart", sid, name="demo")
+        self.command("mcp_enable", sid, name="demo", enabled=False)
+        state = self.snapshot()["state"]
+        self.assertIn("mcp__demo__add", state["enabled_tools"])
+        self.assertNotIn("mcp__demo__add", state["all_tools"])
+        self.command("mcp_save", sid, name="demo", enabled=False, create=False,
+                     options={"transport": "streamable_http", "url": "https://mcp.example/mcp"})
+        self.assertEqual(self.snapshot()["state"]["mcp_servers"][0]["options"]["transport"], "streamable_http")
+        self.command("mcp_delete", sid, name="demo")
+        self.assertEqual(self.snapshot()["state"]["mcp_servers"], [])
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)
