@@ -147,6 +147,15 @@ def _valid_prompt_name(name: str) -> bool:
     )
 
 
+def validate_prompt_request(name: str, arguments: dict[str, str]) -> None:
+    if not _valid_prompt_name(name) or not isinstance(arguments, dict) or len(arguments) > _PROMPT_FIELDS:
+        raise ValueError("MCP 模板名称或参数无效。")
+    if not all(_valid_prompt_name(key) and isinstance(value, str) for key, value in arguments.items()):
+        raise ValueError("MCP 模板参数必须是字符串。")
+    if _json_size(arguments, _PROMPT_BYTES) is None:
+        raise ValueError("MCP 模板参数超出大小上限。")
+
+
 class _WatchedReadStream:
     """Notify the owner when the SDK's receive stream reaches EOF."""
 
@@ -545,12 +554,7 @@ class MCPConnection:
             raise MCPPromptError("MCP 模板列表超出分页上限。")
 
     async def get_prompt(self, name: str, arguments: dict[str, str]) -> GetPromptResult:
-        if not _valid_prompt_name(name) or not isinstance(arguments, dict) or len(arguments) > _PROMPT_FIELDS:
-            raise ValueError("MCP 模板名称或参数无效。")
-        if not all(_valid_prompt_name(key) and isinstance(value, str) for key, value in arguments.items()):
-            raise ValueError("MCP 模板参数必须是字符串。")
-        if _json_size(arguments, _PROMPT_BYTES) is None:
-            raise ValueError("MCP 模板参数超出大小上限。")
+        validate_prompt_request(name, arguments)
         async with self._prompt_request() as client:
             # Do not drive server-requested sampling, elicitation, or additional input.
             result = await client.session.get_prompt(name, arguments)

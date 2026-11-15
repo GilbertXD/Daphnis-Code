@@ -75,6 +75,19 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(MCPPromptError, "大小上限"):
                     await connection.get_prompt("large", {})
                 self.assertEqual((await connection.call("add", {"a": 2, "b": 3}))["structured_content"], {"sum": 5})
+                self.assertEqual(ops.list_mcp_prompt_servers(), ("prompt-only", "both"))
+                self.assertEqual(await ops.list_mcp_prompts("both"), prompts)
+                with self.assertRaisesRegex(MCPPromptError, "未连接"):
+                    await ops.list_mcp_prompts("missing")
+                with self.assertRaisesRegex(ValueError, "必填"):
+                    await ops.get_mcp_prompt("both", "greet", {})
+                with self.assertRaisesRegex(ValueError, "未定义"):
+                    await ops.get_mcp_prompt("both", "greet", {"who": "Ada", "extra": "no"})
+                with self.assertRaisesRegex(ValueError, "未找到"):
+                    await ops.get_mcp_prompt("both", "missing", {})
+                self.assertEqual(await ops.get_mcp_prompt("both", "bundle", {}), bundle)
+                self.assertEqual(ops.message_snapshot(), [])
+                self.assertEqual(ops.list_sessions(), ())
             finally:
                 await ops.close()
 

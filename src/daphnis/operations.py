@@ -13,7 +13,7 @@ from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
 from .events import Callback
 from .history import SessionLease, finish_io
-from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
+from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
 from .mcp_store import MCPServerConfig
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .project import Project
@@ -22,6 +22,8 @@ from .tools import ApprovalDecision, ApprovalMode
 from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
 
 if TYPE_CHECKING:
+    from mcp.types import GetPromptResult, Prompt
+
     from .agent import TurnResult
     from .app import Application
     from .history import SessionInfo, SessionScan
@@ -380,6 +382,26 @@ class Operations:
             if server.available
             for tool in server.tools
         )
+
+    def list_mcp_prompt_servers(self) -> tuple[str, ...]:
+        return tuple(server.name for server in self._app._mcp.values() if server.supports_prompts)
+
+    async def list_mcp_prompts(self, server: str) -> "tuple[Prompt, ...]":
+        return await self._app._mcp_prompt_connection(server).list_prompts()
+
+    async def get_mcp_prompt(self, server: str, name: str, arguments: dict[str, str]) -> "GetPromptResult":
+        connection = self._app._mcp_prompt_connection(server)
+        validate_prompt_request(name, arguments)
+        arguments = dict(arguments)
+        prompt = next((item for item in await connection.list_prompts() if item.name == name), None)
+        if prompt is None:
+            raise ValueError("未找到该 MCP 模板，请刷新模板列表。")
+        fields = {field.name: field for field in prompt.arguments or ()}
+        if arguments.keys() - fields.keys():
+            raise ValueError("MCP 模板包含未定义的参数。")
+        if any(field.required and not arguments.get(field.name, "").strip() for field in fields.values()):
+            raise ValueError("请填写 MCP 模板的必填参数。")
+        return await connection.get_prompt(name, arguments)
 
     def list_sessions(self) -> "tuple[SessionInfo, ...]":
         return self._app._history.list_sessions()

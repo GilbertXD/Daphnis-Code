@@ -24,7 +24,7 @@ from .history import (
     SessionLease,
     finish_io,
 )
-from .mcp import TOOL_PREFIX, MCPConnection
+from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError
 from .mcp_store import MCPStore
 from .model_io import ObservedChatClient
 from .models import (
@@ -212,6 +212,15 @@ class Application:
         await self.events.emit(
             "mcp.error", session_id=self._session.id, turn_id="", server=name, error=error
         )
+
+    def _mcp_prompt_connection(self, server: str) -> MCPConnection:
+        self._ensure_open()
+        connection = self._mcp.get(server) if isinstance(server, str) else None
+        if connection is None or not connection.available:
+            raise MCPPromptError("MCP 服务未连接。")
+        if not connection.supports_prompts:
+            raise MCPPromptError("此 MCP 服务不支持模板。")
+        return connection
 
     def _mcp_catalog(self, connecting: MCPConnection | None = None) -> ToolExecutor:
         return create_tools(
