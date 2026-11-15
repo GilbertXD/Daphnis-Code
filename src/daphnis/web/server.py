@@ -36,6 +36,8 @@ _FIELDS = {
     "mcp_enable": {"name": str, "enabled": bool},
     "mcp_restart": {"name": str},
     "mcp_delete": {"name": str},
+    "mcp_list_prompts": {"server": str},
+    "mcp_get_prompt": {"server": str, "name": str, "arguments": dict},
     "registry_search": {"query": str, "cursor": (str, type(None))},
     "registry_detail": {"registry_name": str, "version": str},
     "mcp_add_registry": {"name": str, "registry_name": str, "version": str, "url": str, "auth_env": (str, type(None))},
@@ -49,6 +51,7 @@ _FIELDS = {
     "approve": {"request_id": str, "decision": str},
 }
 _RUN_ACTIONS = {"send", "retry", "continue", "terminate"}
+_PROMPT_ACTIONS = {"mcp_list_prompts", "mcp_get_prompt"}
 
 
 class RequestError(ValueError):
@@ -200,6 +203,42 @@ async def _execute(bridge, action, session, args, discovery):
     return None
 
 
+async def _prompt_response(bridge, action, session, args):
+    if bridge.ops.session.id != session:
+        raise RequestError("当前会话已切换，请重新打开模板。", 409)
+    redactor = bridge.redactor
+    if action == "mcp_list_prompts":
+        prompts = await bridge.ops.list_mcp_prompts(args["server"])
+        response = {"mcp_prompts": [{
+            "name": prompt.name,
+            "title": redactor.text(prompt.title or ""),
+            "description": redactor.text(prompt.description or ""),
+            "arguments": [{
+                "name": field.name, "title": redactor.text(field.title or ""),
+                "description": redactor.text(field.description or ""), "required": bool(field.required),
+            } for field in (prompt.arguments or ())],
+        } for prompt in prompts if redactor.text(prompt.name) == prompt.name and all(
+            redactor.text(field.name) == field.name for field in (prompt.arguments or ())
+        )]}
+    else:
+        result = await bridge.ops.get_mcp_prompt(args["server"], args["name"], args["arguments"])
+        messages = []
+        redacted = False
+        for message in result.messages:
+            # The browser preview never loads remote resources or decodes attachments.
+            content = {"type": message.content.type}
+            if message.content.type == "text":
+                content["text"] = redactor.text(message.content.text)
+                redacted |= content["text"] != message.content.text
+            messages.append({"role": message.role, "content": content})
+        response = {"mcp_prompt_result": {
+            "description": redactor.text(result.description or ""), "messages": messages, "redacted": redacted,
+        }}
+    if bridge.ops.session.id != session:
+        raise RequestError("当前会话已切换，请重新打开模板。", 409)
+    return JSONResponse(response)
+
+
 def create_app(open_bridge, *, token: str, port: int, assets: Path):
     host = f"127.0.0.1:{port}"
     origin = f"http://{host}"
@@ -231,6 +270,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
         bridge = request.app.state.bridge
         try:
             action, session, args = await _command(request)
+            if action in _PROMPT_ACTIONS:
+                return await _prompt_response(bridge, action, session, args)
             if action in {"registry_search", "registry_detail"}:
                 if bridge.ops.session.id != session:
                     raise RequestError("当前会话已切换，请重新操作。", 409)

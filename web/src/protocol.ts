@@ -43,6 +43,19 @@ export type MCPServer = {
   error: string | null
 }
 
+export type MCPPrompt = {
+  name: string
+  title: string
+  description: string
+  arguments: { name: string; title: string; description: string; required: boolean }[]
+}
+
+export type MCPPromptResult = {
+  description: string
+  redacted: boolean
+  messages: { role: 'user' | 'assistant'; content: { type: string; text?: string } }[]
+}
+
 export type RegistryRemote = {
   transport: string
   url: string
@@ -156,6 +169,7 @@ type State = {
   projects_error: string | null
   mcp_servers: MCPServer[]
   mcp_error: string | null
+  mcp_prompt_servers: string[]
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
@@ -186,7 +200,10 @@ export type View = Omit<Frame, 'state'> & { state: State }
 export type Command = (
   action: string,
   fields?: Record<string, unknown>,
-) => Promise<{ notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer }>
+) => Promise<{
+  notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer
+  mcp_prompts?: MCPPrompt[]; mcp_prompt_result?: MCPPromptResult
+}>
 
 export function useConnection(token: string) {
   const [view, setView] = useState<View | null>(null)

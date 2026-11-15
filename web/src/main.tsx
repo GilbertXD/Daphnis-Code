@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
+import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
 import type { Approval, Command, Model, Project, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
@@ -334,6 +335,7 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
 }
 
 type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system'; sessionId: string }
+  | { action: 'prompts'; sessionId: string }
   | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
   | { action: 'move'; session: Session }
@@ -354,7 +356,11 @@ function Workspace({ view, connected, command }: {
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
   const inFlight = useRef(false)
   const [notice, setNotice] = useState('')
+  const composerInput = useRef<HTMLTextAreaElement>(null)
   const { state, status, session_id: id } = view
+  useEffect(() => {
+    setModal((current) => current?.action === 'prompts' && current.sessionId !== id ? null : current)
+  }, [id])
   const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
   const recovery = state.recovery
   const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
@@ -387,8 +393,8 @@ function Workspace({ view, connected, command }: {
     }
   }
 
-  function updateDraft(text: string) {
-    setDrafts((current) => ({ ...current, [id]: text }))
+  function updateDraft(text: string | ((draft: string) => string)) {
+    setDrafts((current) => ({ ...current, [id]: typeof text === 'function' ? text(current[id] ?? '') : text }))
   }
 
   async function send() {
@@ -448,7 +454,7 @@ function Workspace({ view, connected, command }: {
         </div>}
         {!modal && notice && <p className="notice" role="status">{notice}</p>}
         <form className="composer" onSubmit={(event) => { event.preventDefault(); void send() }}>
-          <textarea aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
+          <textarea ref={composerInput} aria-label="消息" placeholder="请输入你的需求…" value={draft} rows={2}
             onChange={(event) => updateDraft(event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) {
@@ -483,6 +489,10 @@ function Workspace({ view, connected, command }: {
                 }}>
                 工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'} <span aria-hidden="true">⌄</span>
               </button>
+              <button type="button" disabled={!connected} onClick={() => {
+                setNotice('')
+                setModal({ action: 'prompts', sessionId: id })
+              }}>模板</button>
               <button type="button" disabled={disabled} onClick={() => {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
@@ -523,6 +533,14 @@ function Workspace({ view, connected, command }: {
       <MCPManager servers={state.mcp_servers} disabled={disabled} error={state.mcp_error}
         notice={notice} perform={perform} command={command} />
     </Dialog>}
+    {modal?.action === 'prompts' && modal.sessionId === id &&
+      <Dialog title="MCP 模板" close={() => setModal(null)} className="mcp-dialog">
+        <PromptPicker servers={state.mcp_prompt_servers} connected={connected} command={command} insert={(text) => {
+          updateDraft((current) => current ? `${current}\n\n${text}` : text)
+          setModal(null)
+          requestAnimationFrame(() => composerInput.current?.focus())
+        }} />
+      </Dialog>}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
     {modal?.action === 'confirm_full' && modal.sessionId === id && <Dialog title="启用 FULL" close={() => setModal(null)}>

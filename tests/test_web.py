@@ -140,6 +140,7 @@ class WebTests(unittest.TestCase):
             "action": action, "session_id": session_id, **args,
         })
         self.assertEqual(response.status_code, expected, response.text)
+        return response.json()
 
     def snapshot(self):
         with self.client.websocket_connect(ORIGIN.replace("http:", "ws:") + "/api/events", headers={"Origin": ORIGIN}) as socket:
@@ -544,6 +545,38 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.snapshot()["state"]["mcp_servers"][0]["options"]["transport"], "streamable_http")
         self.command("mcp_delete", sid, name="demo")
         self.assertEqual(self.snapshot()["state"]["mcp_servers"], [])
+
+    def test_mcp_prompt_preview_preserves_message_order_without_changing_session(self):
+        sid = self.snapshot()["session_id"]
+        (self.workspace / "prompts").touch()
+        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+        })
+        before = self.snapshot()
+        self.assertEqual(before["state"]["mcp_prompt_servers"], ["demo"])
+        prompts = self.command("mcp_list_prompts", sid, server="demo")["mcp_prompts"]
+        self.assertEqual(prompts[0]["name"], "greet")
+        self.assertTrue(prompts[0]["arguments"][0]["required"])
+        result = self.command("mcp_get_prompt", sid, server="demo", name="greet",
+                              arguments={"who": API_KEY})["mcp_prompt_result"]
+        self.assertTrue(result["redacted"])
+        self.assertEqual(result["messages"], [
+            {"role": "user", "content": {"type": "text", "text": "Hello, [REDACTED]! (neutral)"}},
+        ])
+        bundle = self.command("mcp_get_prompt", sid, server="demo", name="bundle",
+                              arguments={})["mcp_prompt_result"]
+        self.assertEqual(bundle["messages"], [
+            {"role": "user", "content": {"type": "text", "text": "first"}},
+            {"role": "assistant", "content": {"type": "image"}},
+        ])
+        self.command("mcp_get_prompt", sid, 409, server="demo", name="greet", arguments={"who": 7})
+        after = self.snapshot()
+        self.assertEqual(after["state"]["messages"], before["state"]["messages"])
+        self.assertEqual(after["state"]["enabled_tools"], before["state"]["enabled_tools"])
+        self.assertEqual(self.requests, [])
+        self.command("new", sid)
+        self.command("mcp_list_prompts", sid, 409, server="demo")
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)

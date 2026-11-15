@@ -174,6 +174,7 @@ class Bridge:
             "approval_mode": ops.approval_mode,
         })
         state["mcp_error"] = mcp_error
+        state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers()
         state["mcp_servers"] = []
         for server in servers:
             status = statuses.get(server.name)

@@ -225,6 +225,16 @@ dialog fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .tool-group summary small { margin-left: 4px; white-space: nowrap; }
 .tool-group .tool-group-action { position: absolute; top: 4px; right: 2px; padding: 5px 8px; font-size: .8rem; }
 .tool-group-rows { padding: 0 2px 3px 12px; }
+.prompt-group { border-bottom: 1px solid var(--line); padding: 9px 0; }
+.prompt-group summary { font-weight: 600; }
+.prompt-group > p { margin-top: 6px; }
+.prompt-group small { font-weight: 400; }
+.prompt-list { list-style: none; margin: 4px 0 0; padding-left: 14px; }
+.prompt-list li { padding: 6px 0; }
+.prompt-panel, .prompt-preview { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.prompt-panel > .mcp-text-button { justify-self: start; font-size: .87rem; }
+.prompt-preview { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 10px; }
+.prompt-message pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0 0; padding: 8px; background: var(--soft); max-height: 28dvh; overflow: auto; }
 input[type=checkbox] { accent-color: #111; }
 
 .access { min-height: 100dvh; display: grid; place-items: center; padding: 20px; }
