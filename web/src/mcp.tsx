@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
-import type { Command, MCPOptions, MCPServer, RegistryPage, RegistryRemote, RegistryServer } from './protocol'
+import type { Command, MCPOptions, MCPServer, RegistryPage, RegistryRemote, RegistryServer, ResourceDraft } from './protocol'
+import { ResourceBrowser } from './resources'
 
 type Perform = (action: string, fields: Record<string, unknown>) => Promise<boolean>
 
@@ -94,27 +95,35 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
   </form>
 }
 
-export function MCPManager({ servers, disabled, error, notice, perform, command }: {
+export function MCPManager({ servers, disabled, connected, error, notice, perform, command, resourceServers, addResources }: {
   servers: MCPServer[]
   disabled: boolean
+  connected: boolean
+  resourceServers: string[]
+  addResources: (resources: ResourceDraft[]) => string | null
   error: string | null
   notice: string
   perform: Perform
   command: Command
 }) {
   const [editing, setEditing] = useState<MCPServer | 'new' | null>(null)
-  const [discover, setDiscover] = useState(false)
+  const [page, setPage] = useState<'servers' | 'discover' | 'resources'>('servers')
   const blocked = disabled || !!error
   return <>
     <div className="mcp-tabs" aria-label="MCP 页面">
-      <button type="button" aria-pressed={!discover} onClick={() => setDiscover(false)}>已配置</button>
-      <button type="button" aria-pressed={discover} onClick={() => { setEditing(null); setDiscover(true) }}>发现</button>
+      <button type="button" aria-pressed={page === 'servers'} onClick={() => setPage('servers')}>已配置</button>
+      <button type="button" aria-pressed={page === 'discover'} onClick={() => { setEditing(null); setPage('discover') }}>发现</button>
+      <button type="button" aria-pressed={page === 'resources'} onClick={() => {
+        setEditing(null)
+        setPage('resources')
+      }}>Resources</button>
     </div>
     {error && <p role="alert">{error}</p>}
-    {notice && (discover || editing || !servers.some((server) => server.error === notice)) && <p role="status">{notice}</p>}
-    {discover ? <RegistryPanel command={command} servers={servers} disabled={blocked} add={async (fields) => {
+    {notice && (page === 'discover' || editing || !servers.some((server) => server.error === notice)) && <p role="status">{notice}</p>}
+    {page === 'resources' ? <ResourceBrowser servers={resourceServers} command={command} connected={connected}
+      disabled={disabled} add={addResources} /> : page === 'discover' ? <RegistryPanel command={command} servers={servers} disabled={blocked} add={async (fields) => {
       const saved = await perform('mcp_add_registry', fields)
-      if (saved) setDiscover(false)
+      if (saved) setPage('servers')
       return saved
     }} /> : editing ? <MCPEditor initial={editing === 'new' ? undefined : editing} disabled={blocked}
       cancel={() => setEditing(null)}

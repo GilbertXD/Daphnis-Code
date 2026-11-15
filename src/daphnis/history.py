@@ -322,7 +322,7 @@ class History:
         if validated.prompt_groups:
             data["prompt_groups"] = [asdict(group) for group in validated.prompt_groups]
         if validated.attachment_refs:
-            data["attachment_refs"] = {str(index): asdict(batch) for index, batch in validated.attachment_refs.items()}
+            data["attachment_refs"] = {str(index): batch.to_json() for index, batch in validated.attachment_refs.items()}
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
         self._replace(destination, serialized)
         session._saved_revision = (session.id, sha256(serialized).hexdigest())

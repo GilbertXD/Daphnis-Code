@@ -649,6 +649,62 @@ class WebTests(unittest.TestCase):
         self.command("mcp_run_prompt", sid, 202, **fields)
         self.assertEqual(len(self.requests), 2)
 
+    def test_standalone_resource_draft_is_session_scoped_and_replay_safe(self):
+        sid = self.snapshot()["session_id"]
+        (self.workspace / "resources").touch()
+        remote = self.workspace / "resource-text"
+        remote.write_text("standalone material")
+        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+        })
+        self.assertEqual(self.snapshot()["state"]["mcp_resource_servers"], ["demo"])
+        catalog = self.command("mcp_list_resources", sid, server="demo")["mcp_resource_catalog"]
+        template = next(entry for entry in catalog["entries"] if entry["variables"])
+        self.assertEqual(template["variables"], ["name"])
+        reads = self.workspace / "resource-reads"
+        self.assertFalse(reads.exists())
+        preview, = self.command(
+            "mcp_read_resource", sid, server="demo", uri=template["uri"], arguments={"name": "Review/二"},
+        )["mcp_resource_preview"]
+        self.assertEqual(preview["text"], "standalone material")
+        self.assertEqual(preview["uri"], "notes://pages/Review%2F%E4%BA%8C")
+        self.command("mcp_read_resource", sid, 409, server="demo", uri="notes://blob", arguments=None)
+        preview_reads = reads.read_text()
+        self.assertEqual(self.snapshot()["state"]["messages"], [])
+        self.command("send", sid, 202, prompt="Start.")
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        payload = {
+            "action": "send_attachments", "session_id": sid, "submission_id": "b" * 32, "prompt": "Read these.",
+            "attachments": [{"resource_id": preview["id"]}, {"name": "local.txt", "text": "uploaded material"}],
+        }
+        self.command("new", sid)
+        other = self.snapshot()["session_id"]
+        path = "/api/attachments/send"
+        response = self.client.post(path, headers=self.headers, json={**payload, "session_id": other})
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(self.snapshot()["state"]["messages"], [])
+        self.command("restore", other, id=sid)
+        remote.write_text("changed remote content")
+        response = self.client.post(path, headers=self.headers, json=payload)
+        self.assertEqual(response.status_code, 202, response.text)
+        saved = self.history.load(sid)
+        (index, batch), = saved.attachment_refs.items()
+        self.assertEqual(saved.messages.get(index)["content"], "Read these.")
+        item, uploaded = batch.files
+        self.assertEqual((item.source, item.uri), ("standalone", preview["uri"]))
+        self.assertEqual(self.history.attachments.read(sid, item), "standalone material")
+        self.assertEqual(self.history.attachments.read(sid, uploaded), "uploaded material")
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        content = self.requests[-1]["messages"][-1]["content"]
+        self.assertIn("standalone material", content)
+        self.assertNotIn(item.uri, content)
+        self.bridge.resource_drafts.clear()
+        repeated = self.client.post(path, headers=self.headers, json=payload)
+        self.assertEqual(repeated.status_code, 202, repeated.text)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(reads.read_text(), preview_reads)
+
     def test_attachment_send_is_committed_before_ack_and_deduplicated(self):
         sid = self.snapshot()["session_id"]
         path = "/api/attachments/send"

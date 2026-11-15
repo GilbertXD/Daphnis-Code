@@ -57,7 +57,8 @@ class TextAttachmentInput:
 def validate_resource_uri(uri: str) -> None:
     if (not isinstance(uri, str) or not 0 < len(uri) <= 2048
         or any(char.isspace() or ord(char) < 32 for char in uri)
-        or _BINARY.search(uri) or not urlsplit(uri).scheme):
+        or _BINARY.search(uri) or re.search(r'[%](?![0-9a-fA-F]{2})|[<>"{}|\\^`]', uri)
+        or not urlsplit(uri).scheme):
         raise ValueError("MCP 资源 URI 无效。")
     uri.encode("utf-8")
 
@@ -101,10 +102,17 @@ class TextResourceInput(TextAttachmentInput):
     uri: str
     mime_type: str
     source: str
+    draft_id: str | None = None
 
     def __post_init__(self) -> None:
         _resource_metadata(self.name, self.server, self.uri, self.mime_type, self.source)
         snapshot_bytes(self.text)
+        if self.draft_id is not None and (self.source != "standalone" or not valid_id(self.draft_id)):
+            raise ValueError("MCP 资源草稿标识无效。")
+
+
+def resource_snapshot_id(submission_id: str, draft_id: str) -> str:
+    return sha256(f"{submission_id}:{draft_id}".encode("ascii")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,9 @@ class TextAttachment:
     @property
     def model_name(self) -> str:
         return "MCP text resource" if self.source else self.name
+
+    def to_json(self) -> dict:
+        return {key: value for key, value in asdict(self).items() if value is not None}
 
     def __post_init__(self) -> None:
         if self.source is None:
@@ -154,6 +165,9 @@ class AttachmentBatch:
         if self.submission_id is not None and not valid_id(self.submission_id):
             raise ValueError("附件发送标识无效。")
 
+    def to_json(self) -> dict:
+        return {"files": [item.to_json() for item in self.files], "submission_id": self.submission_id}
+
     @classmethod
     def from_json(cls, data: dict) -> "AttachmentBatch":
         if not isinstance(data, dict) or not isinstance(data.get("files"), list):
@@ -169,15 +183,18 @@ def prepare_attachments(uploads: Sequence[TextAttachmentInput], submission_id: s
         if not isinstance(upload, TextAttachmentInput) or not isinstance(upload.text, str):
             raise TypeError("附件内容必须是 UTF-8 文本。")
         source = {}
+        snapshot_id = uuid4().hex
         if isinstance(upload, TextResourceInput):
             source = {"server": upload.server, "uri": upload.uri, "mime_type": upload.mime_type, "source": upload.source}
+            if upload.draft_id and submission_id:
+                snapshot_id = resource_snapshot_id(submission_id, upload.draft_id)
         else:
             _name(upload.name)
         data = snapshot_bytes(upload.text)
         if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", upload.text):
             raise ValueError("附件不能包含二进制内容或私钥。")
         files.append(TextAttachment(
-            id=uuid4().hex, name=upload.name, size_bytes=len(data),
+            id=snapshot_id, name=upload.name, size_bytes=len(data),
             sha256=sha256(data).hexdigest(), lines=upload.text.count("\n") + 1, **source,
         ))
     return AttachmentBatch(tuple(files), submission_id)
@@ -186,7 +203,7 @@ def prepare_attachments(uploads: Sequence[TextAttachmentInput], submission_id: s
 def attachment_metadata(batch: AttachmentBatch) -> list[dict]:
     return [
         {"id": item.id, "name": item.model_name, "size_bytes": item.size_bytes, "lines": item.lines}
-        if item.source else {key: value for key, value in asdict(item).items() if value is not None}
+        if item.source else item.to_json()
         for item in batch.files
     ]
 
@@ -263,7 +280,12 @@ class AttachmentStore:
                         os.fchmod(stream.fileno(), 0o400)
                         os.fsync(stream.fileno())
                     # Publish without overwriting an existing immutable snapshot.
-                    os.link(temporary, item.id + ".txt", src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+                    try:
+                        os.link(temporary, item.id + ".txt", src_dir_fd=directory,
+                                dst_dir_fd=directory, follow_symlinks=False)
+                    except FileExistsError:
+                        # A retried submission may already have published this snapshot.
+                        pass
                     os.unlink(temporary, dir_fd=directory)
                     self._read(directory, item)
                 finally:

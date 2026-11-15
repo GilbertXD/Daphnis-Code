@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import OrderedDict, deque
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from functools import partial
 from uuid import uuid4
 
@@ -78,6 +78,7 @@ class Bridge:
         self.upload = None
         self.prompt_run = None
         self.prompt_previews = OrderedDict()
+        self.resource_drafts = OrderedDict()
         self.live = {}
         self.lock = asyncio.Lock()
         self._subscriptions = [ops.subscribe(name, self._forward) for name in _EVENT_NAMES]
@@ -210,6 +211,7 @@ class Bridge:
         })
         state["mcp_error"] = mcp_error
         state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers()
+        state["mcp_resource_servers"] = ops.list_mcp_resource_servers()
         state["mcp_servers"] = []
         for server in servers:
             status = statuses.get(server.name)
@@ -265,6 +267,19 @@ class Bridge:
         if reset or revision != self.revision:
             frame["state"] = self.state()
         return frame
+
+    def cache_resource_draft(self, session, resource):
+        draft_id = uuid4().hex
+        self.resource_drafts[draft_id] = (session, replace(resource, draft_id=draft_id))
+        if len(self.resource_drafts) > 64:
+            self.resource_drafts.popitem(last=False)
+        return draft_id
+
+    def resource_draft(self, session, draft_id):
+        draft = self.resource_drafts.get(draft_id)
+        if draft is None or draft[0] != session:
+            raise ValueError("MCP 资源草稿已失效，请重新读取并添加。")
+        return draft[1]
 
     def cache_prompt_preview(self, session, server, name, messages):
         preview_id = uuid4().hex

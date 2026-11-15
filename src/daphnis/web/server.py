@@ -16,7 +16,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from ..attachments import MAX_FILES, TextAttachmentInput, TextResourceInput, valid_id
-from ..mcp.resources import text_resource
+from ..mcp.resources import resource_template, text_resource
 from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..prompt_groups import MAX_PROMPT_MESSAGES, PROMPT_ROLES, PromptInput
 from ..tools.approval import ApprovalMode
@@ -45,6 +45,8 @@ _FIELDS = {
     "mcp_list_prompts": {"server": str},
     "mcp_get_prompt": {"server": str, "name": str, "arguments": dict},
     "mcp_run_prompt": {"preview_id": str, "texts": list},
+    "mcp_list_resources": {"server": str},
+    "mcp_read_resource": {"server": str, "uri": str, "arguments": (dict, type(None))},
     "registry_search": {"query": str, "cursor": (str, type(None))},
     "registry_detail": {"registry_name": str, "version": str},
     "mcp_add_registry": {"name": str, "registry_name": str, "version": str, "url": str, "auth_env": (str, type(None))},
@@ -108,8 +110,10 @@ async def _command(request: Request):
     if action == "send_attachments" and (
         not valid_id(value["submission_id"]) or not 0 < len(value["attachments"]) <= MAX_FILES
         or len(value["prompt"].encode()) > _MAX_BODY_BYTES
-        or any(not isinstance(item, dict) or item.keys() != {"name", "text"}
-               or not all(isinstance(field, str) for field in item.values()) for item in value["attachments"])
+        or any(not isinstance(item, dict) or not (
+            item.keys() == {"resource_id"} and valid_id(item["resource_id"])
+            or item.keys() == {"name", "text"} and all(isinstance(field, str) for field in item.values())
+        ) for item in value["attachments"])
     ):
         raise RequestError("附件发送字段无效。")
     if action == "move" and (value["project_id"] is None) != (value["workspace"] is None):
@@ -127,13 +131,18 @@ async def _command(request: Request):
 async def _send_attachments(bridge, session, args):
     prompt = args["prompt"]
     submission_id = args["submission_id"]
-    attachments = tuple(TextAttachmentInput(**item) for item in args["attachments"])
+    entries = tuple(item["resource_id"] if "resource_id" in item else TextAttachmentInput(**item)
+                    for item in args["attachments"])
+    resource_ids = [item for item in entries if isinstance(item, str)]
+    if len(set(resource_ids)) != len(resource_ids):
+        raise RequestError("不能重复添加同一份 MCP 资源草稿。")
     async with bridge.lock:
         ops = bridge.ops
         if ops.session.id != session:
             raise RequestError("当前会话已切换，请重新操作。", 409)
-        if ops.attachment_submitted(submission_id, prompt, attachments):
+        if ops.attachment_submitted(submission_id, prompt, entries):
             return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
+        attachments = tuple(bridge.resource_draft(session, entry) if isinstance(entry, str) else entry for entry in entries)
         if bridge.upload and bridge.upload[0] == submission_id:
             _, old_prompt, old_attachments, accepted = bridge.upload
             if (prompt, attachments) != (old_prompt, old_attachments):
@@ -311,6 +320,49 @@ def _resource_preview(item: TextResourceInput, redactor) -> tuple[TextResourceIn
     }
 
 
+async def _resource_response(bridge, action, session, args):
+    ops = bridge.ops
+    if ops.session.id != session:
+        raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
+    server = args["server"]
+    redactor = bridge.redactor
+    if action == "mcp_read_resource":
+        resources = await ops.read_mcp_resource(server, args["uri"], args["arguments"])
+        if ops.session.id != session:
+            raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
+        previews = [_resource_preview(item, redactor) for item in resources]
+        return JSONResponse({"mcp_resource_preview": [
+            {**data, "id": bridge.cache_resource_draft(session, item)} for item, data in previews
+        ]})
+
+    response = {"entries": [], "errors": []}
+    for templates, load in ((False, ops.list_mcp_resources), (True, ops.list_mcp_resource_templates)):
+        try:
+            entries = await load(server)
+        except (RuntimeError, ValueError) as exc:
+            response["errors"].append(redactor.text(str(exc)))
+            continue
+        for entry in entries:
+            uri = entry.uri_template if templates else str(entry.uri)
+            if redactor.text(uri) != uri:
+                continue
+            variables = None
+            error = None
+            if templates:
+                try:
+                    variables = list(resource_template(uri).variable_names)
+                except ValueError as exc:
+                    error = str(exc)
+            response["entries"].append({
+                "uri": uri, "name": redactor.text(entry.name), "title": redactor.text(entry.title or ""),
+                "description": redactor.text(entry.description or ""), "mime_type": redactor.text(entry.mime_type or ""),
+                "variables": variables, "error": error,
+            })
+    if ops.session.id != session:
+        raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
+    return JSONResponse({"mcp_resource_catalog": response})
+
+
 async def _prompt_response(bridge, action, session, args):
     if bridge.ops.session.id != session:
         raise RequestError("当前会话已切换，请重新打开模板。", 409)
@@ -403,6 +455,8 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
                 return await _send_attachments(bridge, session, args)
             if action == "mcp_run_prompt":
                 return await _run_prompt(bridge, session, args)
+            if action in {"mcp_list_resources", "mcp_read_resource"}:
+                return await _resource_response(bridge, action, session, args)
             if action in _PROMPT_ACTIONS:
                 return await _prompt_response(bridge, action, session, args)
             if action in {"registry_search", "registry_detail"}:

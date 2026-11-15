@@ -1,12 +1,14 @@
 const MAX_FILE = 128 * 1024
-const MAX_TOTAL = 256 * 1024
-const MAX_FILES = 10
+export const MAX_TOTAL = 256 * 1024
+export const MAX_FILES = 10
 export const textFileTypes = '.txt,.md,.markdown,.rst,.py,.go,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.js,.jsx,.ts,.tsx,.css,.html,.xml,.csv,.tsv,.log,.sql,.sh,.bash,.zsh,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cc,.cs,.rb,.php,.swift,.vue,.svelte,.tex,.diff,.patch'
 const extensions = new Set(textFileTypes.split(','))
 const blocked = /^(?:\.env|id_(?:rsa|ed25519|ecdsa|dsa)\.|(?:application_default_credentials|credentials|secrets)\.json$)/i
 const binary = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/
 
-export type DraftAttachment = { id: string; name: string; text: string; size: number }
+export type DraftAttachment = { id: string; name: string; size: number } & (
+  { text: string } | { resourceId: string }
+)
 
 export async function readTextFiles(files: File[], existing: DraftAttachment[]) {
   const added: DraftAttachment[] = []

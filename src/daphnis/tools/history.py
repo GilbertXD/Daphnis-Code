@@ -129,7 +129,12 @@ def prepare_history(
             }
 
         index = arguments["message_id"]
+        batch = attachments.get(index) if attachments else None
         entry = visible_history_text(messages, index, redactor) if index < len(messages) else None
+        if entry is None and batch and index < len(messages):
+            message = messages.get(index)
+            if message["role"] in ("user", "assistant") and message.get(TURN_STATE) != ABANDONED:
+                entry = (message["role"], "")
         if entry is None:
             raise ToolError("history_unavailable", "No exposed text at this Session message ID.")
         role, content = entry
@@ -144,8 +149,8 @@ def prepare_history(
             "start": start, "end": page_end, "length": len(content),
             "content": content[start:page_end], "next_start": page_end if page_end < stop else None,
         }
-        if attachments and index in attachments:
-            result["attachments"] = redactor.json(attachment_metadata(attachments[index]))
+        if batch:
+            result["attachments"] = redactor.json(attachment_metadata(batch))
         return result
 
     return Operation(

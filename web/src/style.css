@@ -296,3 +296,5 @@ input[type=checkbox] { accent-color: #111; }
 
 .resource-preview { display: grid; gap: 4px; overflow-wrap: anywhere; }
 .resource-preview pre { white-space: pre-wrap; max-height: 30dvh; overflow: auto; padding: 8px 0; }
+.resource-uri { overflow-wrap: anywhere; }
+.resource-result + .resource-result { border-top: 1px solid var(--line); padding-top: 8px; }

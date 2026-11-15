@@ -14,6 +14,7 @@ from .attachments import (
     TextAttachmentInput,
     TextResourceInput,
     prepare_attachments,
+    resource_snapshot_id,
 )
 from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
@@ -611,16 +612,22 @@ class Operations:
         }
 
     def attachment_submitted(
-        self, submission_id: str, prompt: str, attachments: Sequence[TextAttachmentInput],
+        self, submission_id: str, prompt: str, attachments: Sequence[TextAttachmentInput | str],
     ) -> bool:
         session = self._app._session
         for index, batch in session.attachment_refs.items():
             if batch.submission_id != submission_id:
                 continue
-            uploaded = prepare_attachments(attachments, submission_id)
+            received = []
+            for entry in attachments:
+                if isinstance(entry, str):
+                    received.append(resource_snapshot_id(submission_id, entry))
+                else:
+                    item, = prepare_attachments((entry,), submission_id).files
+                    received.append(item.id if item.source else (item.name, item.sha256))
+            committed = [item.id if item.source else (item.name, item.sha256) for item in batch.files]
             if (session.messages.get(index)["content"] != (prompt if prompt.strip() else ATTACHMENT_ONLY_PROMPT)
-                or [(item.name, item.sha256) for item in batch.files]
-                != [(item.name, item.sha256) for item in uploaded.files]):
+                or committed != received):
                 raise ValueError("该附件发送标识已用于不同内容。")
             return True
         return False

@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { AttachmentLabels, readTextFiles, textFileTypes } from './attachments'
+import { AttachmentLabels, MAX_FILES, MAX_TOTAL, readTextFiles, textFileTypes } from './attachments'
 import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
-import type { Approval, Command, Model, Project, Session, View } from './protocol'
+import type { Approval, Command, Model, Project, ResourceDraft, Session, View } from './protocol'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
@@ -425,6 +425,21 @@ function Workspace({ view, connected, command }: {
     }
   }
 
+  function addResources(resources: ResourceDraft[]) {
+    if (disabled || fileReads.current.has(id)) return '请等待当前操作结束。'
+    const added = resources.filter((resource) => !files.some((file) => file.id === resource.id))
+      .map((resource) => ({ id: resource.id, name: resource.name, size: resource.size_bytes, resourceId: resource.id }))
+    const next = [...files, ...added]
+    if (!added.length) return '所选资源已在待发送附件中。'
+    if (next.length > MAX_FILES || next.reduce((sum, file) => sum + file.size, 0) > MAX_TOTAL) {
+      return '每次最多发送 10 份附件或资源，总计最多 256 KiB。'
+    }
+    setDraftFiles((current) => ({ ...current, [id]: next }))
+    setUploadErrors((current) => ({ ...current, [id]: '' }))
+    setModal(null)
+    return null
+  }
+
   async function send() {
     if (disabled || interrupted || fileReads.current.has(id) || (!draft.trim() && !files.length)) return
     if (files.length) {
@@ -434,7 +449,8 @@ function Workspace({ view, connected, command }: {
         ? pending : { id: crypto.randomUUID().replaceAll('-', ''), text: draft, ids }
       submissions.current.set(id, submission)
       const accepted = await perform('send_attachments', {
-        submission_id: submission.id, prompt: draft, attachments: files.map(({ name, text }) => ({ name, text })),
+        submission_id: submission.id, prompt: draft, attachments: files.map((file) => 'resourceId' in file
+          ? { resource_id: file.resourceId } : { name: file.name, text: file.text }),
       })
       if (!accepted) return
       submissions.current.delete(id)
@@ -607,8 +623,9 @@ function Workspace({ view, connected, command }: {
       disabled={disabled || state.model.supports_tools !== true}
       notice={notice} apply={(names) => perform('tools', { names })} />}
     {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)} className="mcp-dialog">
-      <MCPManager servers={state.mcp_servers} disabled={disabled} error={state.mcp_error}
-        notice={notice} perform={perform} command={command} />
+      <MCPManager key={id} servers={state.mcp_servers} disabled={disabled} connected={connected} error={state.mcp_error}
+        notice={notice} perform={perform} command={command}
+        resourceServers={state.mcp_resource_servers} addResources={addResources} />
     </Dialog>}
     {modal?.action === 'prompts' && modal.sessionId === id &&
       <Dialog title="MCP Prompts" close={() => setModal(null)} className="mcp-dialog">

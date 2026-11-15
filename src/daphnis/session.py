@@ -78,7 +78,7 @@ class Session:
             if any(item.source == "embedded" for item in batch.files):
                 embedded_indices.add(index)
                 if (len(batch.files) != 1 or batch.submission_id is not None
-                    or self.messages.get(index)["content"] != ""):
+                    or self.messages.get(index).get("content") != ""):
                     raise ValueError("Invalid embedded resource reference.")
             elif self.messages.get(index)["role"] != "user":
                 raise ValueError("Attachment refers to an invalid user message index.")

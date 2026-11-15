@@ -59,6 +59,18 @@ export type ResourceText = {
   redacted: boolean
 }
 
+export type ResourceDraft = ResourceText & { id: string }
+export type ResourceEntry = {
+  uri: string
+  name: string
+  title: string
+  description: string
+  mime_type: string
+  variables: string[] | null
+  error: string | null
+}
+export type ResourceCatalog = { entries: ResourceEntry[]; errors: string[] }
+
 export type MCPPromptResult = {
   description: string
   redacted: boolean
@@ -189,6 +201,7 @@ type State = {
   mcp_servers: MCPServer[]
   mcp_error: string | null
   mcp_prompt_servers: string[]
+  mcp_resource_servers: string[]
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
@@ -224,6 +237,7 @@ export type Command = (
 ) => Promise<{
   notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer
   mcp_prompts?: MCPPrompt[]; mcp_prompt_result?: MCPPromptResult
+  mcp_resource_catalog?: ResourceCatalog; mcp_resource_preview?: ResourceDraft[]
 }>
 
 export function useConnection(token: string) {

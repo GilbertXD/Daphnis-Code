@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from daphnis.attachments import TextAttachmentInput, prepare_attachments
+from saturnus import Messages
+
+from daphnis.attachments import (
+    TextAttachmentInput,
+    TextResourceInput,
+    prepare_attachments,
+)
 from daphnis.history import History, SessionBusyError
 from daphnis.session import Session
 
@@ -159,6 +165,58 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(set(history.load(sid).attachment_refs), {0, 4})
             finally:
                 await ops.close()
+
+    async def test_resources_are_readable_only_by_snapshot_id_in_the_owning_session(self):
+        from daphnis.compaction import CompactionCheckpoint
+        from daphnis.events import EventBus
+        from daphnis.prompt_groups import PromptInput
+        from daphnis.tools import ApprovalMode, create_tools
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = History(root / "sessions")
+            session = Session(workspace=root, provider="deepseek", model_id="deepseek-flash")
+            resource = TextResourceInput(
+                "Architecture", "资源 needle", "demo", "notes://architecture", "text/markdown", "embedded",
+            )
+            prompt = PromptInput("resource-turn", "demo", "review", (
+                ("assistant", resource), ("user", "Find the marker."),
+            ))
+            session.messages = Messages([*prompt.snapshot(), {"role": "assistant", "content": "Done."},
+                                         {"role": "user", "content": "Next task."}])
+            session.prompt_groups = (prompt.group(0),)
+            batch = prepare_attachments((resource,), None)
+            session.attachment_refs = {0: batch}
+            summary = '{"goals":"Review resources","progress":"","files":"","next_steps":""}'
+            session.compaction = CompactionCheckpoint(1, summary)
+            with self.assertRaisesRegex(ValueError, "Prompt input group"):
+                history.save(session)
+            session.compaction = CompactionCheckpoint(3, summary)
+            history.save(session)
+            history.attachments.write(session.id, batch, (resource,))
+            saved = history.load(session.id)
+            item = saved.attachment_refs[0].files[0]
+            registry = create_tools(attachment_store=history.attachments)
+
+            async def call(owner, name, arguments):
+                executor = registry.select([name], mode=ApprovalMode.AUTO).bind(
+                    session=owner, events=EventBus(), turn_id="test",
+                )
+                result = await executor.execute({"id": "call", "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(arguments),
+                }})
+                return result.value
+
+            page = await call(saved, "read_attachment", {"id": item.id})
+            self.assertEqual(page["lines"][0]["text"], resource.text)
+            hits = await call(saved, "search_attachment", {"id": item.id, "query": "needle"})
+            self.assertEqual(hits["matches"][0]["column"], 4)
+            history_page = await call(saved, "history_read", {"message_id": 0})
+            self.assertEqual(history_page["attachments"][0]["id"], item.id)
+            self.assertNotIn("notes://", json.dumps(history_page))
+            other = Session(workspace=root, provider="deepseek", model_id="deepseek-flash")
+            blocked = await call(other, "read_attachment", {"id": item.id})
+            self.assertEqual(blocked["error"]["code"], "attachment_unavailable")
 
     async def test_attachment_paging_search_and_permissions(self):
         from daphnis.events import EventBus
