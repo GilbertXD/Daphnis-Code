@@ -2,6 +2,8 @@
 
 from saturnus import Compatibility
 
+from .deepseek_files import DeepSeekFiles
+
 COMPATIBILITY = Compatibility(
     field_mappings={
         "output_limit": "max_tokens",
@@ -12,3 +14,5 @@ COMPATIBILITY = Compatibility(
     value_mappings={"thinking_mode": {"off": "none", "on": "high"}},
     content_part_mappings={"image_url": {"type": "image_url"}},
 )
+
+document_adapter = DeepSeekFiles

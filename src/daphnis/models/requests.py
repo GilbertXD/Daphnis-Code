@@ -26,6 +26,11 @@ def require_image_input(model: ModelInfo) -> None:
         raise CapabilityError(f"当前模型 {model.id!r} 不支持 Daphnis 图片输入（{reason}）。")
 
 
+def require_document_input(model: ModelInfo) -> None:
+    if model.supports_document is not True:
+        raise CapabilityError(f"当前模型 {model.id!r} 不支持有效上下文中的文档。请切换支持文档的模型或压缩旧历史。")
+
+
 def require_tools(model: ModelInfo) -> None:
     if model.supports_tools is not True:
         reason = "unknown" if model.supports_tools is None else "unsupported"

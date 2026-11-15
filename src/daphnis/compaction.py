@@ -334,6 +334,7 @@ class Compactor:
         self, context_window: int | None, *, counter: TokenCounter = DEFAULT_COUNTER,
         recent_tokens: int = 4096, response_format: dict[str, str] | None = None,
         image_metadata: bool = False,
+        document_metadata: bool = False,
     ) -> None:
         if type(recent_tokens) is not int or recent_tokens < 0:
             raise ValueError("recent_tokens must be a non-negative integer.")
@@ -342,6 +343,7 @@ class Compactor:
         self.recent_tokens = recent_tokens
         self.response_format = response_format
         self.image_metadata = image_metadata
+        self.document_metadata = document_metadata
         self.output_limit = (
             2048 if context_window is None else min(2048, max(1, context_window // 8))
         )
@@ -512,6 +514,11 @@ class Compactor:
             instruction += (
                 " Image metadata is not visual evidence."
                 " Attribute any description of an image to a recorded observation."
+            )
+        if self.document_metadata:
+            instruction += (
+                " Document metadata is not evidence of document contents."
+                " Attribute any findings to an observation recorded in the history."
             )
         if prompt_groups:
             instruction += (

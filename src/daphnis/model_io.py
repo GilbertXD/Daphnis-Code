@@ -17,18 +17,19 @@ _ATTACHMENT_PREVIEW_NOTICE = "部分内容因附件安全策略而隐藏。"
 _IMAGE_DATA_URL = re.compile(r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+", re.IGNORECASE)
 
 
-def hide_image_echo(value: Any, payloads: tuple[str, ...]) -> Any:
-    """Remove inline images and exact echoes of uploaded data from model output."""
+def hide_attachment_echo(value: Any, private_values: tuple[str, ...]) -> Any:
+    """Remove inline images and private attachment values from model output."""
     if isinstance(value, str):
         value = _IMAGE_DATA_URL.sub(_HIDDEN_CONTENT, value)
-        for payload in payloads:
+        for payload in private_values:
             if len(value) >= len(payload):
                 value = value.replace(payload, _HIDDEN_CONTENT)
         return value
     if isinstance(value, dict):
-        return {hide_image_echo(key, payloads): hide_image_echo(item, payloads) for key, item in value.items()}
+        return {hide_attachment_echo(key, private_values): hide_attachment_echo(item, private_values)
+                for key, item in value.items()}
     if isinstance(value, list):
-        return [hide_image_echo(item, payloads) for item in value]
+        return [hide_attachment_echo(item, private_values) for item in value]
     return value
 
 

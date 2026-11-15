@@ -10,6 +10,7 @@ from .compaction_settings import CompactionSettings
 
 _DEFAULT_RESERVE = 16_384
 _DEFAULT_COMPACTION = CompactionSettings()
+_UNKNOWN_DOCUMENT_RESERVE = 48_000
 
 
 def mimo_image_tokens(width: int, height: int) -> int:
@@ -81,6 +82,7 @@ class TokenBudget:
     count_source: Literal["estimate", "local_tokenizer"] = "estimate"
     trigger_tokens: int | None = None
     auto_enabled: bool = True
+    unknown_documents: int = 0
 
     @property
     def hard_limit(self) -> int | None:
@@ -118,9 +120,11 @@ def request_budget(
     settings: CompactionSettings | None = None,
     default_output_tokens: int | None = None,
     image_reserve: int = 0,
+    unknown_documents: int = 0,
 ) -> TokenBudget:
     # Only prompt-bearing options are counted as input. Allow for chat framing.
     input_tokens = counter.count(messages) + 4 * len(messages) + 3 + image_reserve
+    input_tokens += unknown_documents * _UNKNOWN_DOCUMENT_RESERVE
     for field in ("tools", "response_format"):
         if field in body:
             input_tokens += counter.count(body[field])
@@ -153,4 +157,5 @@ def request_budget(
         needs_compaction=settings.auto_enabled and threshold is not None
         and 0 < threshold <= input_tokens,
         count_source=counter.source, trigger_tokens=trigger, auto_enabled=settings.auto_enabled,
+        unknown_documents=unknown_documents,
     )

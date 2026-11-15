@@ -17,6 +17,7 @@ class ModelInfo:
     max_output_tokens: int | None = None
     default_output_tokens: int | None = None
     supports_image: bool | None = None
+    supports_document: bool | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "provider"):
@@ -33,7 +34,7 @@ class ModelInfo:
             and self.default_output_tokens > self.max_output_tokens
         ):
             raise ValueError("default_output_tokens cannot exceed max_output_tokens.")
-        for name in ("supports_tools", "supports_image"):
+        for name in ("supports_tools", "supports_image", "supports_document"):
             value = getattr(self, name)
             if value is not None and type(value) is not bool:
                 raise ValueError(f"{name} must be True, False, or None.")
@@ -58,6 +59,7 @@ DEEPSEEK_MODELS = (
         max_output_tokens=393_216,
         supports_tools=True,
         supports_image=True,
+        supports_document=True,
         thinking_modes=("off", "on", "low", "high", "max"),
     ),
     ModelInfo(

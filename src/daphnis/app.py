@@ -42,8 +42,10 @@ from .models import (
     provider_compatibility,
     resolve_model,
 )
+from .models.documents import DocumentAdapter
 from .models.models import validate_catalog
-from .models.requests import require_image_input
+from .models.providers import provider_documents
+from .models.requests import require_document_input, require_image_input
 from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
@@ -105,6 +107,7 @@ class Application:
                 secrets.extend(value for value in headers.values() if isinstance(value, str))
         self._history_redactor = Redactor(secrets)
         self._clients: dict[str, ChatClient] = {}
+        self._document_adapters: dict[str, DocumentAdapter | None] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
@@ -186,6 +189,13 @@ class Application:
         self._connection(provider)
         provider_compatibility(provider)
         return resolve_model(provider, model_id, catalog=self._catalog)
+
+    def _document_adapter(self, provider: str) -> DocumentAdapter | None:
+        if provider not in self._document_adapters:
+            self._document_adapters[provider] = provider_documents(
+                provider, self._connection(provider), self._history.directory.parent,
+            )
+        return self._document_adapters[provider]
 
     @property
     def _model(self) -> ModelInfo:
@@ -444,7 +454,7 @@ class Application:
             require_image_input(self._model)
         batch = prepare_attachments(uploads, submission_id) if uploads else None
         if batch and batch.documents:
-            raise ValueError("当前模型不支持文档输入。")
+            require_document_input(self._model)
         if prompt_input and (uploads or submission_id is not None):
             raise ValueError("MCP Prompt 必须作为独立任务运行。")
         if prompt_input:
@@ -547,6 +557,11 @@ class Application:
                             item.text for item in uploads if isinstance(item, TextAttachmentInput)
                         ) if batch else (),
                         attachment_store=self._history.attachments,
+                        document_adapter=(
+                            self._document_adapter(provider) if self._model.supports_document and (
+                                (batch and batch.documents) or any(ref.documents for ref in session.attachment_refs.values())
+                            ) else None
+                        ),
                     )
                     if result.status is TurnStatus.COMPLETED and title_source is not None:
                         await self._name_session(agent, session, title_source, lease=lease)
@@ -702,6 +717,9 @@ class Application:
         async with AsyncExitStack() as stack:
             for client in self._clients.values():
                 stack.push_async_callback(client.aclose)
+            for adapter in self._document_adapters.values():
+                if adapter is not None:
+                    stack.push_async_callback(adapter.aclose)
             try:
                 await self._cancel_turn()
                 self.events.clear()

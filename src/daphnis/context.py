@@ -6,7 +6,12 @@ from typing import Any
 
 from saturnus import Messages
 
-from .attachments import AttachmentBatch, AttachmentStore, ImageAttachment
+from .attachments import (
+    AttachmentBatch,
+    AttachmentStore,
+    DocumentAttachment,
+    ImageAttachment,
+)
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boundaries
 from .prompt_groups import PromptGroup
 from .turn_state import (
@@ -17,6 +22,7 @@ from .turn_state import (
 )
 
 IMAGE_REFS = "_daphnis_image_refs"
+DOCUMENT_REFS = "_daphnis_document_refs"
 
 
 def active_images(
@@ -32,11 +38,22 @@ def projected_image_bytes(messages: list[dict[str, Any]]) -> int:
     return sum(image.size_bytes for message in messages for image in message.get(IMAGE_REFS, ()))
 
 
+def active_documents(
+    messages: list[dict[str, Any]], refs: dict[int, AttachmentBatch], through: int,
+) -> dict[int, tuple[DocumentAttachment, ...]]:
+    return {
+        index: documents for index, batch in refs.items()
+        if index >= through and messages[index].get(TURN_STATE) != ABANDONED and (documents := batch.documents)
+    }
+
+
 def attachment_note(
-    batch: AttachmentBatch, texts: tuple[str, ...] = (), *, include_images: bool = False,
+    batch: AttachmentBatch, texts: tuple[str, ...] = (), *,
+    include_images: bool = False, include_documents: bool = False,
 ) -> str:
     text_files = batch.texts
-    if not text_files and not (include_images and batch.images):
+    documents = batch.documents if include_documents else ()
+    if not text_files and not (include_images and batch.images) and not documents:
         return ""
     has_resources = any(item.source for item in text_files)
     label = "Text attachments and resources" if has_resources else "User-uploaded attachments"
@@ -52,6 +69,11 @@ def attachment_note(
                 "type": "image", "id": item.id, "name": item.name,
                 "mime_type": item.mime_type, "width": item.width, "height": item.height,
             }, ensure_ascii=False))
+    for item in documents:
+        blocks.append(json.dumps({
+            "type": "document", "id": item.id, "name": item.name,
+            "mime_type": item.mime_type, "size_bytes": item.size_bytes, "reading_mode": item.reading_mode,
+        }, ensure_ascii=False))
     if text_files and not texts:
         if has_resources:
             blocks.append("Snapshot references only. Use recorded reads as evidence of their contents.")
@@ -128,6 +150,8 @@ class Context:
         messages = annotate_attachments(messages, attachment_notes)
         for index, images in active_images(messages, attachment_refs or {}, checkpoint.through if checkpoint else 0).items():
             messages[index] = {**messages[index], IMAGE_REFS: images}
+        for index, documents in active_documents(messages, attachment_refs or {}, checkpoint.through if checkpoint else 0).items():
+            messages[index] = {**messages[index], DOCUMENT_REFS: documents}
         if prompt_groups:
             messages = project_terminated_turns(messages, prompt_groups)
         prompt = self.system_prompt

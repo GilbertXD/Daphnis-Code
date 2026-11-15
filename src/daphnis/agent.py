@@ -41,8 +41,10 @@ from .compaction import (
 )
 from .compaction_settings import CompactionSettings
 from .context import (
+    DOCUMENT_REFS,
     IMAGE_REFS,
     Context,
+    active_documents,
     active_images,
     annotate_attachments,
     attachment_note,
@@ -54,7 +56,7 @@ from .events import EventBus
 from .history import finish_io
 from .model_io import (
     ContextOverflowError,
-    hide_image_echo,
+    hide_attachment_echo,
     is_context_overflow,
     is_http_context_overflow,
 )
@@ -65,8 +67,9 @@ from .models import (
     require_tools,
     resolve_model,
 )
+from .models.documents import DocumentAdapter, DocumentInputError
 from .models.models import validate_catalog
-from .models.requests import require_image_input
+from .models.requests import require_document_input, require_image_input
 from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
 from .token_budget import TokenBudget, image_token_reserve, request_budget
@@ -222,7 +225,7 @@ class Agent:
         event_fields: dict[str, Any],
         extra_body: dict[str, Any],
         extra_headers: dict[str, str] | None,
-        image_payloads: tuple[str, ...] = (),
+        private_values: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         if not stream:
             response = await self._client.create(
@@ -233,8 +236,8 @@ class Agent:
             )
             if "error" in response and is_context_overflow(response):
                 raise ContextOverflowError
-            if image_payloads:
-                response = hide_image_echo(response, image_payloads)
+            if private_values:
+                response = hide_attachment_echo(response, private_values)
             if response.get("usage") is not None:
                 await self.events.emit(
                     "model.usage", **event_fields, usage=response["usage"]
@@ -264,17 +267,17 @@ class Agent:
                 if chunk.get("usage") is not None:
                     usage = chunk["usage"]
                     await self.events.emit(
-                        "model.usage", **event_fields, usage=hide_image_echo(usage, image_payloads) if image_payloads else usage,
+                        "model.usage", **event_fields, usage=hide_attachment_echo(usage, private_values) if private_values else usage,
                     )
-                if not image_payloads:
+                if not private_values:
                     await self.events.emit("model.delta", **event_fields, chunk=chunk)
         response = accumulator.finalize()
         for choice in response["choices"]:
             if choice["index"] in refusals:
                 choice["message"]["refusal"] = "".join(refusals[choice["index"]])
-        if image_payloads:
-            # An echoed Data URL can be split across any number of SSE events.
-            response = hide_image_echo(response, image_payloads)
+        if private_values:
+            # A private attachment value can be split across any number of SSE events.
+            response = hide_attachment_echo(response, private_values)
             await self.events.emit("model.delta", **event_fields, chunk={
                 "choices": [{"index": choice["index"], "delta": choice["message"]}
                             for choice in response["choices"]],
@@ -301,7 +304,7 @@ class Agent:
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             Agent._validate_tool_calls(calls)
-        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT, IMAGE_REFS):
+        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT, IMAGE_REFS, DOCUMENT_REFS):
             message.pop(field, None)
         return message, reason
 
@@ -462,10 +465,11 @@ class Agent:
             recent_tokens=self.compaction_settings.recent_tokens,
             response_format=self._summary_response_format(),
             image_metadata=any(batch.images for batch in session.attachment_refs.values()),
+            document_metadata=any(batch.documents for batch in session.attachment_refs.values()),
         )
         notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
         raw = annotate_attachments(session.messages.snapshot(), {
-            index: attachment_note(batch, include_images=True) for index, batch in session.attachment_refs.items()
+            index: attachment_note(batch, include_images=True, include_documents=True) for index, batch in session.attachment_refs.items()
         })
         fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
         if notes:
@@ -473,11 +477,11 @@ class Agent:
         if raw and len(raw) not in safe_boundaries(raw, session.prompt_groups):
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
-        tail_budget, image_inputs = self._image_tail_budget(raw, previous, session.attachment_refs, model)
+        tail_budget, attachment_inputs = self._attachment_tail_budget(raw, previous, session.attachment_refs, model)
         cut_source = annotate_attachments(session.messages.snapshot(), notes) if tail_budget else raw
         through = compactor.cut(
             cut_source, previous, prompt_groups=session.prompt_groups,
-            tail_budget=tail_budget, keep_latest_input_for=image_inputs,
+            tail_budget=tail_budget, keep_latest_input_for=attachment_inputs,
         )
         if through is None:
             await self.events.emit("compaction.candidate", **fields, reason="no_safe_cut")
@@ -553,12 +557,14 @@ class Agent:
         return None
 
     @staticmethod
-    def _image_tail_budget(
+    def _attachment_tail_budget(
         messages: list[dict[str, Any]], checkpoint: CompactionCheckpoint | None,
         refs: dict[int, AttachmentBatch], model: ModelInfo,
     ) -> tuple[Callable[[int, list[dict[str, Any]]], int | None] | None, set[int]]:
-        images = active_images(messages, refs, checkpoint.through if checkpoint else 0)
-        if not images:
+        start = checkpoint.through if checkpoint else 0
+        images = active_images(messages, refs, start)
+        documents = active_documents(messages, refs, start)
+        if not images and not documents:
             return None, set()
         costs = {
             index: (
@@ -576,21 +582,26 @@ class Agent:
                     reserve += image_tokens
             if size > MAX_IMAGE_REQUEST_BYTES:
                 return None
-            return request_budget(tail, {}, None, counter=model.token_counter, image_reserve=reserve).input_tokens
+            unknown = sum(len(items) for index, items in documents.items() if index >= through)
+            return request_budget(
+                tail, {}, None, counter=model.token_counter, image_reserve=reserve, unknown_documents=unknown,
+            ).input_tokens
 
-        return budget, set(images)
+        return budget, images.keys() | documents.keys()
 
     def _request_budget(
         self, messages: list[dict[str, Any]], body: dict[str, Any], model: ModelInfo,
     ) -> TokenBudget:
         image_reserve = 0
+        unknown_documents = 0
         text_messages = []
         for message in messages:
-            if IMAGE_REFS in message:
-                image_reserve += sum(
-                    image_token_reserve(model.provider, image.width, image.height) for image in message[IMAGE_REFS]
-                )
-                text_messages.append({key: value for key, value in message.items() if key != IMAGE_REFS})
+            image_reserve += sum(
+                image_token_reserve(model.provider, image.width, image.height) for image in message.get(IMAGE_REFS, ())
+            )
+            unknown_documents += len(message.get(DOCUMENT_REFS, ()))
+            if IMAGE_REFS in message or DOCUMENT_REFS in message:
+                text_messages.append({key: value for key, value in message.items() if key not in (IMAGE_REFS, DOCUMENT_REFS)})
             else:
                 text_messages.append(message)
         return request_budget(
@@ -599,6 +610,7 @@ class Agent:
             default_output_tokens=None if self._custom_compatibility else model.default_output_tokens,
             settings=self.compaction_settings,
             image_reserve=image_reserve,
+            unknown_documents=unknown_documents,
         )
 
     async def _compact_request(
@@ -629,7 +641,7 @@ class Agent:
         failure_reason = None
         try:
             raw = (annotate_attachments(history.snapshot(), {
-                       index: attachment_note(batch, include_images=True)
+                       index: attachment_note(batch, include_images=True, include_documents=True)
                        for index, batch in (attachment_refs or {}).items()
                    })
                    if history_lookup or self.compaction_settings.auto_enabled else [])
@@ -663,11 +675,11 @@ class Agent:
                     available -= compactor.counter.count(SUMMARY_POLICY)
                     if history_lookup:
                         available -= compactor.counter.count(history_range_hint(len(raw)))
-                tail_budget, image_inputs = self._image_tail_budget(raw, checkpoint, attachment_refs or {}, model)
+                tail_budget, attachment_inputs = self._attachment_tail_budget(raw, checkpoint, attachment_refs or {}, model)
                 cut_source = annotate_attachments(history.snapshot(), attachment_notes) if tail_budget else raw
                 through = compactor.cut(
                     cut_source, checkpoint, within_turn=True, available_tokens=available, prompt_groups=prompt_groups,
-                    tail_budget=tail_budget, keep_latest_input_for=image_inputs,
+                    tail_budget=tail_budget, keep_latest_input_for=attachment_inputs,
                 )
                 cut_key = (checkpoint.through if checkpoint else 0, through) if through is not None else None
                 if through is None:
@@ -741,6 +753,7 @@ class Agent:
         attachment_batch: AttachmentBatch | None = None,
         attachment_texts: tuple[str, ...] = (),
         attachment_store: AttachmentStore | None = None,
+        document_adapter: DocumentAdapter | None = None,
     ) -> TurnResult:
         session_id = session.id
         if session_id in _ACTIVE_SESSIONS:
@@ -757,6 +770,7 @@ class Agent:
         requests = primary_requests = maintenance_requests = calls_executed = 0
         side_effects = False
         retried_overflow = False
+        retried_documents = False
         committed_checkpoint = checkpoint = session.compaction
         try:
             provider, model_id = session.provider, session.model_id
@@ -777,6 +791,10 @@ class Agent:
                 require_image_input(model)
                 if attachment_store is None or persist is None:
                     raise ValueError("图片附件需要持久化存储。")
+            if attachment_batch and attachment_batch.documents:
+                require_document_input(model)
+                if attachment_store is None or persist is None or document_adapter is None:
+                    raise DocumentInputError("文档输入需要可用的持久化存储和模型文件接口。")
             recovery = recovery_state(committed, session_id, session.prompt_groups)
             if recovery_action is None:
                 if prompt_input is None:
@@ -826,6 +844,8 @@ class Agent:
                 response_format=self._summary_response_format(),
                 image_metadata=bool(attachment_batch and attachment_batch.images)
                 or any(batch.images for batch in session.attachment_refs.values()),
+                document_metadata=bool(attachment_batch and attachment_batch.documents)
+                or any(batch.documents for batch in session.attachment_refs.values()),
             )
 
             def check_session() -> None:
@@ -965,37 +985,60 @@ class Agent:
             async def send_request(
                 messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
-                nonlocal requests, primary_requests
-                image_payloads = ()
+                nonlocal requests, primary_requests, retried_documents
+                private_values = ()
                 if any(IMAGE_REFS in message for message in messages):
                     if projected_image_bytes(messages) > MAX_IMAGE_REQUEST_BYTES:
                         raise ValueError("当前上下文中的图片超过 32 MiB，请先压缩历史。")
                     if attachment_store is None:
                         raise ValueError("原始图片附件快照不可用。")
-                    messages, image_payloads = await asyncio.to_thread(
+                    messages, private_values = await asyncio.to_thread(
                         materialize_images, messages, attachment_store, session.id,
                     )
-                primary_requests += 1
-                requests += 1
-                request_fields = {**fields, "request_number": requests}
-                await self.events.emit(
-                    "model.started", **request_fields, provider=provider, model_id=model_id,
-                )
-                await self.events.emit(
-                    "context.budget", **request_fields, **asdict(budget),
-                    provider=provider, model_id=model_id,
-                )
-                try:
-                    response = await self._request(
-                        model=model_id, messages=messages, stream=stream,
-                        event_fields=request_fields, extra_body=body, extra_headers=extra_headers,
-                        image_payloads=image_payloads,
+                documents = {index: message[DOCUMENT_REFS] for index, message in enumerate(messages)
+                             if DOCUMENT_REFS in message}
+                if documents:
+                    if attachment_store is None or document_adapter is None:
+                        raise DocumentInputError("模型文档接口或原始文档快照不可用。")
+                    messages = [{key: value for key, value in m.items() if key != DOCUMENT_REFS} for m in messages]
+
+                while True:
+                    prepared = None
+                    if documents:
+                        prepared = await document_adapter.prepare(
+                            messages, documents, lambda item: attachment_store.read_document(session.id, item),
+                        )
+                        await _checkpoint()
+                    primary_requests += 1
+                    requests += 1
+                    request_fields = {**fields, "request_number": requests}
+                    await self.events.emit(
+                        "model.started", **request_fields, provider=provider, model_id=model_id,
                     )
-                except (APIError, ResponseError) as exc:
-                    if is_http_context_overflow(exc):
-                        raise ContextOverflowError from exc
-                    raise
-                return response, request_fields
+                    await self.events.emit(
+                        "context.budget", **request_fields, **asdict(budget),
+                        provider=provider, model_id=model_id,
+                    )
+                    try:
+                        response = await self._request(
+                            model=model_id, messages=prepared.messages if prepared else messages, stream=stream,
+                            event_fields=request_fields, extra_body=body, extra_headers=extra_headers,
+                            private_values=private_values + (prepared.private_values if prepared else ()),
+                        )
+                    except (APIError, ResponseError) as exc:
+                        if is_http_context_overflow(exc):
+                            raise ContextOverflowError from exc
+                        if not (
+                            prepared and isinstance(exc, APIError)
+                            and await document_adapter.invalidate_missing(exc.response, prepared)
+                        ):
+                            raise
+                        if retried_documents or primary_remaining() == 0:
+                            raise DocumentInputError("远端文档引用已失效，请重试。") from None
+                        retried_documents = True
+                        await _checkpoint()
+                        continue
+                    return response, request_fields
 
             await _checkpoint()
             pending = []
@@ -1098,6 +1141,10 @@ class Agent:
                 await commit(snapshot)
             if body is None:
                 body = request_options()
+            if pending and active_documents(
+                session.messages.snapshot(), session.attachment_refs, checkpoint.through if checkpoint else 0,
+            ):
+                require_document_input(model)
             for call, index in pending:
                 await process_tool(call, index, {**fields, "request_number": 0})
             attempted_cuts: set[tuple[int, int]] = set()
@@ -1113,6 +1160,10 @@ class Agent:
                     require_image_input(model)
                     if model.context_window is None:
                         raise ValueError("模型上下文上限未知，无法安全发送图片。")
+                if any(DOCUMENT_REFS in message for message in messages):
+                    require_document_input(model)
+                    if document_adapter is None or model.context_window is None:
+                        raise DocumentInputError("模型文档接口或上下文上限不可用。")
                 budget = self._request_budget(messages, body, model)
                 if not budget.fits and can_read_attachments and attachment_notes is not reference_notes:
                     attachment_notes = reference_notes
@@ -1185,6 +1236,8 @@ class Agent:
                             if reason == "request_limit" or (maintenance_limited and reason in ("window_limit", "no_reduction")):
                                 response = None
                                 break
+                            if any(DOCUMENT_REFS in message for message in messages):
+                                raise DocumentInputError("文档和当前上下文超过模型上限，请缩小文档或压缩历史。") from None
                             raise
                         retried_overflow = True
                         messages = reduced
