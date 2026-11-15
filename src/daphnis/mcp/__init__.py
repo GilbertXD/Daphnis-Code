@@ -1,4 +1,4 @@
-"""MCP tool discovery and calls over SDK transports."""
+"""MCP tools and prompts over SDK transports."""
 
 import asyncio
 import json
@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
@@ -19,7 +19,9 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.client.subscriptions import ToolsListChanged
 from mcp.types import (
     EmptyResult,
+    GetPromptResult,
     PingRequest,
+    Prompt,
     TextContent,
     Tool,
     ToolListChangedNotification,
@@ -33,6 +35,10 @@ TOOL_PREFIX = "mcp__"
 MAX_TOOL_RESULT_BYTES = 65_536
 _CONNECT_TIMEOUT = 15
 _CALL_TIMEOUT = 30
+_PROMPT_TIMEOUT = 10
+_PROMPT_BYTES = 65_536
+_PROMPT_PAGES = 32
+_PROMPT_FIELDS = 64
 _HTTP_HEALTH_INTERVAL = 15
 _HTTP_HEALTH_TIMEOUT = 5
 _STDERR_LIMIT = 16 * 1024
@@ -92,16 +98,20 @@ async def _stdio_errlog(name: str) -> AsyncIterator[TextIO]:
                     await asyncio.to_thread(capture.log, name)
 
 
-def _result_fits(value: dict[str, Any]) -> bool:
-    # Match Saturnus ToolResult serialization, including UTF-8 and JSON escaping.
-    remaining = MAX_TOOL_RESULT_BYTES
+def _json_size(value: Any, limit: int) -> int | None:
+    remaining = limit
     for chunk in json.JSONEncoder(ensure_ascii=False, allow_nan=False).iterencode(value):
         if len(chunk) > remaining:
-            return False
+            return None
         remaining -= len(chunk.encode("utf-8"))
         if remaining < 0:
-            return False
-    return True
+            return None
+    return limit - remaining
+
+
+def _result_fits(value: dict[str, Any]) -> bool:
+    # Match Saturnus ToolResult serialization, including UTF-8 and JSON escaping.
+    return _json_size(value, MAX_TOOL_RESULT_BYTES) is not None
 
 
 def _bounded_result(value: dict[str, Any]) -> dict[str, Any]:
@@ -125,6 +135,16 @@ class MCPStatus:
     state: str
     tool_count: int
     error: str | None
+
+
+class MCPPromptError(RuntimeError):
+    """A safe diagnostic for a failed prompt request."""
+
+
+def _valid_prompt_name(name: str) -> bool:
+    return isinstance(name, str) and 0 < len(name) <= 256 and bool(name.strip()) and not re.search(
+        r"[\x00-\x1f\x7f-\x9f]", name,
+    )
 
 
 class _WatchedReadStream:
@@ -282,6 +302,11 @@ class MCPConnection:
     def available(self) -> bool:
         return self.state == "Connected" and self._live
 
+    @property
+    def supports_prompts(self) -> bool:
+        client = self._client
+        return self.available and client is not None and client.server_capabilities.prompts is not None
+
     def _can_publish(self) -> bool:
         return self.state == "Connecting" and self._live
 
@@ -374,19 +399,28 @@ class MCPConnection:
             status = response.status_code
             if status in (401, 403):
                 suffix = "在线发现仅支持 Bearer Token。" if self._public_only else ""
-                self._http_error = (
+                error = (
                     "mcp_auth_failed",
                     f"MCP 认证失败（HTTP {status}）。{suffix}",
                 )
             elif response.is_redirect:
-                self._http_error = (
+                error = (
                     "mcp_redirect",
                     "MCP 地址发生重定向，请配置最终地址。",
                 )
             else:
                 return
+            if response.request.method == "POST":
+                with suppress(ValueError, httpx2.RequestNotRead):
+                    method = json.loads(response.request.content).get("method")
+                    if method in {"prompts/list", "prompts/get"}:
+                        # Let the SDK reject just this request without following a redirect.
+                        response.status_code = 403
+                        response.headers.pop("Location", None)
+                        return
+            self._http_error = error
             # Stop before the SDK can follow or log a server-controlled Location.
-            raise httpx2.RequestError(self._http_error[1])
+            raise httpx2.RequestError(error[1])
 
         try:
             transport = await public_transport(self._url) if self._public_only else None
@@ -428,6 +462,8 @@ class MCPConnection:
             return await self._discover(client)
 
     async def _discover(self, client: Client) -> dict[str, Tool]:
+        if client.server_capabilities.tools is None:
+            return {}
         tools = {}
         cursor = None
         seen_cursors = set()
@@ -455,6 +491,74 @@ class MCPConnection:
             if cursor in seen_cursors:
                 raise ValueError("MCP Server 返回了重复的分页游标。")
             seen_cursors.add(cursor)
+
+    @asynccontextmanager
+    async def _prompt_request(self) -> AsyncIterator[Client]:
+        client = self._client
+        if not self.available or client is None:
+            raise MCPPromptError("MCP 连接不可用。")
+        if client.server_capabilities.prompts is None:
+            raise MCPPromptError("此 MCP 服务不支持模板。")
+        try:
+            async with asyncio.timeout(_PROMPT_TIMEOUT):
+                yield client
+        except TimeoutError:
+            raise MCPPromptError("MCP 模板请求超时。") from None
+        except MCPPromptError:
+            raise
+        except Exception:  # noqa: BLE001 - SDK failures may contain server data or user arguments.
+            if not self.available or self._client is not client:
+                raise MCPPromptError("MCP 连接已中断。") from None
+            raise MCPPromptError("MCP 模板请求失败或响应无效。") from None
+        if not self.available or self._client is not client:
+            raise MCPPromptError("MCP 连接已中断。")
+
+    async def list_prompts(self) -> tuple[Prompt, ...]:
+        async with self._prompt_request() as client:
+            prompts: dict[str, Prompt] = {}
+            cursor = None
+            seen_cursors: set[str] = set()
+            remaining = _PROMPT_BYTES
+            for _ in range(_PROMPT_PAGES):
+                page = await client.list_prompts(cursor=cursor, cache_mode="bypass")
+                size = _json_size(page.model_dump(mode="json", by_alias=True), remaining)
+                if size is None:
+                    raise MCPPromptError("MCP 模板列表超出大小上限。")
+                remaining -= size
+                if page.result_type != "complete":
+                    raise MCPPromptError("MCP 模板列表响应无效。")
+                for prompt in page.prompts:
+                    arguments = [arg.name for arg in prompt.arguments or ()]
+                    if (
+                        not _valid_prompt_name(prompt.name) or prompt.name in prompts
+                        or len(arguments) > _PROMPT_FIELDS or len(set(arguments)) != len(arguments)
+                        or not all(map(_valid_prompt_name, arguments))
+                    ):
+                        raise MCPPromptError("MCP 模板定义无效或名称重复。")
+                    prompts[prompt.name] = prompt
+                cursor = page.next_cursor
+                if cursor is None:
+                    return tuple(prompts.values())
+                if cursor in seen_cursors:
+                    raise MCPPromptError("MCP 模板列表返回了重复的分页游标。")
+                seen_cursors.add(cursor)
+            raise MCPPromptError("MCP 模板列表超出分页上限。")
+
+    async def get_prompt(self, name: str, arguments: dict[str, str]) -> GetPromptResult:
+        if not _valid_prompt_name(name) or not isinstance(arguments, dict) or len(arguments) > _PROMPT_FIELDS:
+            raise ValueError("MCP 模板名称或参数无效。")
+        if not all(_valid_prompt_name(key) and isinstance(value, str) for key, value in arguments.items()):
+            raise ValueError("MCP 模板参数必须是字符串。")
+        if _json_size(arguments, _PROMPT_BYTES) is None:
+            raise ValueError("MCP 模板参数超出大小上限。")
+        async with self._prompt_request() as client:
+            # Do not drive server-requested sampling, elicitation, or additional input.
+            result = await client.session.get_prompt(name, arguments)
+            if result.result_type != "complete" or not result.messages:
+                raise MCPPromptError("MCP 模板结果无效。")
+            if _json_size(result.model_dump(mode="json", by_alias=True), _PROMPT_BYTES) is None:
+                raise MCPPromptError("MCP 模板结果超出大小上限。")
+            return result
 
     async def _serve(
         self,
@@ -501,6 +605,8 @@ class MCPConnection:
     async def _watch_tools(
         self, client: Client, on_changed: Callable[["MCPConnection"], Awaitable[None]]
     ) -> None:
+        if client.server_capabilities.tools is None:
+            return
         if client.session.discover_result is not None:
             # Unsupported or interrupted subscriptions leave manual refresh available.
             try:

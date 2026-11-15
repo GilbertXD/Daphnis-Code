@@ -13,7 +13,7 @@ import httpx
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.app import Application
-from daphnis.mcp import MCPConnection
+from daphnis.mcp import MCPConnection, MCPPromptError
 from daphnis.runtime import open_operations
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
@@ -30,6 +30,54 @@ def tool_call(name, call_id, **arguments):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_protocol_pagination_payloads_and_failure_isolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt_root = root / "prompts"
+            prompt_root.mkdir()
+            (prompt_root / "prompts").touch()
+            (prompt_root / "prompts-only").touch()
+            plain_root = root / "plain"
+            plain_root.mkdir()
+            both_root = root / "both"
+            both_root.mkdir()
+            (both_root / "prompts").touch()
+            app = Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash",
+                connections={"deepseek": {"base_url": "https://model.test"}},
+                history=History(root / "sessions"),
+            )
+            ops = Operations(app)
+            try:
+                await ops.connect_mcp("plain", sys.executable, [str(DEMO), str(plain_root)])
+                with self.assertRaisesRegex(MCPPromptError, "不支持模板"):
+                    await app._mcp["plain"].list_prompts()
+                self.assertTrue(app._mcp["plain"].available)
+                await ops.connect_mcp("prompt-only", sys.executable, [str(DEMO), str(prompt_root)])
+                self.assertTrue(app._mcp["prompt-only"].supports_prompts)
+                self.assertEqual(app._mcp["prompt-only"].tools, {})
+                await ops.connect_mcp("both", sys.executable, [str(DEMO), str(both_root)])
+                connection = app._mcp["both"]
+                prompts = await connection.list_prompts()
+                self.assertEqual([prompt.name for prompt in prompts], ["greet", "bundle", "slow", "fail", "large"])
+                self.assertEqual([(arg.name, arg.required) for arg in prompts[0].arguments],
+                                 [("who", True), ("tone", False)])
+                greeting = await connection.get_prompt("greet", {"who": "Ada", "tone": "casual"})
+                self.assertEqual(greeting.messages[0].content.text, "Hello, Ada! (casual)")
+                bundle = await connection.get_prompt("bundle", {})
+                self.assertEqual([(msg.role, msg.content.type) for msg in bundle.messages],
+                                 [("user", "text"), ("assistant", "image")])
+                self.assertEqual(bundle.messages[1].content.data, "AA==")
+                with patch("daphnis.mcp._PROMPT_TIMEOUT", 0.1), self.assertRaisesRegex(MCPPromptError, "超时"):
+                    await connection.get_prompt("slow", {})
+                with self.assertRaisesRegex(MCPPromptError, "响应无效"):
+                    await connection.get_prompt("fail", {})
+                with self.assertRaisesRegex(MCPPromptError, "大小上限"):
+                    await connection.get_prompt("large", {})
+                self.assertEqual((await connection.call("add", {"a": 2, "b": 3}))["structured_content"], {"sum": 5})
+            finally:
+                await ops.close()
+
     async def test_runtime_persists_and_restores_mcp_with_isolated_connection_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -527,6 +575,10 @@ asyncio.run(main())
             "http-demo", log_level="CRITICAL", subscriptions=ObservedBus()
         )
 
+        @server.prompt()
+        def greeting() -> str:
+            return "Hello from MCP"
+
         async def double(a: int, b: int) -> dict[str, int]:
             return {"sum": 2 * (a + b)}
 
@@ -571,6 +623,25 @@ asyncio.run(main())
                 )
                 await send({"type": "http.response.body", "body": b""})
                 return
+            if scope["method"] == "POST":
+                first = await receive()
+                if (
+                    first["type"] == "http.request" and not first.get("more_body") and first.get("body")
+                    and json.loads(first["body"]).get("method") == "prompts/get"
+                ):
+                    await send({"type": "http.response.start", "status": 307,
+                                "headers": [(b"location", b"/unexpected")]})
+                    await send({"type": "http.response.body", "body": b""})
+                    return
+
+                async def replay():
+                    nonlocal first
+                    if first is not None:
+                        message, first = first, None
+                        return message
+                    return await receive()
+
+                return await remote(scope, replay, send)
             return await remote(scope, receive, send)
 
         def model(request):
@@ -668,6 +739,12 @@ asyncio.run(main())
                         auth=bearer,
                     )
                 self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
+                connection = app._mcp["remote"]
+                self.assertEqual([prompt.name for prompt in await connection.list_prompts()], ["greeting"])
+                with self.assertRaisesRegex(MCPPromptError, "响应无效"):
+                    await connection.get_prompt("greeting", {})
+                self.assertTrue(connection.available)
+                self.assertNotIn("/unexpected", received)
                 await ops.set_tools(("mcp__remote__add",))
                 await asyncio.wait_for(subscribed.wait(), 5)
                 send = asyncio.create_task(ops.send("add", stream=False))
