@@ -25,6 +25,7 @@ from .history import (
     finish_io,
 )
 from .mcp import TOOL_PREFIX, MCPConnection
+from .mcp_store import MCPStore
 from .model_io import ObservedChatClient
 from .models import (
     MODELS,
@@ -95,6 +96,7 @@ class Application:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
+        self._mcp_store = MCPStore(self._history.directory.parent / "mcp.json")
         self._interactive = interactive
         self._observe_model_io = observe_model_io
         self._request_limits = {
@@ -237,55 +239,58 @@ class Application:
     async def _connect_mcp(self, connection: MCPConnection) -> None:
         self._ensure_idle()
         async with self._state_lock:
-            previous = self._mcp.get(connection.name)
-            if previous and previous.state == "Connected":
-                raise ValueError(f"MCP Server {connection.name!r} 已连接。")
-            self._revoke_mcp_trust(connection.name)
-            if previous:
-                await previous.aclose()
-            self._mcp[connection.name] = connection
-            discovered = await connection.start(self._mcp_error, self._mcp_tools_changed)
-            previous_tools = connection.tools
-            try:
-                self._ensure_open()
-                connection.tools = discovered
-                tools = self._mcp_catalog(connecting=connection)
-            except Exception:  # noqa: BLE001 - SDK catalogue errors must not disclose server data.
-                error = "无法注册 MCP 工具定义。"
-            else:
-                if connection._can_publish():
-                    try:
-                        if (
-                            previous is None
-                            and discovered
-                            and not self._use_saved_tool_preferences
-                            and self._model.supports_tools is True
-                        ):
-                            session = replace(
-                                self._session,
-                                enabled_tools=(*self._session.enabled_tools, *discovered),
-                            )
-                            await finish_io(self._save_and_publish_session(session))
-                    except (SessionBusyError, SessionConflictError, asyncio.CancelledError):
-                        connection.tools = previous_tools
-                        await finish_io(connection.aclose())
-                        raise
-                    except (OSError, TypeError, ValueError):
-                        error = "无法保存 MCP 工具启用偏好。"
-                    else:
-                        if not self._closed and connection._can_publish():
-                            connection.state = "Connected"
-                            self._tools = tools
-                            return
-                        error = connection.error or "MCP 连接在发布前已中断。"
+            await self._start_mcp(connection)
+
+    async def _start_mcp(self, connection: MCPConnection) -> None:
+        previous = self._mcp.get(connection.name)
+        if previous and previous.state == "Connected":
+            raise ValueError(f"MCP Server {connection.name!r} 已连接。")
+        self._revoke_mcp_trust(connection.name)
+        if previous:
+            await previous.aclose()
+        self._mcp[connection.name] = connection
+        discovered = await connection.start(self._mcp_error, self._mcp_tools_changed)
+        previous_tools = connection.tools
+        try:
+            self._ensure_open()
+            connection.tools = discovered
+            tools = self._mcp_catalog(connecting=connection)
+        except Exception:  # noqa: BLE001 - SDK catalogue errors must not disclose server data.
+            error = "无法注册 MCP 工具定义。"
+        else:
+            if connection._can_publish():
+                try:
+                    if (
+                        previous is None
+                        and discovered
+                        and not self._use_saved_tool_preferences
+                        and self._model.supports_tools is True
+                    ):
+                        session = replace(
+                            self._session,
+                            enabled_tools=(*self._session.enabled_tools, *discovered),
+                        )
+                        await finish_io(self._save_and_publish_session(session))
+                except (SessionBusyError, SessionConflictError, asyncio.CancelledError):
+                    connection.tools = previous_tools
+                    await finish_io(connection.aclose())
+                    raise
+                except (OSError, TypeError, ValueError):
+                    error = "无法保存 MCP 工具启用偏好。"
                 else:
+                    if not self._closed and connection._can_publish():
+                        connection.state = "Connected"
+                        self._tools = tools
+                        return
                     error = connection.error or "MCP 连接在发布前已中断。"
-            connection.tools = previous_tools
-            await connection.aclose()
-            if self._closed:
-                raise RuntimeError("Application 已关闭。")
-            connection.state, connection.error = "Error", error
-            raise RuntimeError(error)
+            else:
+                error = connection.error or "MCP 连接在发布前已中断。"
+        connection.tools = previous_tools
+        await connection.aclose()
+        if self._closed:
+            raise RuntimeError("Application 已关闭。")
+        connection.state, connection.error = "Error", error
+        raise RuntimeError(error)
 
     async def _disconnect_mcp(self, name: str) -> None:
         self._ensure_idle()

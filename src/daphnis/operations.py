@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 from saturnus import ValidationError
 
 from .compaction import CompactionCheckpoint
+from .config import load_mcp_config
 from .events import Callback
-from .history import finish_io
+from .history import SessionLease, finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus
+from .mcp_store import MCPServerConfig
 from .models import CapabilityError, ModelInfo, list_models, require_tools
 from .project import Project
 from .session import Session
@@ -276,6 +278,93 @@ class Operations:
 
     def mcp_status(self) -> tuple[MCPStatus, ...]:
         return tuple(server.status for server in self._app._mcp.values())
+
+    def managed_mcp(self) -> tuple[MCPServerConfig, ...]:
+        return tuple(self._app._mcp_store.read().values())
+
+    def import_mcp(self, path: Path) -> None:
+        """Seed managed configuration once, including an intentionally empty list."""
+        app = self._app
+        app._ensure_idle()
+        store = app._mcp_store
+        if store.path.exists():
+            return
+        with SessionLease(store.path):
+            if not store.path.exists():
+                configs = {}
+                for name, options in load_mcp_config(path).items():
+                    if isinstance(options.get("cwd"), Path):
+                        options["cwd"] = str(options["cwd"])
+                    configs[name] = MCPServerConfig.from_json(name, {"enabled": True, "options": options})
+                store.write(configs)
+
+    async def save_mcp(
+        self, name: str, *, enabled: bool, options: dict[str, Any] | None = None,
+        create: bool = False,
+    ) -> str | None:
+        app = self._app
+        app._ensure_idle()
+        async with app._state_lock:
+            store = app._mcp_store
+            with SessionLease(store.path):
+                configs = store.read()
+                current = configs.get(name)
+                if create and (current or name in app._mcp):
+                    raise ValueError("该 MCP 服务标识已存在。")
+                if not create and current is None:
+                    raise ValueError("MCP 服务不存在。")
+                if options is None and current is None:
+                    raise ValueError("请提供 MCP 服务配置。")
+                config = MCPServerConfig(name, enabled, deepcopy(options if options is not None else current.options))
+                connection = config.connection()
+                if config == current:
+                    return None
+                configs[name] = config
+                store.write(configs)
+            return await finish_io(self._apply_mcp(name, connection if enabled else None))
+
+    async def restart_mcp(self, name: str) -> str | None:
+        app = self._app
+        app._ensure_idle()
+        async with app._state_lock:
+            config = app._mcp_store.read().get(name)
+            if config is None or not config.enabled:
+                raise ValueError("请先启用 MCP 服务。")
+            return await finish_io(self._apply_mcp(name, config.connection()))
+
+    async def delete_mcp(self, name: str) -> None:
+        app = self._app
+        app._ensure_idle()
+        async with app._state_lock:
+            store = app._mcp_store
+            with SessionLease(store.path):
+                configs = store.read()
+                if configs.pop(name, None) is None:
+                    raise ValueError("MCP 服务不存在。")
+                store.write(configs)
+            await finish_io(self._apply_mcp(name, None, remove=True))
+
+    async def _apply_mcp(
+        self, name: str, connection: MCPConnection | None, *, remove: bool = False,
+    ) -> str | None:
+        app = self._app
+        previous = app._mcp.get(name)
+        if previous is not None:
+            app._revoke_mcp_trust(name)
+            await previous.aclose()
+            app._tools = app._mcp_catalog()
+        if connection is None:
+            if remove:
+                app._mcp.pop(name, None)
+            return None
+        try:
+            await app._start_mcp(connection)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            if connection.state != "Error":
+                await connection.aclose()
+                connection.state, connection.error = "Error", "无法初始化 MCP 连接。"
+            return connection.error
+        return None
 
     def list_mcp_tools(self) -> tuple[str, ...]:
         return tuple(

@@ -190,8 +190,8 @@ class MCPConnection:
     def __init__(
         self,
         name: str,
-        command: str | None,
-        args: Sequence[str],
+        command: str | None = None,
+        args: Sequence[str] = (),
         *,
         cwd: str | Path | None = None,
         env: Mapping[str, str] | None = None,

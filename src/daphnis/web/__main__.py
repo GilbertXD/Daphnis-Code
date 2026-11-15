@@ -7,7 +7,7 @@ from pathlib import Path
 
 import uvicorn
 
-from ..runtime import MCPStartupError, open_operations
+from ..runtime import open_operations
 from .bridge import Bridge
 from .redaction import Redactor
 from .server import create_app
@@ -37,8 +37,6 @@ def main() -> None:
             ops = await open_operations(
                 args.workspace or Path.cwd(), session_id=args.session, observe_model_io=True
             )
-        except MCPStartupError:
-            raise
         except Exception as exc:  # noqa: BLE001 - Avoid leaking configuration in startup logs.
             raise RuntimeError(f"Daphnis 无法启动（{type(exc).__name__}），请检查服务端配置。") from None
         redactor = Redactor([
