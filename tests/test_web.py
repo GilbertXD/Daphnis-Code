@@ -63,11 +63,11 @@ class WebTests(unittest.TestCase):
             if body["messages"][0]["content"] == TITLE_PROMPT:
                 self.title_requests.append(body)
                 source = body["messages"][-1]["content"]
-                if source.startswith("[REDACTED]"):
+                if source.startswith("User: [REDACTED]"):
                     return httpx.Response(200, json={
                         "choices": [{
                             "index": 0, "finish_reason": "stop",
-                            "message": {"role": "assistant", "content": "整理首条消息"},
+                            "message": {"role": "assistant", "content": "本会话的标题是：“整理首条消息”"},
                         }],
                         "usage": {"prompt_tokens": 8, "completion_tokens": 4},
                     })
@@ -876,7 +876,7 @@ class WebTests(unittest.TestCase):
         result = json.loads(terminated["state"]["messages"][-1]["content"])
         self.assertEqual(result["error"]["code"], "execution_skipped")
 
-    def test_session_title_uses_first_prompt_and_preserves_manual_names(self):
+    def test_session_title_uses_input_and_preserves_manual_names(self):
         session_id = self.snapshot()["session_id"]
         prompt = f"  {API_KEY}\n\t{'一' * 80}"
         self.command("thinking", session_id, mode="high")
@@ -893,7 +893,7 @@ class WebTests(unittest.TestCase):
         [title_request] = self.title_requests
         self.assertEqual(title_request["reasoning_effort"], "none")
         self.assertNotIn("tools", title_request)
-        self.assertEqual(title_request["messages"][1]["content"], prompt.replace(API_KEY, "[REDACTED]").strip())
+        self.assertEqual(title_request["messages"][1]["content"], "User: [REDACTED] " + "一" * 80)
         self.assertEqual(self.requests[0]["reasoning_effort"], "high")
         self.assertEqual(self.titles_at_reply, ["[REDACTED] " + "一" * 28 + "…"])
         self.assertNotIn(expected, json.dumps(self.requests[0], ensure_ascii=False))
@@ -915,6 +915,42 @@ class WebTests(unittest.TestCase):
         self.assertEqual(done["state"]["session"]["title"], "手动命名")
         self.assertEqual(self.history.load(fresh).title, "手动命名")
         self.assertEqual(len(self.title_requests), 1)
+
+    def test_resource_prompt_title_uses_committed_group_and_a_separate_budget(self):
+        sid = self.snapshot()["session_id"]
+        (self.workspace / "prompts").touch()
+        (self.workspace / "resource-text").write_text("small private resource excerpt")
+        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+        })
+        for name, resource_text, include_text in (
+            ("embedded", "small private resource excerpt", True),
+            ("embedded-large", "X" * 70_000, False),
+        ):
+            with self.subTest(name=name):
+                result = self.command("mcp_get_prompt", sid, server="demo", name=name,
+                                      arguments={})["mcp_prompt_result"]
+                self.command("mcp_run_prompt", sid, 202, preview_id=result["preview_id"],
+                             texts=["Review this resource.", "", "Summarize architecture upgrades."])
+                done = self.wait_for(lambda frame: not frame["status"]["running"])
+                source = self.title_requests[-1]["messages"][-1]["content"]
+                self.assertIn("User: Review this resource.", source)
+                self.assertIn("Assistant: 附件: notes://embedded-source (text/markdown,", source)
+                self.assertIn("User: Summarize architecture upgrades.", source)
+                self.assertEqual(resource_text in source, include_text)
+                self.assertNotIn("X" * 32, source)
+                self.assertNotIn("embedded-large", source)
+                self.assertNotIn("done", source)
+                self.assertLessEqual(len(source), 3000)
+                title_event = next(event for event in done["events"] if event["name"] == "model.request"
+                                   and event["data"].get("purpose") == "title")
+                self.assertEqual(title_event["data"]["body"]["messages"][1]["content"], "[内容已隐藏]")
+                self.assertNotIn("small private resource excerpt", json.dumps(done["events"]))
+                self.assertEqual(self.history.load(sid).title, "Review this resource.")
+                self.command("new", sid)
+                sid = self.snapshot()["session_id"]
+        self.assertEqual(len(self.title_requests), 2)
 
     def test_failed_title_request_keeps_truncated_first_prompt(self):
         session_id = self.snapshot()["session_id"]

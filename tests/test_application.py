@@ -337,6 +337,36 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(scenario=scenario):
                 await check(scenario)
 
+    async def test_invalid_or_timed_out_title_keeps_the_saved_fallback(self):
+        async def handler(request):
+            nonlocal title_requests
+            if json.loads(request.content)["messages"][0]["content"] == TITLE_PROMPT:
+                title_requests += 1
+                if output is None:
+                    await asyncio.Future()
+                return response({"role": "assistant", "content": output})
+            return response({"role": "assistant", "content": "done"})
+
+        with tempfile.TemporaryDirectory() as temporary:
+            history = History(Path(temporary) / "sessions")
+            ops = Operations(Application(
+                workspace=temporary, provider="deepseek", model_id="a", catalog=CATALOG,
+                connections={"deepseek": {
+                    "base_url": "https://model.test", "transport": httpx.MockTransport(handler),
+                }}, history=history,
+            ))
+            self.addAsyncCleanup(ops.close)
+            title_requests = 0
+            with patch("daphnis.app._TITLE_TIMEOUT", 0.05):
+                for output in ("", "长" * 41, None):
+                    result = await ops.send("first task", stream=False)
+                    self.assertEqual(result.status, TurnStatus.COMPLETED)
+                    saved = history.load(ops.session.id)
+                    self.assertEqual(saved.title, "first task")
+                    self.assertEqual(saved.messages.snapshot()[-1]["content"], "done")
+                    await ops.new_session()
+            self.assertEqual(title_requests, 3)
+
     async def test_cancel_title_keeps_completed_reply_and_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             history = History(Path(temporary) / "sessions")

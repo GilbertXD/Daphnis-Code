@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from saturnus import ChatClient
 
-from .agent import Agent, TurnResult, TurnStatus, assistant_text
+from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
     ATTACHMENT_ONLY_PROMPT,
     AttachmentBatch,
@@ -44,7 +44,7 @@ from .models.models import validate_catalog
 from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
-from .terminal_text import sanitize_terminal
+from .title import build_title_source, fallback_title, normalize_title
 from .token_budget import TokenBudget
 from .tools import (
     ApprovalDecision,
@@ -57,6 +57,7 @@ from .turn_state import RecoveryAction
 from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
+_TITLE_TIMEOUT = 5
 _EVENT_DRAIN_TIMEOUT = 0.5
 
 
@@ -485,6 +486,7 @@ class Application:
                     raise ValueError("该附件发送请求已接受。")
                 save_failed = False
                 title_source = None
+                input_start = len(session.messages)
 
                 async def persist(candidate: Session) -> None:
                     nonlocal save_failed, title_source
@@ -492,6 +494,7 @@ class Application:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
                         added = candidate.attachment_refs.keys() - session.attachment_refs.keys()
+                        excerpts = {}
                         if added:
                             snapshots = AttachmentBatch(tuple(
                                 item for index in sorted(added) for item in candidate.attachment_refs[index].files
@@ -502,21 +505,18 @@ class Application:
                                 ))
                             except OSError:
                                 raise OSError("无法持久化附件快照。") from None
-                        if candidate.title is None:
-                            first_user = next(
-                                (message for index, message in enumerate(candidate.messages.snapshot())
-                                 if message["role"] == "user" and message.get("content") and not (
-                                     index in candidate.attachment_refs and message.get("content") == ATTACHMENT_ONLY_PROMPT
-                                 )),
-                                {},
+                            excerpts = {
+                                item.id: upload.text for item, upload in zip(snapshots.files, uploads, strict=True)
+                                if item.source
+                            }
+                        if candidate.title is None and recovery_action is None and len(session.messages) == input_start:
+                            source = build_title_source(
+                                candidate.messages.snapshot()[input_start:],
+                                {index - input_start: candidate.attachment_refs[index] for index in added},
+                                excerpts=excerpts, redactor=self._history_redactor,
                             )
-                            text = sanitize_terminal(assistant_text(first_user))
-                            source = self._history_redactor.text(text).strip()
-                            title = " ".join(source.split())
-                            if len(title) > 40:
-                                title = title[:39].rstrip() + "…"
-                            candidate.title = title or None
-                            if title:
+                            candidate.title = fallback_title(source)
+                            if candidate.title:
                                 title_source = source
                         await self._save_session(candidate, lease=lease)
                     except Exception:
@@ -641,12 +641,10 @@ class Application:
     async def _name_session(self, agent: Agent, session: Session, source: str, *, lease: SessionLease) -> None:
         title = session.title
         try:
-            async with asyncio.timeout(5):
+            async with asyncio.timeout(_TITLE_TIMEOUT):
                 generated = await agent.generate_title(session=session, source=source)
             if generated:
-                lines = sanitize_terminal(self._history_redactor.text(generated)).strip().splitlines()
-                if len(lines) == 1 and 0 < len(candidate := " ".join(lines[0].split())) <= 40:
-                    title = candidate
+                title = normalize_title(generated, self._history_redactor) or title
         except Exception as exc:  # noqa: BLE001 - Title generation is optional.
             logger.debug("会话标题生成失败：%s", type(exc).__name__)
         if title != session.title:
