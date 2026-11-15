@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .text import decode_text
@@ -53,6 +54,59 @@ class TextAttachmentInput:
     text: str
 
 
+def validate_resource_uri(uri: str) -> None:
+    if (not isinstance(uri, str) or not 0 < len(uri) <= 2048
+        or any(char.isspace() or ord(char) < 32 for char in uri)
+        or _BINARY.search(uri) or not urlsplit(uri).scheme):
+        raise ValueError("MCP 资源 URI 无效。")
+    uri.encode("utf-8")
+
+
+def _resource_metadata(name: str, server: str, uri: str, mime_type: str, source: str) -> None:
+    validate_resource_uri(uri)
+    if (not isinstance(name, str) or not 0 < len(name) <= 255 or _BINARY.search(name)
+        or any(ord(char) < 32 for char in name)
+        or not isinstance(server, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", server)
+        or source not in ("embedded", "standalone")):
+        raise ValueError("MCP 资源元数据无效。")
+    name.encode("utf-8")
+    base = mime_type.partition(";")[0].strip().lower() if isinstance(mime_type, str) else ""
+    if (not base or len(mime_type) > 255 or not mime_type.isprintable()
+        or not (re.fullmatch(r"text/[a-z0-9.+_-]+", base) or base in {
+            "application/json", "application/xml", "application/yaml", "application/toml",
+            "application/javascript", "application/x-ndjson",
+        } or re.fullmatch(r"application/[a-z0-9.+_-]+\+json", base))):
+        raise ValueError("MCP 资源的 MIME 类型不受支持。")
+
+
+def snapshot_bytes(text: str) -> bytes:
+    if not isinstance(text, str):
+        raise TypeError("附件内容必须是 UTF-8 文本。")
+    if len(text) > MAX_FILE_BYTES:
+        raise ValueError("每个附件或资源最多 128 KiB。")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeError:
+        raise ValueError("附件内容必须是有效的 UTF-8。") from None
+    if len(data) > MAX_FILE_BYTES:
+        raise ValueError("每个附件或资源最多 128 KiB。")
+    if _BINARY.search(text):
+        raise ValueError("附件或资源不能包含二进制内容。")
+    return data
+
+
+@dataclass(frozen=True)
+class TextResourceInput(TextAttachmentInput):
+    server: str
+    uri: str
+    mime_type: str
+    source: str
+
+    def __post_init__(self) -> None:
+        _resource_metadata(self.name, self.server, self.uri, self.mime_type, self.source)
+        snapshot_bytes(self.text)
+
+
 @dataclass(frozen=True)
 class TextAttachment:
     id: str
@@ -61,11 +115,23 @@ class TextAttachment:
     sha256: str
     lines: int
     mime_type: str = "text/plain"
+    source: str | None = None
+    server: str | None = None
+    uri: str | None = None
+
+    @property
+    def model_name(self) -> str:
+        return "MCP text resource" if self.source else self.name
 
     def __post_init__(self) -> None:
-        _name(self.name)
+        if self.source is None:
+            _name(self.name)
+            if self.server is not None or self.uri is not None or self.mime_type != "text/plain":
+                raise ValueError("附件元数据无效。")
+        else:
+            _resource_metadata(self.name, self.server, self.uri, self.mime_type, self.source)
         if (
-            not valid_id(self.id) or self.mime_type != "text/plain"
+            not valid_id(self.id)
             or type(self.size_bytes) is not int or not 0 <= self.size_bytes <= MAX_FILE_BYTES
             or not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256)
             or type(self.lines) is not int or not 1 <= self.lines <= self.size_bytes + 1
@@ -102,26 +168,27 @@ def prepare_attachments(uploads: Sequence[TextAttachmentInput], submission_id: s
     for upload in uploads:
         if not isinstance(upload, TextAttachmentInput) or not isinstance(upload.text, str):
             raise TypeError("附件内容必须是 UTF-8 文本。")
-        _name(upload.name)
-        if len(upload.text) > MAX_FILE_BYTES:
-            raise ValueError("每个附件最多 128 KiB。")
-        try:
-            data = upload.text.encode("utf-8")
-        except UnicodeError:
-            raise ValueError("附件内容必须是有效的 UTF-8。") from None
-        if len(data) > MAX_FILE_BYTES:
-            raise ValueError("每个附件最多 128 KiB。")
-        if _BINARY.search(upload.text) or re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", upload.text):
+        source = {}
+        if isinstance(upload, TextResourceInput):
+            source = {"server": upload.server, "uri": upload.uri, "mime_type": upload.mime_type, "source": upload.source}
+        else:
+            _name(upload.name)
+        data = snapshot_bytes(upload.text)
+        if re.search(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", upload.text):
             raise ValueError("附件不能包含二进制内容或私钥。")
         files.append(TextAttachment(
             id=uuid4().hex, name=upload.name, size_bytes=len(data),
-            sha256=sha256(data).hexdigest(), lines=upload.text.count("\n") + 1,
+            sha256=sha256(data).hexdigest(), lines=upload.text.count("\n") + 1, **source,
         ))
     return AttachmentBatch(tuple(files), submission_id)
 
 
 def attachment_metadata(batch: AttachmentBatch) -> list[dict]:
-    return [asdict(item) for item in batch.files]
+    return [
+        {"id": item.id, "name": item.model_name, "size_bytes": item.size_bytes, "lines": item.lines}
+        if item.source else {key: value for key, value in asdict(item).items() if value is not None}
+        for item in batch.files
+    ]
 
 
 class AttachmentStore:

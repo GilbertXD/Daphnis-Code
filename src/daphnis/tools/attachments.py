@@ -30,7 +30,7 @@ def _page(item: TextAttachment, text: str, args: dict) -> dict:
     end = min(args.get("end_line", len(rows)), len(rows))
     if line > end or column > len(rows[line - 1]) + 1:
         raise ToolError("invalid_range", "Requested attachment range is outside the file.")
-    result = {"ok": True, "notice": _NOTICE, "id": item.id, "name": item.name, "total_lines": item.lines,
+    result = {"ok": True, "notice": _NOTICE, "id": item.id, "name": item.model_name, "total_lines": item.lines,
               "lines": [], "next_line": None, "next_column": None}
     remaining = _LIMIT - _wire_size(result) - 32
     for number, value in enumerate(line_range(rows, line, end), line):
@@ -80,7 +80,7 @@ def prepare_attachments(name: str, args: dict, session: Session, store: Attachme
         for item in selected:
             for line, index, row in literal_matches((await _read(store, session, item)).split("\n"), query):
                 start = max(0, index - 40)
-                hit = {"id": item.id, "name": item.name, "line": line, "column": index + 1,
+                hit = {"id": item.id, "name": item.model_name, "line": line, "column": index + 1,
                        "excerpt": row[start:start + 180]}
                 if len(hits) >= limit or _wire_size(result) + _wire_size(hit) + 2 > _LIMIT:
                     result["truncated"] = True
