@@ -30,6 +30,7 @@ from mcp.types import (
 )
 
 from ..attachments import (
+    MAX_FILE_BYTES,
     MAX_FILES,
     MAX_TOTAL_BYTES,
     TextResourceInput,
@@ -643,7 +644,18 @@ class MCPConnection:
             result = await client.session.get_prompt(name, arguments)
             if result.result_type != "complete" or not result.messages:
                 raise MCPPromptError("MCP 模板结果无效。")
-            if _json_size(result.model_dump(mode="json", by_alias=True), _PROMPT_BYTES) is None:
+            payload = result.model_dump(mode="json", by_alias=True)
+            resource_sizes = []
+            for message in payload["messages"]:
+                content = message["content"]
+                if content["type"] == "resource" and isinstance(text := content["resource"].get("text"), str):
+                    if len(text) > MAX_FILE_BYTES or (size := len(text.encode("utf-8"))) > MAX_FILE_BYTES:
+                        raise MCPPromptError("MCP 模板内嵌资源超过 128 KiB。")
+                    resource_sizes.append(size)
+                    content["resource"]["text"] = ""
+            if len(resource_sizes) > MAX_FILES or sum(resource_sizes) > MAX_TOTAL_BYTES:
+                raise MCPPromptError("MCP 模板内嵌资源超过 10 份或 256 KiB。")
+            if _json_size(payload, _PROMPT_BYTES) is None:
                 raise MCPPromptError("MCP 模板结果超出大小上限。")
             return result
 

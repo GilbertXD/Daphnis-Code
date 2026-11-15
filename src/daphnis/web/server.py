@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 from contextlib import asynccontextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -14,7 +15,8 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from ..attachments import MAX_FILES, TextAttachmentInput, valid_id
+from ..attachments import MAX_FILES, TextAttachmentInput, TextResourceInput, valid_id
+from ..mcp.resources import text_resource
 from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..prompt_groups import MAX_PROMPT_MESSAGES, PROMPT_ROLES, PromptInput
 from ..tools.approval import ApprovalMode
@@ -162,7 +164,7 @@ async def _run_prompt(bridge, session, args):
             return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
         if bridge.prompt_run and bridge.prompt_run[0].id == preview_id:
             previous, accepted = bridge.prompt_run
-            if texts != tuple(text for _, text in previous.messages):
+            if texts != tuple(message["content"] for message in previous.snapshot()):
                 raise RequestError("该 MCP Prompt 运行标识已用于不同内容。", 409)
         else:
             if bridge.run is not None or ops.running:
@@ -182,7 +184,16 @@ async def _run_prompt(bridge, session, args):
                 raise RequestError("当前模型接口需要以 User 消息结束。请补充一条 User 消息。")
             if any(bridge.redactor.text(text) != text for text in texts):
                 raise RequestError("编辑内容中检测到凭据。请移除凭据并重新确认。")
-            messages = tuple(zip(roles, texts, strict=True))
+            values = []
+            for index, text in enumerate(texts):
+                original_value = original[index][1] if index < len(original) else None
+                if isinstance(original_value, TextResourceInput):
+                    if text != "":
+                        raise RequestError("内嵌资源只读，请保留确认预览的内容。")
+                    values.append(original_value)
+                else:
+                    values.append(text)
+            messages = tuple(zip(roles, values, strict=True))
             prompt_input = PromptInput(preview_id, server, name, messages, edited=messages != original)
             accepted = bridge.start(None, prompt_input=prompt_input)
     error = await asyncio.shield(accepted)
@@ -289,6 +300,17 @@ async def _execute(bridge, action, session, args, discovery):
     return None
 
 
+def _resource_preview(item: TextResourceInput, redactor) -> tuple[TextResourceInput, dict]:
+    if redactor.text(item.uri) != item.uri or redactor.text(item.mime_type) != item.mime_type:
+        raise ValueError("MCP 资源标识包含敏感内容。")
+    visible = replace(item, name=redactor.text(item.name), text=redactor.json(item.text))
+    return visible, {
+        "name": visible.name, "uri": visible.uri, "mime_type": visible.mime_type,
+        "text": visible.text, "size_bytes": len(visible.text.encode("utf-8")),
+        "redacted": visible.text != item.text,
+    }
+
+
 async def _prompt_response(bridge, action, session, args):
     if bridge.ops.session.id != session:
         raise RequestError("当前会话已切换，请重新打开模板。", 409)
@@ -309,23 +331,33 @@ async def _prompt_response(bridge, action, session, args):
     else:
         result = await bridge.ops.get_mcp_prompt(args["server"], args["name"], args["arguments"])
         messages = []
+        original = []
         redacted = False
+        runnable = 0 < len(result.messages) <= MAX_PROMPT_MESSAGES
         for message in result.messages:
-            # The browser preview never loads remote resources or decodes attachments.
             content = {"type": message.content.type}
+            value = None
             if message.content.type == "text":
-                content["text"] = redactor.text(message.content.text)
-                redacted |= content["text"] != message.content.text
+                value = redactor.text(message.content.text)
+                content["text"] = value
+                redacted |= value != message.content.text
+            if message.content.type == "resource":
+                try:
+                    value, resource = _resource_preview(
+                        text_resource(args["server"], message.content.resource, "embedded"), redactor,
+                    )
+                except (TypeError, ValueError) as exc:
+                    content["error"] = str(exc)
+                else:
+                    content["resource"] = resource
+                    redacted |= resource["redacted"]
+            runnable &= value is not None and message.role in PROMPT_ROLES
+            original.append((message.role, value))
             messages.append({"role": message.role, "content": content})
         if bridge.ops.session.id != session:
             raise RequestError("当前会话已切换，请重新打开 Prompts。", 409)
-        runnable = (
-            0 < len(messages) <= MAX_PROMPT_MESSAGES
-            and all(message["role"] in PROMPT_ROLES and message["content"]["type"] == "text" for message in messages)
-        )
         preview_id = bridge.cache_prompt_preview(
-            session, args["server"], args["name"],
-            tuple((message["role"], message["content"]["text"]) for message in messages),
+            session, args["server"], args["name"], tuple(original),
         ) if runnable else None
         response = {"mcp_prompt_result": {
             "description": redactor.text(result.description or ""), "messages": messages, "redacted": redacted,

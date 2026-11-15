@@ -197,8 +197,14 @@ const Committed = memo(function Committed({ messages, tools, turns, retry, recov
             : <small>当前模型无法续写 Assistant 结尾的 Prompt，请发送新消息。</small>)}
         </div>
         {messages.slice(index, group.end).map((item, offset) => item.role === 'user'
-          ? <UserMessage key={offset} text={messageText(item)} />
-          : <AssistantMessage key={offset} text={messageText(item)} />)}
+          ? <UserMessage key={offset} text={messageText(item)} attachments={attachmentRefs?.[index + offset]} />
+          : <div key={offset}>
+            <AssistantMessage text={messageText(item)} />
+            {attachmentRefs?.[index + offset] && <div className="assistant-message">
+              <small className="muted">Assistant · Resource</small>
+              <AttachmentLabels files={attachmentRefs[index + offset]} />
+            </div>}
+          </div>)}
       </section>
     }
     if (index < promptEnd) return null

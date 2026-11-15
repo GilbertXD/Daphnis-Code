@@ -55,6 +55,7 @@ class WebTests(unittest.TestCase):
         self.title_requests = []
         self.titles_at_reply = []
         self.overflowed = False
+        self.resource_failed = False
 
         async def provider(request):
             body = json.loads(request.content)
@@ -90,6 +91,9 @@ class WebTests(unittest.TestCase):
                     self.resume,
                     chunk({"content": API_KEY[17:]}, "stop") + b"data: [DONE]\n\n",
                 ))
+            if last.get("content") == "resource-retry" and not self.resource_failed:
+                self.resource_failed = True
+                return httpx.Response(400, json={"error": {"message": "Fixture first resource turn fails."}})
             if last.get("content") == "force-error":
                 return httpx.Response(429, json={"error": {"api_key": API_KEY, "message": "Rate limit"}})
             if last.get("content") == "test mcp":
@@ -606,6 +610,44 @@ class WebTests(unittest.TestCase):
         self.command("new", sid)
         self.command("mcp_list_prompts", sid, 409, server="demo")
         self.command("mcp_run_prompt", self.snapshot()["session_id"], 409, preview_id=old_preview, texts=texts)
+
+    def test_embedded_text_resource_keeps_role_and_uses_snapshot_on_retry(self):
+        sid = self.snapshot()["session_id"]
+        for name in ("prompts", "resources"):
+            (self.workspace / name).touch()
+        text = self.workspace / "resource-text"
+        text.write_text("original material " + API_KEY)
+        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+        })
+        preview = self.command("mcp_get_prompt", sid, server="demo", name="embedded",
+                               arguments={})["mcp_prompt_result"]
+        self.assertTrue(preview["redacted"])
+        expected = "original material [REDACTED]"
+        self.assertEqual(preview["messages"][1]["content"]["resource"]["text"], expected)
+        fields = {"preview_id": preview["preview_id"], "texts": ["Review this resource.", "", "resource-retry"]}
+        self.command("mcp_run_prompt", sid, 400, **{**fields, "texts": ["Review", "forged", "resource-retry"]})
+        self.command("mcp_run_prompt", sid, 202, **fields)
+        failed = self.wait_for(lambda frame: not frame["status"]["running"])
+        saved = self.history.load(sid)
+        item, = saved.attachment_refs[1].files
+        self.assertEqual((item.source, item.server, item.uri), ("embedded", "demo", "notes://embedded-source"))
+        self.assertEqual(self.history.attachments.read(sid, item), expected)
+        self.assertEqual([m["role"] for m in saved.messages.snapshot()], ["user", "assistant", "user"])
+        projected = self.requests[0]["messages"][-2]
+        self.assertEqual(projected["role"], "assistant")
+        self.assertIn(expected, projected["content"])
+        self.assertNotIn(item.uri, projected["content"])
+        text.write_text("new remote material")
+        self.command("new", sid)
+        self.command("restore", self.snapshot()["session_id"], id=sid)
+        self.command("retry", sid, 202, key=failed["state"]["recovery"]["key"])
+        self.wait_for(lambda frame: not frame["status"]["running"])
+        self.assertEqual(self.requests[-1]["messages"], self.requests[0]["messages"])
+        self.assertFalse((self.workspace / "resource-reads").exists())
+        self.command("mcp_run_prompt", sid, 202, **fields)
+        self.assertEqual(len(self.requests), 2)
 
     def test_attachment_send_is_committed_before_ack_and_deduplicated(self):
         sid = self.snapshot()["session_id"]

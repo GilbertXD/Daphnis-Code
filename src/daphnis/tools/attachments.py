@@ -6,6 +6,7 @@ import json
 from ..attachments import AttachmentStore, TextAttachment
 from ..session import Session
 from ..text import line_range, literal_matches
+from ..turn_state import ABANDONED, TURN_STATE
 from .approval import Decision, Operation, ToolError
 
 _LIMIT = 8 * 1024
@@ -63,7 +64,10 @@ def _page(item: TextAttachment, text: str, args: dict) -> dict:
 def prepare_attachments(name: str, args: dict, session: Session, store: AttachmentStore | None) -> Operation:
     if store is None:
         raise ToolError("attachment_unavailable", "Attachment storage is unavailable.")
-    files = {item.id: item for batch in session.attachment_refs.values() for item in batch.files}
+    files = {
+        item.id: item for index, batch in session.attachment_refs.items() for item in batch.files
+        if item.source != "embedded" or session.messages.get(index).get(TURN_STATE) != ABANDONED
+    }
     requested = args.get("id")
     if requested is not None and requested not in files:
         raise ToolError("attachment_unavailable", "No attachment with that ID belongs to this Session.")

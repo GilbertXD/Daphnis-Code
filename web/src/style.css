@@ -293,3 +293,6 @@ input[type=checkbox] { accent-color: #111; }
   .selectors > * { font-size: .77rem; }
   .connection { font-size: .69rem; }
 }
+
+.resource-preview { display: grid; gap: 4px; overflow-wrap: anywhere; }
+.resource-preview pre { white-space: pre-wrap; max-height: 30dvh; overflow: auto; padding: 8px 0; }

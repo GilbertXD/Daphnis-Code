@@ -66,13 +66,21 @@ class Session:
             raise TypeError("messages must be a Saturnus Messages instance.")
         if not isinstance(self.attachment_refs, dict):
             raise TypeError("Session attachment_refs must be an object.")
+        embedded_indices: set[int] = set()
         ids: set[str] = set()
         submissions: set[str] = set()
         for index, batch in self.attachment_refs.items():
             if (
                 type(index) is not int or not 0 <= index < len(self.messages)
-                or self.messages.get(index)["role"] != "user" or not isinstance(batch, AttachmentBatch)
+                or not isinstance(batch, AttachmentBatch)
             ):
+                raise ValueError("Attachment refers to an invalid message index.")
+            if any(item.source == "embedded" for item in batch.files):
+                embedded_indices.add(index)
+                if (len(batch.files) != 1 or batch.submission_id is not None
+                    or self.messages.get(index)["content"] != ""):
+                    raise ValueError("Invalid embedded resource reference.")
+            elif self.messages.get(index)["role"] != "user":
                 raise ValueError("Attachment refers to an invalid user message index.")
             for item in batch.files:
                 if item.id in ids:
@@ -91,14 +99,27 @@ class Session:
                 or group.start < previous_end or group.end > len(self.messages)):
                 raise ValueError("Invalid Session prompt group range or ID.")
             messages = []
+            resource_positions = set()
+            resource_items = []
             for index in range(group.start, group.end):
                 message = self.messages.get(index)
-                if index in self.attachment_refs or message.keys() - {"role", "content", TURN_STATE, TURN_ATTEMPT}:
+                if message.keys() - {"role", "content", TURN_STATE, TURN_ATTEMPT}:
                     raise ValueError("Invalid message in Session prompt group.")
+                if index in self.attachment_refs:
+                    item = self.attachment_refs[index].files[0]
+                    if index not in embedded_indices or item.server != group.server:
+                        raise ValueError("Invalid resource in Session prompt group.")
+                    embedded_indices.remove(index)
+                    resource_positions.add(index - group.start)
+                    resource_items.append(item)
                 messages.append((message["role"], message.get("content")))
-            validate_messages(tuple(messages))
+            validate_messages(tuple(messages), frozenset(resource_positions))
+            if resource_items:
+                AttachmentBatch(tuple(resource_items))
             previous_end = group.end
             group_ids.add(group.id)
+        if embedded_indices:
+            raise ValueError("Embedded resources must belong to a Prompt group.")
         if not isinstance(self.usage, UsageTotals):
             raise TypeError("usage must be a UsageTotals instance.")
         if self.thinking is not None and (

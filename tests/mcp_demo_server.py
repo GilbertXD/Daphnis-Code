@@ -11,6 +11,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import (
     BlobResourceContents,
     CallToolResult,
+    EmbeddedResource,
     GetPromptResult,
     ImageContent,
     ListPromptsResult,
@@ -79,7 +80,7 @@ async def call_tool(ctx, params):
 
 async def list_prompts(ctx, params):
     if params and params.cursor == "more":
-        return ListPromptsResult(prompts=[Prompt(name=name) for name in ("bundle", "slow", "fail", "large", "dialogue")])
+        return ListPromptsResult(prompts=[Prompt(name=name) for name in ("bundle", "slow", "fail", "large", "dialogue", "embedded", "embedded-large", "embedded-oversize")])
     return ListPromptsResult(
         prompts=[Prompt(name="greet", description="Create a greeting.", arguments=[
             PromptArgument(name="who", required=True, description="Name to greet."),
@@ -97,6 +98,16 @@ async def get_prompt(ctx, params):
         return GetPromptResult(messages=[
             PromptMessage(role="user", content=TextContent(type="text", text="first")),
             PromptMessage(role="assistant", content=ImageContent(type="image", data="AA==", mime_type="image/png")),
+        ])
+    if params.name.startswith("embedded"):
+        size = {"embedded": 0, "embedded-large": 70_000, "embedded-oversize": 131_073}[params.name]
+        text = "X" * size if size else (root / "resource-text").read_text()
+        return GetPromptResult(messages=[
+            PromptMessage(role="user", content=TextContent(type="text", text="Review this resource.")),
+            PromptMessage(role="assistant", content=EmbeddedResource(type="resource", resource=TextResourceContents(
+                uri="notes://embedded-source", mime_type="text/markdown", text=text,
+            ))),
+            PromptMessage(role="user", content=TextContent(type="text", text="resource-retry")),
         ])
     if params.name == "dialogue":
         return GetPromptResult(messages=[

@@ -59,7 +59,10 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 await ops.connect_mcp("both", sys.executable, [str(DEMO), str(both_root)])
                 connection = app._mcp["both"]
                 prompts = await connection.list_prompts()
-                self.assertEqual([prompt.name for prompt in prompts], ["greet", "bundle", "slow", "fail", "large", "dialogue"])
+                self.assertEqual([prompt.name for prompt in prompts], [
+                    "greet", "bundle", "slow", "fail", "large", "dialogue",
+                    "embedded", "embedded-large", "embedded-oversize",
+                ])
                 self.assertEqual([(arg.name, arg.required) for arg in prompts[0].arguments],
                                  [("who", True), ("tone", False)])
                 greeting = await connection.get_prompt("greet", {"who": "Ada", "tone": "casual"})
@@ -74,6 +77,10 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     await connection.get_prompt("fail", {})
                 with self.assertRaisesRegex(MCPPromptError, "大小上限"):
                     await connection.get_prompt("large", {})
+                large = await connection.get_prompt("embedded-large", {})
+                self.assertEqual(len(large.messages[1].content.resource.text), 70_000)
+                with self.assertRaisesRegex(MCPPromptError, "128 KiB"):
+                    await connection.get_prompt("embedded-oversize", {})
                 self.assertEqual((await connection.call("add", {"a": 2, "b": 3}))["structured_content"], {"sum": 5})
                 self.assertEqual(ops.list_mcp_prompt_servers(), ("prompt-only", "both"))
                 self.assertEqual(await ops.list_mcp_prompts("both"), prompts)

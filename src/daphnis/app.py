@@ -15,7 +15,9 @@ from saturnus import ChatClient
 from .agent import Agent, TurnResult, TurnStatus, assistant_text
 from .attachments import (
     ATTACHMENT_ONLY_PROMPT,
+    AttachmentBatch,
     TextAttachmentInput,
+    TextResourceInput,
     prepare_attachments,
 )
 from .compaction import CompactionCheckpoint, CompactionError
@@ -435,6 +437,15 @@ class Application:
         session = self._session
         uploads = tuple(attachments)
         batch = prepare_attachments(uploads, submission_id) if uploads else None
+        if prompt_input and (uploads or submission_id is not None):
+            raise ValueError("MCP Prompt 必须作为独立任务运行。")
+        if prompt_input:
+            uploads = tuple(prompt_input.resources.values())
+        for item in uploads:
+            if isinstance(item, TextResourceInput) and (
+                self._history_redactor.json(item.text) != item.text or self._history_redactor.text(item.uri) != item.uri
+            ):
+                raise ValueError("MCP 资源包含未确认的敏感内容。")
         if batch and isinstance(prompt, str) and not prompt.strip():
             prompt = ATTACHMENT_ONLY_PROMPT
         if self._mcp_pending:
@@ -480,15 +491,21 @@ class Application:
                     if self._session is not session:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
-                        if batch and len(candidate.attachment_refs) > len(session.attachment_refs):
+                        added = candidate.attachment_refs.keys() - session.attachment_refs.keys()
+                        if added:
+                            snapshots = AttachmentBatch(tuple(
+                                item for index in sorted(added) for item in candidate.attachment_refs[index].files
+                            ))
                             try:
-                                await finish_io(asyncio.to_thread(self._history.attachments.write, session.id, batch, uploads))
+                                await finish_io(asyncio.to_thread(
+                                    self._history.attachments.write, session.id, snapshots, uploads,
+                                ))
                             except OSError:
                                 raise OSError("无法持久化附件快照。") from None
                         if candidate.title is None:
                             first_user = next(
                                 (message for index, message in enumerate(candidate.messages.snapshot())
-                                 if message["role"] == "user" and not (
+                                 if message["role"] == "user" and message.get("content") and not (
                                      index in candidate.attachment_refs and message.get("content") == ATTACHMENT_ONLY_PROMPT
                                  )),
                                 {},
@@ -519,7 +536,7 @@ class Application:
                         output_limit=self._output_limits.get((provider, session.model_id)),
                         persist=persist,
                         attachment_batch=batch,
-                        attachment_texts=tuple(item.text for item in uploads),
+                        attachment_texts=tuple(item.text for item in uploads) if batch else (),
                         attachment_store=self._history.attachments,
                     )
                     if result.status is TurnStatus.COMPLETED and title_source is not None:

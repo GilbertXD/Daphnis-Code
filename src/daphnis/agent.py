@@ -25,7 +25,12 @@ from saturnus import (
     get_message,
 )
 
-from .attachments import ATTACHMENT_TOOLS, AttachmentBatch, AttachmentStore
+from .attachments import (
+    ATTACHMENT_TOOLS,
+    AttachmentBatch,
+    AttachmentStore,
+    prepare_attachments,
+)
 from .compaction import (
     SUMMARY_POLICY,
     CompactionCheckpoint,
@@ -317,16 +322,17 @@ class Agent:
 
     def _choose_attachment_notes(
         self, messages: Messages, checkpoint: CompactionCheckpoint | None, body: dict[str, Any],
-        model: ModelInfo, notes: dict[int, str], index: int, inline: str, can_read: bool,
+        model: ModelInfo, notes: dict[int, str], inline: dict[int, str], can_read: bool,
         prompt_groups: tuple[PromptGroup, ...] = (),
     ) -> dict[int, str]:
         base = self._request_budget(self._model_context(messages, checkpoint, attachment_notes=notes, prompt_groups=prompt_groups), body, model)
-        added = max(0, model.token_counter.count(inline) - model.token_counter.count(notes[index]))
+        added = sum(max(0, model.token_counter.count(note) - model.token_counter.count(notes[index]))
+                    for index, note in inline.items())
         limit = 4000
         if base.hard_input_limit is not None:
             limit = min(limit, max(0, base.hard_input_limit - base.input_tokens) // 20)
         if added <= limit:
-            candidate = {**notes, index: inline}
+            candidate = {**notes, **inline}
             projected = self._model_context(messages, checkpoint, attachment_notes=candidate, prompt_groups=prompt_groups)
             if self._request_budget(projected, body, model).fits:
                 return candidate
@@ -642,7 +648,7 @@ class Agent:
         _ACTIVE_SESSIONS.add(session_id)
         turn_id = uuid4().hex
         fields = {"session_id": session_id, "turn_id": turn_id}
-        if session.attachment_refs or attachment_batch:
+        if session.attachment_refs or attachment_batch or (prompt_input and prompt_input.resources):
             fields["attachment_sensitive"] = True
         status = TurnStatus.FAILED
         error: str | None = None
@@ -726,12 +732,10 @@ class Agent:
 
             async def commit(
                 snapshot: list[dict[str, Any]], *, tool_finished: dict[str, Any] | None = None,
-                batch: AttachmentBatch | None = None, group: PromptGroup | None = None,
+                refs_update: dict[int, AttachmentBatch] | None = None, group: PromptGroup | None = None,
             ) -> None:
                 check_session()
-                refs = session.attachment_refs
-                if batch is not None:
-                    refs = {**refs, len(snapshot) - 1: batch}
+                refs = {**session.attachment_refs, **refs_update} if refs_update else session.attachment_refs
                 groups = session.prompt_groups if group is None else (*session.prompt_groups, group)
                 candidate = replace(
                     session, messages=Messages(snapshot), compaction=checkpoint,
@@ -750,8 +754,8 @@ class Agent:
                     session.attachment_refs = candidate.attachment_refs
                     session.prompt_groups = candidate.prompt_groups
                     committed = snapshot
-                    if batch is not None:
-                        await self.events.emit("attachments.committed", **fields, submission_id=batch.submission_id)
+                    if refs_update and group is None:
+                        await self.events.emit("attachments.committed", **fields, submission_id=attachment_batch.submission_id)
                     if group is not None:
                         await self.events.emit("prompt.committed", **fields, group_id=group.id)
                     if committed_checkpoint != checkpoint:
@@ -891,25 +895,46 @@ class Agent:
                     end = next((group.end for group in session.prompt_groups if group.start == start), start + 1)
                     for index in range(start, end):
                         snapshot[index] = {**committed[index], TURN_STATE: ABANDONED}
+                refs_update = {}
+                inline = {}
                 if attachment_batch:
                     index = len(snapshot) - 1
-                    attachment_refs[index] = attachment_note(attachment_batch)
+                    refs_update[index] = attachment_batch
+                    inline[index] = attachment_note(attachment_batch, attachment_texts)
+                elif prompt_input and (resources := prompt_input.resources):
+                    batch = prepare_attachments(tuple(resources.values()), None)
+                    for (offset, resource), item in zip(resources.items(), batch.files, strict=True):
+                        index = group.start + offset
+                        refs_update[index] = AttachmentBatch((item,))
+                        inline[index] = attachment_note(refs_update[index], (resource.text,))
+                if refs_update:
+                    attachment_refs.update((index, attachment_note(batch)) for index, batch in refs_update.items())
                     body = request_options()
+                    groups = (*session.prompt_groups, group) if group else session.prompt_groups
                     attachment_notes = self._choose_attachment_notes(
-                        Messages(snapshot), checkpoint, body, model, attachment_refs, index,
-                        attachment_note(attachment_batch, attachment_texts), can_read_attachments, session.prompt_groups,
+                        Messages(snapshot), checkpoint, body, model, attachment_refs, inline,
+                        can_read_attachments, groups,
                     )
-                await commit(snapshot, batch=attachment_batch, group=group)
+                await commit(snapshot, refs_update=refs_update, group=group)
             else:
                 snapshot = committed.copy()
                 terminating = recovery_action is RecoveryAction.TERMINATE
-                if not terminating and (batch := session.attachment_refs.get(recovery.message_index)):
+                start = recovery.message_index
+                end = next((group.end for group in session.prompt_groups if group.start == start), start + 1)
+                input_refs = {index: session.attachment_refs[index] for index in range(start, end)
+                              if index in session.attachment_refs}
+                if not terminating and input_refs:
                     if attachment_store is None:
                         raise ValueError("附件快照不可用。")
+
+                    def saved_notes():
+                        return {
+                            index: attachment_note(batch, tuple(attachment_store.read(session.id, item) for item in batch.files))
+                            for index, batch in input_refs.items()
+                        }
+
                     try:
-                        texts = await asyncio.to_thread(
-                            lambda: tuple(attachment_store.read(session.id, item) for item in batch.files)
-                        )
+                        inline = await asyncio.to_thread(saved_notes)
                     except (OSError, ValueError):
                         raise ValueError("原始附件快照不可用。") from None
                     body = request_options()
@@ -918,8 +943,8 @@ class Agent:
                         resolve_tool_placeholders(snapshot, interrupted[1], terminate=True)[0]
                     )
                     attachment_notes = self._choose_attachment_notes(
-                        projected, checkpoint, body, model, attachment_refs, recovery.message_index,
-                        attachment_note(batch, texts), can_read_attachments, session.prompt_groups,
+                        projected, checkpoint, body, model, attachment_refs, inline,
+                        can_read_attachments, session.prompt_groups,
                     )
                 if interrupted is not None:
                     calls, indices = interrupted

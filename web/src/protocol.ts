@@ -50,11 +50,20 @@ export type MCPPrompt = {
   arguments: { name: string; title: string; description: string; required: boolean }[]
 }
 
+export type ResourceText = {
+  name: string
+  uri: string
+  mime_type: string
+  text: string
+  size_bytes: number
+  redacted: boolean
+}
+
 export type MCPPromptResult = {
   description: string
   redacted: boolean
   preview_id: string | null
-  messages: { role: 'user' | 'assistant'; content: { type: string; text?: string } }[]
+  messages: { role: 'user' | 'assistant'; content: { type: string; text?: string; resource?: ResourceText; error?: string } }[]
 }
 
 export type PromptGroup = {

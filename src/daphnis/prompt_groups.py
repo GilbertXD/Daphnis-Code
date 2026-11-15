@@ -4,6 +4,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from .attachments import MAX_FILES, MAX_TOTAL_BYTES, TextResourceInput
+
 MAX_PROMPT_BYTES = 65_536
 MAX_PROMPT_MESSAGES = 64
 PROMPT_ROLES = ("user", "assistant")
@@ -16,16 +18,18 @@ def _identifier(value: str, *, limit: int = 256) -> None:
     value.encode("utf-8")
 
 
-def validate_messages(messages: tuple[tuple[str, str], ...]) -> None:
+def validate_messages(messages: tuple[tuple[str, str], ...], resource_indices: frozenset[int] = frozenset()) -> None:
     if not isinstance(messages, tuple) or not 0 < len(messages) <= MAX_PROMPT_MESSAGES:
         raise ValueError("MCP Prompt 消息数量超出限制。")
     size = 0
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, tuple) or len(message) != 2:
             raise ValueError("无效的 MCP Prompt 消息。")
         role, content = message
-        if role not in PROMPT_ROLES or not isinstance(content, str) or not content.strip():
-            raise ValueError("MCP Prompt 仅支持非空的 User 和 Assistant 文本。")
+        if role not in PROMPT_ROLES or not isinstance(content, str) or (
+            content != "" if index in resource_indices else not content.strip()
+        ):
+            raise ValueError("MCP Prompt 仅支持 User 和 Assistant 角色的非空文本或文本资源。")
         size += len(json.dumps({"role": role, "content": content}, ensure_ascii=False).encode())
         if size > MAX_PROMPT_BYTES:
             raise ValueError("MCP Prompt 文本超出大小限制。")
@@ -56,15 +60,31 @@ class PromptInput:
     id: str
     server: str
     prompt: str
-    messages: tuple[tuple[str, str], ...]
+    messages: tuple[tuple[str, str | TextResourceInput], ...]
     edited: bool = False
 
     def __post_init__(self) -> None:
-        validate_messages(self.messages)
+        if not isinstance(self.messages, tuple) or any(
+            not isinstance(message, tuple) or len(message) != 2 for message in self.messages
+        ):
+            raise ValueError("无效的 MCP Prompt 消息。")
+        resources = self.resources
+        if (len(resources) > MAX_FILES
+            or sum(len(item.text.encode()) for item in resources.values()) > MAX_TOTAL_BYTES):
+            raise ValueError("MCP Prompt 内嵌资源超过 10 份或 256 KiB。")
+        if any(item.source != "embedded" or item.server != self.server for item in resources.values()):
+            raise ValueError("MCP Prompt 内嵌资源来源无效。")
+        validate_messages(tuple((m["role"], m["content"]) for m in self.snapshot()), frozenset(resources))
         self.group(0)
+
+    @property
+    def resources(self) -> dict[int, TextResourceInput]:
+        return {index: content for index, (_, content) in enumerate(self.messages)
+                if isinstance(content, TextResourceInput)}
 
     def group(self, start: int) -> PromptGroup:
         return PromptGroup(self.id, self.server, self.prompt, start, start + len(self.messages), self.edited)
 
     def snapshot(self) -> list[dict[str, str]]:
-        return [{"role": role, "content": text} for role, text in self.messages]
+        return [{"role": role, "content": "" if isinstance(content, TextResourceInput) else content}
+                for role, content in self.messages]

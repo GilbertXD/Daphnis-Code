@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import type { Command, MCPPrompt, MCPPromptResult } from './protocol'
+import { ResourcePreview } from './resources'
 
 const MAX_PROMPT_BYTES = 64 * 1024
 const MAX_PROMPT_MESSAGES = 64
@@ -123,8 +124,8 @@ function PromptPreview({ result, run, disabled }: {
   const appended = texts.length > result.messages.length
   const roles = result.messages.map(({ role }) => role)
   if (appended) roles.push('user')
-  const hasNonText = result.messages.some(({ content }) => content.type !== 'text')
-  const nonEmpty = texts.every((text) => text.trim())
+  const hasNonText = result.messages.some(({ content }) => content.type !== 'text' && !content.resource)
+  const nonEmpty = texts.every((text, index) => result.messages[index]?.content.resource || text.trim())
   const bytes = texts.reduce((size, text, index) =>
     size + new TextEncoder().encode(JSON.stringify({ role: roles[index], content: text })).length + 3, 0)
   const needsUser = roles.at(-1) === 'assistant'
@@ -147,7 +148,11 @@ function PromptPreview({ result, run, disabled }: {
         <span>{role === 'user' ? 'User' : 'Assistant'}</span>
         <textarea rows={3} readOnly={!result.preview_id} value={texts[index]}
           onChange={(event) => update(index, event.target.value)} />
-      </label> : <p className="muted">{role === 'user' ? 'User' : 'Assistant'} · {content.type}</p>}
+      </label> : <>
+        <p className="muted">{role === 'user' ? 'User' : 'Assistant'} · {content.type}</p>
+        {content.resource && <ResourcePreview resource={content.resource} />}
+        {content.error && <p role="status">{content.error}</p>}
+      </>}
     </div>)}
     {appended && <div className="prompt-message">
       <label className="field">
