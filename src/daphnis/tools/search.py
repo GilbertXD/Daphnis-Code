@@ -5,8 +5,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ..text import decode_text, literal_matches
 from .approval import ApprovalMode, Operation, Target, ToolError, path_decision
-from .files import MAX_FILE_BYTES, decode_text, read_bytes
+from .files import MAX_FILE_BYTES, read_bytes
 
 IGNORED_DIRECTORIES = frozenset(
     {
@@ -93,31 +94,16 @@ def prepare_search(
                                     truncated |= shortened
                                     text = decode_text(data, shortened)
                                     if "\0" not in text:
-                                        for number, line in enumerate(
-                                            text.splitlines(), 1
+                                        for number, position, line in literal_matches(
+                                            text.splitlines(), needle, case_sensitive=case_sensitive,
                                         ):
-                                            candidate = (
-                                                line
-                                                if case_sensitive
-                                                else line.casefold()
-                                            )
-                                            position = candidate.find(needle)
-                                            if position >= 0:
-                                                matches.append(
-                                                    {
-                                                        "path": label,
-                                                        "kind": "content",
-                                                        "line": number,
-                                                        "text": line[
-                                                            max(
-                                                                0, position - 80
-                                                            ) : position + 220
-                                                        ],
-                                                    }
-                                                )
-                                                if len(matches) >= limit:
-                                                    truncated = True
-                                                    break
+                                            matches.append({
+                                                "path": label, "kind": "content", "line": number,
+                                                "text": line[max(0, position - 80):position + 220],
+                                            })
+                                            if len(matches) >= limit:
+                                                truncated = True
+                                                break
                                 except (OSError, UnicodeError, ToolError):
                                     skipped += 1
                         await asyncio.sleep(0)

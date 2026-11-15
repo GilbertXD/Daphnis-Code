@@ -1,6 +1,5 @@
 """Bounded text reads, directory listing, and approved file writes."""
 
-import codecs
 import errno
 import os
 import re
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..text import decode_text, line_range
 from .approval import (
     ApprovalMode,
     Decision,
@@ -70,10 +70,6 @@ def read_bytes(target: Target, limit: int, *, mode: ApprovalMode = ApprovalMode.
         return bytes(data[:limit]), len(data) > limit
 
 
-def decode_text(data: bytes, truncated: bool) -> str:
-    return codecs.getincrementaldecoder("utf-8")().decode(data, final=not truncated)
-
-
 def prepare_read(
     arguments: dict[str, Any], workspace: Path, *, mode: ApprovalMode = ApprovalMode.AUTO,
 ) -> Operation:
@@ -87,7 +83,7 @@ def prepare_read(
         end = arguments.get("end_line")
         if end is not None and end < start:
             raise ToolError("invalid_range", "end_line must be at least start_line.")
-        selected = lines[start - 1 : end]
+        selected = line_range(lines, start, end)
         return {
             "ok": True,
             "path": str(target.path),

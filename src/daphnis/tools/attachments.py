@@ -5,6 +5,7 @@ import json
 
 from ..attachments import AttachmentStore, TextAttachment
 from ..session import Session
+from ..text import line_range, literal_matches
 from .approval import Decision, Operation, ToolError
 
 _LIMIT = 8 * 1024
@@ -32,9 +33,9 @@ def _page(item: TextAttachment, text: str, args: dict) -> dict:
     result = {"ok": True, "notice": _NOTICE, "id": item.id, "name": item.name, "total_lines": item.lines,
               "lines": [], "next_line": None, "next_column": None}
     remaining = _LIMIT - _wire_size(result) - 32
-    while line <= end:
-        value = rows[line - 1][column - 1:]
-        row = {"line": line, "column": column, "text": ""}
+    for number, value in enumerate(line_range(rows, line, end), line):
+        value = value[column - 1:]
+        row = {"line": number, "column": column, "text": ""}
         room = remaining - _wire_size(row) - 2
         if room <= 0:
             break
@@ -53,7 +54,7 @@ def _page(item: TextAttachment, text: str, args: dict) -> dict:
         if low < len(value):
             column += low
             break
-        line, column = line + 1, 1
+        line, column = number + 1, 1
     if line <= end:
         result.update(next_line=line, next_column=column)
     return result
@@ -77,10 +78,7 @@ def prepare_attachments(name: str, args: dict, session: Session, store: Attachme
         limit = args.get("limit", 10)
         selected = files.values() if requested is None else (files[requested],)
         for item in selected:
-            for line, row in enumerate((await _read(store, session, item)).split("\n"), 1):
-                index = row.find(query)
-                if index < 0:
-                    continue
+            for line, index, row in literal_matches((await _read(store, session, item)).split("\n"), query):
                 start = max(0, index - 40)
                 hit = {"id": item.id, "name": item.name, "line": line, "column": index + 1,
                        "excerpt": row[start:start + 180]}

@@ -10,6 +10,8 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+from .text import decode_text
+
 MAX_FILE_BYTES = 128 * 1024
 MAX_TOTAL_BYTES = 256 * 1024
 MAX_FILES = 10
@@ -176,7 +178,7 @@ class AttachmentStore:
             data = stream.read(item.size_bytes + 1)
         if len(data) != item.size_bytes or sha256(data).hexdigest() != item.sha256:
             raise OSError("附件快照校验失败。")
-        return data.decode("utf-8")
+        return decode_text(data)
 
     def read(self, session_id: str, item: TextAttachment) -> str:
         with self._session_directory(session_id) as (_, directory):

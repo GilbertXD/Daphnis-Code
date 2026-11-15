@@ -169,7 +169,8 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             history = History(root / "sessions")
             history.directory.mkdir()
             session = Session(workspace=root, provider="deepseek", model_id="deepseek-flash")
-            source = "needle " + "界" * 4000 + "\nneedle second\nneedle third"
+            source = "页🙂needle " + "界\\" * 4000 + "\nneedle second\nneedle third\n"
+            (root / "source.txt").write_text(source, encoding="utf-8")
             uploads = [TextAttachmentInput("source.txt", source)]
             batch = prepare_attachments(uploads, None)
             history.attachments.write(session.id, batch, uploads)
@@ -197,13 +198,47 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(page.content.encode()), 8192)
             self.assertEqual(page.value["next_line"], 1)
             self.assertGreater(page.value["next_column"], 1)
-            rest = await call(ApprovalMode.FULL, "read_attachment", {
-                "id": item.id, "start_line": 1, "start_column": page.value["next_column"],
+            rows: dict[int, str] = {}
+            for _ in range(10):
+                self.assertLessEqual(len(page.content.encode()), 8192)
+                for row in page.value["lines"]:
+                    previous = rows.get(row["line"], "")
+                    self.assertEqual(row["column"], len(previous) + 1)
+                    rows[row["line"]] = previous + row["text"]
+                if page.value["next_line"] is None:
+                    self.assertIsNone(page.value["next_column"])
+                    break
+                page = await call(ApprovalMode.FULL, "read_attachment", {
+                    "id": item.id, "start_line": page.value["next_line"], "start_column": page.value["next_column"],
+                })
+            else:
+                self.fail("Attachment pagination did not finish.")
+            self.assertEqual(list(rows.items()), list(enumerate(source.split("\n"), 1)))
+            workspace = await call(ApprovalMode.AUTO, "read_file", {"path": "source.txt"})
+            self.assertEqual(workspace.value["content"], "\n".join(rows.values()))
+            workspace_range = await call(ApprovalMode.AUTO, "read_file", {
+                "path": "source.txt", "start_line": 2, "end_line": 2,
             })
-            self.assertEqual(page.value["lines"][0]["text"] + rest.value["lines"][0]["text"], source.split("\n")[0])
+            self.assertEqual(workspace_range.value["content"], rows[2] + "\n")
+            self.assertEqual(workspace_range.value["end_line"], 2)
+            workspace_capped = await call(ApprovalMode.AUTO, "read_file", {
+                "path": "source.txt", "max_bytes": 4,
+            })
+            self.assertEqual(workspace_capped.value["content"], "页")
+            self.assertEqual(workspace_capped.value["scanned_bytes"], 4)
+            self.assertTrue(workspace_capped.value["truncated"])
             search = await call(ApprovalMode.AUTO, "search_attachment", {"query": "needle", "limit": 2})
             self.assertEqual([hit["line"] for hit in search.value["matches"]], [1, 2])
+            self.assertEqual([hit["column"] for hit in search.value["matches"]], [3, 1])
             self.assertTrue(search.value["truncated"])
+            exact = await call(ApprovalMode.AUTO, "search_attachment", {"query": "NEEDLE"})
+            self.assertEqual(exact.value["matches"], [])
+            workspace_search = await call(ApprovalMode.AUTO, "search", {
+                "query": "NEEDLE", "case_sensitive": False, "mode": "content", "max_results": 2,
+            })
+            self.assertEqual([(hit["path"], hit["line"]) for hit in workspace_search.value["matches"]],
+                             [("source.txt", 1), ("source.txt", 2)])
+            self.assertTrue(workspace_search.value["truncated"])
             history_page = await call(ApprovalMode.AUTO, "history_read", {"message_id": 0})
             self.assertEqual(history_page.value["attachments"][0]["id"], item.id)
             other = Session(workspace=root, provider="deepseek", model_id="deepseek-flash")
@@ -213,6 +248,10 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 "path": str(history.attachments.directory / session.id / f"{item.id}.txt"),
             })
             self.assertEqual(raw.value["error"]["code"], "sensitive_path")
+            raw_search = await call(ApprovalMode.FULL, "search", {
+                "path": str(history.attachments.directory), "query": "needle", "mode": "content",
+            })
+            self.assertEqual(raw_search.value["error"]["code"], "sensitive_path")
             self.assertEqual(approvals, ["read_attachment"])
 
     async def test_aggregate_budget_and_interrupted_tool_continue_after_restart(self):
