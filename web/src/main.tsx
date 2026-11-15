@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent, ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
-import {
-  AttachmentLabels, MAX_FILES, MAX_TOTAL, documentFileTypes, imageFileTypes, isImageFile, readFiles, textFileTypes,
-} from './attachments'
+import { AttachmentLabels, MAX_FILES, MAX_TOTAL, isImageFile, readFiles } from './attachments'
 import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
@@ -16,6 +14,12 @@ import './style.css'
 
 const tokenKey = 'daphnis.access'
 const modelKey = (model: Model) => JSON.stringify([model.provider, model.id])
+const thinkingLabel = (mode: string | null) => mode === 'off' ? '关闭' : mode === 'on' ? '开启' : mode || '默认'
+const approvalModes = [
+  { value: 'ask', label: 'ASK' },
+  { value: 'auto', label: 'AUTO' },
+  { value: 'full', label: 'FULL' },
+]
 const sessionActions = [
   ['rename', '重命名'], ['move', '移动'], ['delete', '删除'],
 ] as const
@@ -251,6 +255,45 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
   </Dialog>
 }
 
+type SettingOption = { value: string; label: string; unavailable?: boolean }
+
+function SettingsDialog({ title, value, groups, close, apply, disabled, notice }: {
+  title: string
+  value: string
+  groups: { title?: string; options: SettingOption[] }[]
+  close: () => void
+  apply: (value: string) => void
+  disabled: boolean
+  notice: string
+}) {
+  const [selected, setSelected] = useState(value)
+  const canApply = !disabled && selected !== value
+    && groups.some(({ options }) => options.some((option) => option.value === selected && !option.unavailable))
+  return <Dialog title={title} close={close}>
+    <form onSubmit={(event) => {
+      event.preventDefault()
+      if (canApply) apply(selected)
+    }}>
+      <div className="tool-options" role="radiogroup" aria-label={title}>
+        {groups.map((group) => <section key={group.title ?? title}>
+          {group.title && <h3>{group.title}</h3>}
+          {group.options.map(({ value, label, unavailable }) => <label key={value}>
+            <input type="radio" name="setting" value={value} checked={selected === value}
+              disabled={disabled || unavailable} onChange={() => setSelected(value)} />
+            <span>{label}</span>
+            {unavailable && <small className="muted">未配置</small>}
+          </label>)}
+        </section>)}
+      </div>
+      {notice && <p role="status">{notice}</p>}
+      <div className="actions">
+        <button type="button" onClick={close}>取消</button>
+        <button className="primary" type="submit" disabled={!canApply}>应用</button>
+      </div>
+    </form>
+  </Dialog>
+}
+
 function SystemPromptDialog({ initial, close, apply, disabled, notice }: {
   initial: string
   close: () => void
@@ -338,7 +381,8 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
   </Dialog>
 }
 
-type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system'; sessionId: string }
+type SettingAction = 'model' | 'thinking' | 'approval'
+type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system' | SettingAction; sessionId: string }
   | { action: 'prompts'; sessionId: string }
   | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
@@ -371,19 +415,15 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
   const [dragging, setDragging] = useState(false)
   const dragDepth = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
-  const imageInput = useRef<HTMLInputElement>(null)
-  const documentInput = useRef<HTMLInputElement>(null)
-  const attachmentMenu = useRef<HTMLDetailsElement>(null)
   const [busy, setBusy] = useState(false)
   const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
   const inFlight = useRef(false)
   const [notice, setNotice] = useState('')
   const { state, status, session_id: id } = view
   useEffect(() => {
-    setModal((current) => current?.action === 'prompts' && current.sessionId !== id ? null : current)
+    setModal((current) => current && 'sessionId' in current && current.sessionId !== id ? null : current)
     dragDepth.current = 0
     setDragging(false)
-    if (attachmentMenu.current) attachmentMenu.current.open = false
   }, [id])
   useEffect(() => {
     mounted.current = true
@@ -451,6 +491,15 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       inFlight.current = false
       setBusy(false)
     }
+  }
+
+  function openSetting(action: SettingAction) {
+    setNotice('')
+    setModal({ action, sessionId: id })
+  }
+
+  async function applySetting(action: string, fields: Record<string, unknown>) {
+    if (await perform(action, fields)) setModal((current) => current === modal ? null : current)
   }
 
   function updateDraft(text: string | ((draft: string) => string)) {
@@ -544,15 +593,9 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       aria-expanded={sidebar} onClick={() => setSidebar(!sidebar)}>☰</button><strong>Daphnis</strong></header>
     <header className="topbar">
       <h1>{sessionTitle(state.session)}</h1>
-      <div className="topbar-actions">
-        <button type="button" aria-haspopup="dialog" onClick={() => {
-          setNotice('')
-          setModal({ action: 'mcp' })
-        }}>MCP</button>
-        <span className={`connection ${connected ? '' : 'offline'}`} role="status">
-          <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
-        </span>
-      </div>
+      <span className={`connection ${connected ? '' : 'offline'}`} role="status">
+        <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
+      </span>
     </header>
     <Sidebar projects={state.projects} sessions={sessions} selected={id} disabled={disabled} visible={sidebar}
       projectsError={state.projects_error} historyError={state.history_error}
@@ -625,17 +668,7 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
           {imagesBlocked && <p className="notice" role="status">{imageNotice}请切换模型或移除图片后再发送。</p>}
           {documentsBlocked && <p className="notice" role="status">当前模型不支持文档。请切换模型或移除文档后再发送。</p>}
           {uploadErrors[id] && <p className="notice" role="alert">{uploadErrors[id]}</p>}
-          <input ref={fileInput} type="file" hidden multiple accept={textFileTypes} onChange={(event) => {
-            const selected = Array.from(event.currentTarget.files ?? [])
-            event.currentTarget.value = ''
-            void addFiles(selected)
-          }} />
-          <input ref={imageInput} type="file" hidden multiple accept={imageFileTypes} onChange={(event) => {
-            const selected = Array.from(event.currentTarget.files ?? [])
-            event.currentTarget.value = ''
-            void addFiles(selected)
-          }} />
-          <input ref={documentInput} type="file" hidden accept={documentFileTypes} onChange={(event) => {
+          <input ref={fileInput} type="file" hidden multiple onChange={(event) => {
             const selected = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             void addFiles(selected)
@@ -656,77 +689,37 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
             }} />
           <div className="composer-controls">
             <div className="selectors">
-              <details className="attachment-menu" ref={attachmentMenu}>
-                <summary className="attachment-picker" aria-label="添加附件" aria-disabled={reading}
-                  onClick={(event) => { if (reading) event.preventDefault() }}>+</summary>
-                <div>
-                  <button type="button" disabled={reading} onClick={() => {
-                    if (attachmentMenu.current) attachmentMenu.current.open = false
-                    fileInput.current?.click()
-                  }}>上传文件</button>
-                  <button type="button" disabled={reading || !allowsImages} onClick={() => {
-                    if (attachmentMenu.current) attachmentMenu.current.open = false
-                    imageInput.current?.click()
-                  }}>上传图片</button>
-                  <button type="button" disabled={reading || !allowsDocuments} onClick={() => {
-                    if (attachmentMenu.current) attachmentMenu.current.open = false
-                    documentInput.current?.click()
-                  }}>上传文档</button>
-                  {!allowsImages && <small className="muted">{imageNotice}</small>}
-                  {!allowsDocuments && <small className="muted">当前模型不支持文档输入。</small>}
-                </div>
-              </details>
-              <select aria-label="模型" title={`${state.model.provider} / ${state.model.id}`}
-                value={modelKey(state.model)} disabled={disabled} onChange={(event) => {
-                  const model = state.models.find((candidate) => modelKey(candidate) === event.target.value)
-                  if (model) void perform('model', { provider: model.provider, model_id: model.id })
-                }}>
-                {[...new Set(state.models.map((model) => model.provider))].map((provider) =>
-                  <optgroup label={provider} key={provider}>
-                    {state.models.filter((model) => model.provider === provider).map((model) =>
-                      <option key={modelKey(model)} value={modelKey(model)} disabled={!model.configured}>{model.id}</option>)}
-                  </optgroup>)}
-              </select>
-              <select aria-label="Thinking" value={state.thinking ?? ''} disabled={disabled || !state.model.thinking_modes?.length}
-                onChange={(event) => void perform('thinking', { mode: event.target.value || null })}>
-                <option value="">Thinking · 默认</option>
-                {state.model.thinking_modes?.map((mode) => <option key={mode} value={mode}>
-                  Thinking · {mode === 'off' ? '关闭' : mode === 'on' ? '开启' : mode}
-                </option>)}
-              </select>
+              <button className="attachment-picker" type="button" aria-label="添加附件" title="添加附件" disabled={reading}
+                onClick={() => fileInput.current?.click()}>+</button>
+              <button type="button" className="model-control" aria-haspopup="dialog" aria-label={`模型 · ${state.model.id}`}
+                disabled={disabled} onClick={() => openSetting('model')}>{state.model.id}</button>
+              <button type="button" aria-haspopup="dialog" disabled={disabled || !state.model.thinking_modes?.length}
+                onClick={() => openSetting('thinking')}>Thinking · {thinkingLabel(state.thinking)}</button>
               <button type="button" className="tool-control" title="选择启用的工具"
                 disabled={disabled || state.model.supports_tools !== true} onClick={() => {
                   setNotice('')
                   setModal({ action: 'tools' })
                 }}>
-                工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'} <span aria-hidden="true">⌄</span>
+                工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'}
               </button>
-              <button type="button" disabled={!connected} onClick={() => {
+              <button type="button" aria-haspopup="dialog" title="管理 MCP 服务和资源" onClick={() => {
+                setNotice('')
+                setModal({ action: 'mcp' })
+              }}>MCP</button>
+              <button type="button" title="选择 MCP 提示词" disabled={!connected} onClick={() => {
                 setNotice('')
                 setModal({ action: 'prompts', sessionId: id })
               }}>Prompts</button>
-              <button type="button" disabled={disabled} onClick={() => {
+              <button type="button" title="编辑当前会话的系统提示词" disabled={disabled} onClick={() => {
                 setNotice('')
                 setModal({ action: 'system', sessionId: id })
               }}>系统提示词</button>
-              <button type="button" disabled={disabled || interrupted} onClick={() => void perform('compact')}>
+              <button type="button" title="将较早的会话内容压缩为摘要"
+                disabled={disabled || interrupted} onClick={() => void perform('compact')}>
                 {compacting ? '压缩中' : '压缩上下文'}
               </button>
-              <select aria-label="工具审批模式"
-                value={state.approval_mode} disabled={disabled}
-                onChange={(event) => {
-                  const mode = event.currentTarget.value
-                  if (mode === 'full') {
-                    setNotice('')
-                    setModal({ action: 'confirm_full', sessionId: id })
-                  } else {
-                    void perform('set_approval_mode', { mode })
-                  }
-                }}>
-                <option value="ask">ASK</option>
-                <option value="auto">AUTO</option>
-                <option value="full">FULL</option>
-              </select>
+              <button type="button" aria-haspopup="dialog" aria-label={`工具审批模式 · ${state.approval_mode.toUpperCase()}`}
+                disabled={disabled} onClick={() => openSetting('approval')}>{state.approval_mode.toUpperCase()}</button>
             </div>
             {status.running
               ? <button className="primary send" type="button" disabled={busy || !connected || !view.run}
@@ -762,6 +755,31 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       </Dialog>}
     {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
       disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
+    {modal?.action === 'model' && modal.sessionId === id && <SettingsDialog title="选择模型" value={modelKey(state.model)}
+      close={() => setModal(null)} disabled={disabled} notice={notice}
+      groups={[...new Set(state.models.map((model) => model.provider))].map((provider) => ({
+        title: provider,
+        options: state.models.filter((model) => model.provider === provider).map((model) => ({
+          value: modelKey(model), label: model.id, unavailable: !model.configured,
+        })),
+      }))}
+      apply={(key) => {
+        const model = state.models.find((candidate) => modelKey(candidate) === key && candidate.configured)
+        if (model) void applySetting('model', { provider: model.provider, model_id: model.id })
+      }} />}
+    {modal?.action === 'thinking' && modal.sessionId === id && <SettingsDialog title="思考模式" value={state.thinking ?? ''}
+      close={() => setModal(null)} disabled={disabled} notice={notice}
+      groups={[{ options: ['', ...(state.model.thinking_modes ?? [])].map((value) => ({ value, label: thinkingLabel(value) })) }]}
+      apply={(mode) => void applySetting('thinking', { mode: mode || null })} />}
+    {modal?.action === 'approval' && modal.sessionId === id && <SettingsDialog title="工具审批模式" value={state.approval_mode}
+      close={() => setModal(null)} disabled={disabled} notice={notice} groups={[{ options: approvalModes }]}
+      apply={(mode) => {
+        if (mode === 'full') {
+          setModal({ action: 'confirm_full', sessionId: id })
+        } else {
+          void applySetting('set_approval_mode', { mode })
+        }
+      }} />}
     {modal?.action === 'confirm_full' && modal.sessionId === id && <Dialog title="启用 FULL" close={() => setModal(null)}>
       <form onSubmit={async (event) => {
         event.preventDefault()

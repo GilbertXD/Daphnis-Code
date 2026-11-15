@@ -8,20 +8,18 @@ const MAX_IMAGES = 4
 const MAX_DOCUMENT_FILE = 10 * 1024 * 1024
 export const MAX_TOTAL = 256 * 1024
 export const MAX_FILES = 10
-export const textFileTypes = '.txt,.md,.markdown,.rst,.py,.go,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.js,.jsx,.ts,.tsx,.css,.html,.xml,.csv,.tsv,.log,.sql,.sh,.bash,.zsh,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cc,.cs,.rb,.php,.swift,.vue,.svelte,.tex,.diff,.patch'
+const textFileTypes = '.txt,.md,.markdown,.rst,.py,.go,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.js,.jsx,.ts,.tsx,.css,.html,.xml,.csv,.tsv,.log,.sql,.sh,.bash,.zsh,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cc,.cs,.rb,.php,.swift,.vue,.svelte,.tex,.diff,.patch'
 const extensions = new Set(textFileTypes.split(','))
 const imageExtensions = new Map([
   ['.png', 'image/png'], ['.jpg', 'image/jpeg'], ['.jpeg', 'image/jpeg'], ['.webp', 'image/webp'],
 ])
 const imageTypes = new Set(imageExtensions.values())
-export const imageFileTypes = [...imageTypes, ...imageExtensions.keys()].join(',')
 const documentTypes = new Map([
   ['.pdf', 'application/pdf'],
   ['.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
   ['.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
   ['.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
 ])
-export const documentFileTypes = [...documentTypes.keys(), ...documentTypes.values()].join(',')
 const blocked = /^(?:\.env|id_(?:rsa|ed25519|ecdsa|dsa)\.|(?:application_default_credentials|credentials|secrets)\.json$)/i
 const binary = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/
 
@@ -57,7 +55,7 @@ export async function readFiles(
       && file.name.length <= 255 && file.name === file.name.trim() && !/[/\\]/.test(file.name) && !binary.test(file.name)
     const documentMime = documentTypes.get(suffix)
     if (documentMime) {
-      if (!allowDocuments) errors.add('当前模型不支持文档输入。')
+      if (!allowDocuments) errors.add('当前模型不支持文档附件。')
       else if (!safeName || (file.type && !['application/octet-stream', 'application/zip', documentMime].includes(file.type))) {
         errors.add('文档名称或格式无效。')
       } else if (hasDocument || !file.size || file.size > MAX_DOCUMENT_FILE) {
@@ -71,12 +69,16 @@ export async function readFiles(
     }
     if (isImageFile(file)) {
       if (!allowImages) {
-        errors.add('当前模型无法发送图片。')
+        errors.add('当前模型不支持图片附件。')
         continue
       }
       const mimeType = !file.type || file.type === 'application/octet-stream' ? imageExtensions.get(suffix) : file.type
-      if (!safeName || !mimeType || !imageTypes.has(mimeType)) {
-        errors.add('请选择有效的 PNG、JPEG 或 WebP 图片。')
+      if (!safeName) {
+        errors.add('文件名无效或属于凭据文件。')
+        continue
+      }
+      if (!mimeType || !imageTypes.has(mimeType)) {
+        errors.add('当前模型不支持此图片格式，请选择 PNG、JPEG 或 WebP。')
         continue
       }
       if (images.some((image) => image.name === file.name && image.size === file.size
@@ -91,8 +93,12 @@ export async function readFiles(
       imageTotal += file.size
       continue
     }
-    if (!safeName || !extensions.has(suffix)) {
-      errors.add('部分文件格式不受支持，凭据文件无法添加。')
+    if (!safeName) {
+      errors.add('文件名无效或属于凭据文件。')
+      continue
+    }
+    if (!extensions.has(suffix)) {
+      errors.add('当前模型不支持此类型的附件。')
       continue
     }
     if (textCount >= MAX_FILES) {
