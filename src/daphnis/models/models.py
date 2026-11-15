@@ -16,6 +16,7 @@ class ModelInfo:
     token_counter: TokenCounter = DEFAULT_COUNTER
     max_output_tokens: int | None = None
     default_output_tokens: int | None = None
+    supports_image: bool | None = None
 
     def __post_init__(self) -> None:
         for name in ("id", "provider"):
@@ -32,8 +33,10 @@ class ModelInfo:
             and self.default_output_tokens > self.max_output_tokens
         ):
             raise ValueError("default_output_tokens cannot exceed max_output_tokens.")
-        if self.supports_tools is not None and type(self.supports_tools) is not bool:
-            raise ValueError("supports_tools must be True, False, or None.")
+        for name in ("supports_tools", "supports_image"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"{name} must be True, False, or None.")
         if self.thinking_modes is not None:
             if isinstance(self.thinking_modes, str):
                 raise ValueError("thinking_modes must be a sequence of mode names.")
@@ -54,6 +57,7 @@ DEEPSEEK_MODELS = (
         context_window=1_048_576,
         max_output_tokens=393_216,
         supports_tools=True,
+        supports_image=True,
         thinking_modes=("off", "on", "low", "high", "max"),
     ),
     ModelInfo(
@@ -74,6 +78,7 @@ MIMO_MODELS = (
         max_output_tokens=131_072,
         default_output_tokens=131_072,
         supports_tools=True,
+        supports_image=True,
         thinking_modes=("off", "on"),
     ),
     ModelInfo(
@@ -83,6 +88,7 @@ MIMO_MODELS = (
         max_output_tokens=131_072,
         default_output_tokens=131_072,
         supports_tools=True,
+        supports_image=True,
         thinking_modes=("off", "on"),
     ),
 )

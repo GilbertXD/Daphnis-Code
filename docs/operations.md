@@ -86,7 +86,9 @@ result = await ops.send(
 )
 ```
 
-图片输入适用于 `mimo-v2.6-flash`、`mimo-v2.6-pro` 和 `deepseek-flash`。支持静态 PNG、JPEG 和 WebP，单张最多 5 MiB、2000 万像素，每轮最多 4 张和 20 MiB。恢复会话后，未被压缩覆盖且仍在上下文中的图片会随对应 User 消息发出。上下文按图片尺寸预留 Token，同时将一次请求的原始图片总量限制为 32 MiB。
+默认模型目录中的 `mimo-v2.6-flash`、`mimo-v2.6-pro` 和 `deepseek-flash` 已确认支持图片。自定义模型目录可通过 `ModelInfo.supports_image` 声明能力。支持静态 PNG、JPEG 和 WebP，单张最多 5 MiB、2000 万像素，每轮最多 4 张和 20 MiB。恢复会话后，未被压缩覆盖且仍在上下文中的图片会随对应 User 消息发出。
+
+MiMo 的图片 Token 预算按尺寸估算，DeepSeek 每张预留 1024 Token。一次模型请求的原始图片总量上限为 32 MiB，开启自动压缩时可先压缩较早的历史以释放空间。
 
 含图片的模型请求仍可使用 HTTP 流式响应。Daphnis 在收到完整响应并清理可能被分段回显的图片数据后，发布一次合并的 `model.delta`。
 

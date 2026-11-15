@@ -6,7 +6,7 @@ from typing import Any
 
 from saturnus import Messages
 
-from .attachments import AttachmentBatch, AttachmentStore
+from .attachments import AttachmentBatch, AttachmentStore, ImageAttachment
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boundaries
 from .prompt_groups import PromptGroup
 from .turn_state import (
@@ -17,6 +17,19 @@ from .turn_state import (
 )
 
 IMAGE_REFS = "_daphnis_image_refs"
+
+
+def active_images(
+    messages: list[dict[str, Any]], refs: dict[int, AttachmentBatch], through: int,
+) -> dict[int, tuple[ImageAttachment, ...]]:
+    return {
+        index: images for index, batch in refs.items()
+        if index >= through and messages[index].get(TURN_STATE) != ABANDONED and (images := batch.images)
+    }
+
+
+def projected_image_bytes(messages: list[dict[str, Any]]) -> int:
+    return sum(image.size_bytes for message in messages for image in message.get(IMAGE_REFS, ()))
 
 
 def attachment_note(
@@ -113,9 +126,8 @@ class Context:
         if messages and len(messages) not in safe_boundaries(messages, prompt_groups):
             raise ValueError("Cannot request a model with an incomplete tool exchange.")
         messages = annotate_attachments(messages, attachment_notes)
-        for index, batch in (attachment_refs or {}).items():
-            if (checkpoint is None or index >= checkpoint.through) and batch.images:
-                messages[index] = {**messages[index], IMAGE_REFS: batch.images}
+        for index, images in active_images(messages, attachment_refs or {}, checkpoint.through if checkpoint else 0).items():
+            messages[index] = {**messages[index], IMAGE_REFS: images}
         if prompt_groups:
             messages = project_terminated_turns(messages, prompt_groups)
         prompt = self.system_prompt

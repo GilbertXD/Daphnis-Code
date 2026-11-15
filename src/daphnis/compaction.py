@@ -2,7 +2,7 @@
 
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator
 from dataclasses import dataclass
 from itertools import chain, groupby
 from typing import Any
@@ -333,6 +333,7 @@ class Compactor:
     def __init__(
         self, context_window: int | None, *, counter: TokenCounter = DEFAULT_COUNTER,
         recent_tokens: int = 4096, response_format: dict[str, str] | None = None,
+        image_metadata: bool = False,
     ) -> None:
         if type(recent_tokens) is not int or recent_tokens < 0:
             raise ValueError("recent_tokens must be a non-negative integer.")
@@ -340,6 +341,7 @@ class Compactor:
         self.counter = counter
         self.recent_tokens = recent_tokens
         self.response_format = response_format
+        self.image_metadata = image_metadata
         self.output_limit = (
             2048 if context_window is None else min(2048, max(1, context_window // 8))
         )
@@ -348,17 +350,24 @@ class Compactor:
         self, messages: list[Message], previous: CompactionCheckpoint | None,
         *, within_turn: bool = False, available_tokens: int | None = None,
         prompt_groups: tuple[PromptGroup, ...] = (),
+        tail_budget: Callable[[int, list[Message]], int | None] | None = None,
+        keep_latest_input_for: Collection[int] = (),
     ) -> int | None:
-        """Prefer retaining the latest turn. Keep at least the newest exchange."""
+        """Prefer retaining the latest turn. A tail budget can rule out a cut with None."""
         previous_end = previous.through if previous else 0
-        latest_input = _latest_input(messages, len(messages), prompt_groups).start
+        latest = _latest_input(messages, len(messages), prompt_groups)
+        latest_input = latest.start
+        keep_latest_input = any(index in keep_latest_input_for for index in latest)
         group_starts = {group.start for group in prompt_groups}
 
         def starts_input(index: int) -> bool:
             message = messages[index]
             return (index in group_starts or message["role"] == "user") and message.get(TURN_STATE) != ABANDONED
 
-        cuts = [cut for cut in safe_boundaries(messages, prompt_groups) if previous_end < cut < len(messages)]
+        cuts = [
+            cut for cut in safe_boundaries(messages, prompt_groups)
+            if previous_end < cut < len(messages) and (not keep_latest_input or cut <= latest_input)
+        ]
         if not cuts:
             return None
         if available_tokens is None:
@@ -368,17 +377,23 @@ class Compactor:
             # Leave space for the projected summary, current output and the next exchange.
             target = min(target, max(0, available_tokens // 2))
 
-        def tail_tokens(cut: int) -> int:
+        def tail_tokens(cut: int) -> int | None:
             retained = _retained_input(messages, cut, prompt_groups)
             tail = [*(messages[index] for index in retained), *messages[cut:]]
             tail = self.prune(project_turn_messages(tail))
+            if tail_budget is not None:
+                return tail_budget(cut, tail)
             return request_budget(tail, {}, None, counter=self.counter).input_tokens
 
         through = cuts[-1]
+        if tail_budget is not None and tail_tokens(through) is None:
+            return None
         for cut in reversed(cuts):
             if not starts_input(cut):
                 continue
             size = tail_tokens(cut)
+            if size is None:
+                break
             if size <= target:
                 through = cut
             elif cut == latest_input and (
@@ -390,7 +405,10 @@ class Compactor:
                 break
         if through == cuts[-1] and not starts_input(through) and within_turn:
             for cut in reversed(cuts):
-                if cut <= latest_input or tail_tokens(cut) > target:
+                if cut <= latest_input:
+                    break
+                size = tail_tokens(cut)
+                if size is None or size > target:
                     break
                 through = cut
         if not any(self._source(messages, previous_end, through, prompt_groups=prompt_groups)):
@@ -490,6 +508,11 @@ class Compactor:
         prior_input = _retained_input(messages, start, prompt_groups) if previous else range(0)
         source = self._source(messages, start, through, prior_input=prior_input, prompt_groups=prompt_groups)
         instruction = _SUMMARY_PROMPT
+        if self.image_metadata:
+            instruction += (
+                " Image metadata is not visual evidence."
+                " Attribute any description of an image to a recorded observation."
+            )
         if prompt_groups:
             instruction += (
                 " Records marked preloaded_prompt_message are supplied dialogue."

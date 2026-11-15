@@ -43,10 +43,12 @@ from .compaction_settings import CompactionSettings
 from .context import (
     IMAGE_REFS,
     Context,
+    active_images,
     annotate_attachments,
     attachment_note,
     history_range_hint,
     materialize_images,
+    projected_image_bytes,
 )
 from .events import EventBus
 from .history import finish_io
@@ -67,7 +69,7 @@ from .models.models import validate_catalog
 from .models.requests import require_image_input
 from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
-from .token_budget import TokenBudget, request_budget
+from .token_budget import TokenBudget, image_token_reserve, request_budget
 from .tool_state import (
     PENDING,
     TOOL_STATE,
@@ -459,6 +461,7 @@ class Agent:
             model.context_window, counter=model.token_counter,
             recent_tokens=self.compaction_settings.recent_tokens,
             response_format=self._summary_response_format(),
+            image_metadata=any(batch.images for batch in session.attachment_refs.values()),
         )
         notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
         raw = annotate_attachments(session.messages.snapshot(), {
@@ -470,19 +473,24 @@ class Agent:
         if raw and len(raw) not in safe_boundaries(raw, session.prompt_groups):
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
-        through = compactor.cut(raw, previous, prompt_groups=session.prompt_groups)
+        tail_budget, image_inputs = self._image_tail_budget(raw, previous, session.attachment_refs, model)
+        cut_source = annotate_attachments(session.messages.snapshot(), notes) if tail_budget else raw
+        through = compactor.cut(
+            cut_source, previous, prompt_groups=session.prompt_groups,
+            tail_budget=tail_budget, keep_latest_input_for=image_inputs,
+        )
         if through is None:
             await self.events.emit("compaction.candidate", **fields, reason="no_safe_cut")
             return None
-        def budget(candidate):
-            return self._request_budget(
-                self._model_context(
-                    session.messages, candidate, attachment_notes=notes,
-                    attachment_refs=session.attachment_refs, prompt_groups=session.prompt_groups,
-                ), {}, model,
-            ).input_tokens
+        def project_context(candidate):
+            return self._model_context(
+                session.messages, candidate, attachment_notes=notes,
+                attachment_refs=session.attachment_refs, prompt_groups=session.prompt_groups,
+            )
 
-        before = budget(previous)
+        current = project_context(previous)
+        before = self._request_budget(current, {}, model)
+        image_pressure = projected_image_bytes(current) > MAX_IMAGE_REQUEST_BYTES
         number = 0
 
         async def summarize(messages: list[dict[str, Any]], output_limit: int) -> str:
@@ -498,9 +506,11 @@ class Agent:
             })
 
         return await self._shorter_checkpoint(
-            compactor, raw, previous, through, summarize, before,
-            budget,
+            compactor, raw, previous, through, summarize, before.input_tokens,
+            lambda candidate: self._request_budget(project_context(candidate), {}, model).input_tokens,
             fields, prompt_groups=session.prompt_groups,
+            input_target=before.hard_input_limit if image_pressure else None,
+            image_pressure=image_pressure,
             can_retry=lambda: number < min(self.max_maintenance_requests, self.max_total_requests),
         )
 
@@ -510,30 +520,65 @@ class Agent:
         projected_tokens: Callable[[CompactionCheckpoint], int], fields: dict[str, Any],
         *, can_retry: Callable[[], bool], input_target: int | None = None,
         prompt_groups: tuple[PromptGroup, ...] = (),
+        image_pressure: bool = False,
     ) -> CompactionCheckpoint | None:
         placeholder = CompactionCheckpoint(through, '{"goals":"x","progress":"","files":"","next_steps":""}')
         fixed = projected_tokens(placeholder)
-        if fixed >= before:
+        headroom = before - fixed
+        if image_pressure:
+            headroom = compactor.output_limit if input_target is None else input_target - fixed
+        elif input_target is not None and input_target > fixed:
+            headroom = min(headroom, input_target - fixed)
+        if headroom <= 0:
             await self.events.emit("compaction.candidate", **fields, reason="no_token_headroom",
                                    through=through, before_tokens=before, after_tokens=fixed)
             return None
-        headroom = before - fixed
-        if input_target is not None and input_target > fixed:
-            headroom = min(headroom, input_target - fixed)
         targets = (max(1, min(compactor.output_limit * 3 // 4, headroom * 3 // 4)), max(1, headroom // 2))
         for target in dict.fromkeys((targets[0], min(targets))):
             candidate = await compactor.summarize(
                 raw, previous, through, summarize, target_tokens=target, prompt_groups=prompt_groups,
             )
             after = projected_tokens(candidate)
-            reason = "reduced" if after < before else "no_token_reduction"
+            byte_reduction_fits = image_pressure and (input_target is None or after <= input_target)
+            if image_pressure:
+                reason = "image_bytes_reduced" if byte_reduction_fits else "context_safety_limit"
+            else:
+                reason = "reduced" if after < before else "no_token_reduction"
             await self.events.emit("compaction.candidate", **fields, reason=reason, through=through,
                                    before_tokens=before, after_tokens=after)
-            if after < before:
+            if byte_reduction_fits or (not image_pressure and after < before):
                 return candidate
             if not can_retry():
                 break
         return None
+
+    @staticmethod
+    def _image_tail_budget(
+        messages: list[dict[str, Any]], checkpoint: CompactionCheckpoint | None,
+        refs: dict[int, AttachmentBatch], model: ModelInfo,
+    ) -> tuple[Callable[[int, list[dict[str, Any]]], int | None] | None, set[int]]:
+        images = active_images(messages, refs, checkpoint.through if checkpoint else 0)
+        if not images:
+            return None, set()
+        costs = {
+            index: (
+                sum(image.size_bytes for image in items),
+                sum(image_token_reserve(model.provider, image.width, image.height) for image in items),
+            )
+            for index, items in images.items()
+        }
+
+        def budget(through: int, tail: list[dict[str, Any]]) -> int | None:
+            size = reserve = 0
+            for index, (image_bytes, image_tokens) in costs.items():
+                if index >= through:
+                    size += image_bytes
+                    reserve += image_tokens
+            if size > MAX_IMAGE_REQUEST_BYTES:
+                return None
+            return request_budget(tail, {}, None, counter=model.token_counter, image_reserve=reserve).input_tokens
+
+        return budget, set(images)
 
     def _request_budget(
         self, messages: list[dict[str, Any]], body: dict[str, Any], model: ModelInfo,
@@ -542,10 +587,9 @@ class Agent:
         text_messages = []
         for message in messages:
             if IMAGE_REFS in message:
-                # Reserve double the larger of a 32 px tile estimate and 1024 tokens.
-                for image in message[IMAGE_REFS]:
-                    tiles = ((image.width + 31) // 32) * ((image.height + 31) // 32)
-                    image_reserve += 2 * max(1024, tiles)
+                image_reserve += sum(
+                    image_token_reserve(model.provider, image.width, image.height) for image in message[IMAGE_REFS]
+                )
                 text_messages.append({key: value for key, value in message.items() if key != IMAGE_REFS})
             else:
                 text_messages.append(message)
@@ -601,14 +645,15 @@ class Agent:
             pruned = compactor.prune(messages, history_tool_ids=history_tool_ids)
             budget = self._request_budget(pruned, body, model)
             messages = pruned
+            image_pressure = projected_image_bytes(messages) > MAX_IMAGE_REQUEST_BYTES
             if self.compaction_settings.auto_enabled and (
-                overflow or budget.needs_compaction or budget.needs_safety_compaction
+                overflow or budget.needs_compaction or budget.needs_safety_compaction or image_pressure
             ):
                 available = (
                     budget.compaction_threshold if budget.needs_compaction
                     else budget.hard_input_limit
                 )
-                input_target = available
+                input_target = budget.hard_input_limit if image_pressure else available
                 if available is not None:
                     privileged = Messages([
                         message for message in raw if message["role"] in ("system", "developer")
@@ -618,8 +663,11 @@ class Agent:
                     available -= compactor.counter.count(SUMMARY_POLICY)
                     if history_lookup:
                         available -= compactor.counter.count(history_range_hint(len(raw)))
+                tail_budget, image_inputs = self._image_tail_budget(raw, checkpoint, attachment_refs or {}, model)
+                cut_source = annotate_attachments(history.snapshot(), attachment_notes) if tail_budget else raw
                 through = compactor.cut(
-                    raw, checkpoint, within_turn=True, available_tokens=available, prompt_groups=prompt_groups,
+                    cut_source, checkpoint, within_turn=True, available_tokens=available, prompt_groups=prompt_groups,
+                    tail_budget=tail_budget, keep_latest_input_for=image_inputs,
                 )
                 cut_key = (checkpoint.through if checkpoint else 0, through) if through is not None else None
                 if through is None:
@@ -643,6 +691,7 @@ class Agent:
                             compactor, raw, checkpoint, through, summarize, budget.input_tokens,
                             lambda candidate: self._request_budget(project_candidate(candidate), body, model).input_tokens,
                             fields, can_retry=can_retry, input_target=input_target, prompt_groups=prompt_groups,
+                            image_pressure=image_pressure,
                         )
                     except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
                         error = type(exc).__name__
@@ -775,6 +824,8 @@ class Agent:
                 model.context_window, counter=model.token_counter,
                 recent_tokens=self.compaction_settings.recent_tokens,
                 response_format=self._summary_response_format(),
+                image_metadata=bool(attachment_batch and attachment_batch.images)
+                or any(batch.images for batch in session.attachment_refs.values()),
             )
 
             def check_session() -> None:
@@ -915,10 +966,9 @@ class Agent:
                 messages: list[dict[str, Any]], body: dict[str, Any], budget: TokenBudget,
             ) -> tuple[dict[str, Any], dict[str, Any]]:
                 nonlocal requests, primary_requests
-                images = [item for message in messages for item in message.get(IMAGE_REFS, ())]
                 image_payloads = ()
-                if images:
-                    if sum(item.size_bytes for item in images) > MAX_IMAGE_REQUEST_BYTES:
+                if any(IMAGE_REFS in message for message in messages):
+                    if projected_image_bytes(messages) > MAX_IMAGE_REQUEST_BYTES:
                         raise ValueError("当前上下文中的图片超过 32 MiB，请先压缩历史。")
                     if attachment_store is None:
                         raise ValueError("原始图片附件快照不可用。")
@@ -1078,13 +1128,15 @@ class Agent:
                         budget.trigger_tokens, budget.output_reserve,
                     )
                     warned_about_reserve = True
-                if budget.needs_compaction or budget.needs_safety_compaction:
+                image_pressure = projected_image_bytes(messages) > MAX_IMAGE_REQUEST_BYTES
+                if budget.needs_compaction or budget.needs_safety_compaction or image_pressure:
                     checkpoint, messages = await self._compact_request(
                         history=session.messages, checkpoint=checkpoint, messages=messages,
                         body=body, model=model, compactor=compactor, summarize=summarize,
                         fields=fields, history_lookup=history_lookup,
                         attachment_notes=attachment_notes, attachment_refs=session.attachment_refs,
                         prompt_groups=session.prompt_groups,
+                        trigger="image_bytes" if image_pressure else "pressure",
                         can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                     )
                     budget = self._request_budget(messages, body, model)

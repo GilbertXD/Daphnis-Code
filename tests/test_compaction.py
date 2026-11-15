@@ -491,6 +491,11 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         compactor = Compactor(1200, recent_tokens=100)
         self.assertEqual(compactor.cut(raw, None, within_turn=True), 2)
         self.assertEqual(compactor.cut(raw, None, within_turn=True, available_tokens=60), 4)
+        def with_image(through, tail):
+            return request_budget(tail, {}, None, image_reserve=80 if through <= 2 else 0).input_tokens
+
+        self.assertEqual(compactor.cut(raw, None, tail_budget=with_image, keep_latest_input_for={4}), 4)
+        self.assertIsNone(compactor.cut(raw, None, tail_budget=lambda *_: None, keep_latest_input_for={4}))
 
 
 SMALL_MODEL = ModelInfo("model-a", "compatible", context_window=1200, supports_tools=True)

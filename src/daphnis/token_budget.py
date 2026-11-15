@@ -3,12 +3,42 @@
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import ceil, floor, sqrt
 from typing import Any, Literal
 
 from .compaction_settings import CompactionSettings
 
 _DEFAULT_RESERVE = 16_384
 _DEFAULT_COMPACTION = CompactionSettings()
+
+
+def mimo_image_tokens(width: int, height: int) -> int:
+    """Estimate MiMo's image tokens on its 32 px grid before safety margin."""
+    patch = 32
+    min_pixels, max_pixels = 8_192, 8_388_608
+    pixels = width * height
+    cols, rows = max(1, round(width / patch)), max(1, round(height / patch))
+    aligned_pixels = cols * rows * patch**2
+    if aligned_pixels > max_pixels:
+        scale = sqrt(max_pixels / pixels)
+        cols = max(1, floor(width * scale / patch))
+        rows = max(1, floor(height * scale / patch))
+    elif aligned_pixels < min_pixels:
+        scale = sqrt(min_pixels / pixels)
+        cols, rows = ceil(width * scale / patch), ceil(height * scale / patch)
+    # A very narrow image can round to one tile on the short side and still exceed the area cap.
+    return min(cols * rows, max_pixels // patch**2)
+
+
+def image_token_reserve(provider: str, width: int, height: int) -> int:
+    if provider == "mimo":
+        base = mimo_image_tokens(width, height)
+        return base + (base + 9) // 10
+    if provider == "deepseek":
+        return 1024
+    # Custom compatible endpoints lack a verified image tokenizer. Retain the P1 reserve.
+    tiles = ((width + 31) // 32) * ((height + 31) // 32)
+    return 2 * max(1024, tiles)
 
 
 def _hard_limit(context_window: int | None) -> int | None:

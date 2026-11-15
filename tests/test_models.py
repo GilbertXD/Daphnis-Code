@@ -13,6 +13,7 @@ from daphnis.models import (
     provider_compatibility,
     resolve_model,
 )
+from daphnis.models.requests import require_image_input
 
 MESSAGES = [{"role": "user", "content": "hello"}]
 TOOLS = [
@@ -28,6 +29,21 @@ RESPONSE = {
 
 
 class ModelsTests(unittest.IsolatedAsyncioTestCase):
+    def test_image_capability_is_declared_in_the_catalog(self):
+        for provider, model_id in (
+            ("mimo", "mimo-v2.6-flash"), ("mimo", "mimo-v2.6-pro"), ("deepseek", "deepseek-flash"),
+        ):
+            require_image_input(get_model(provider, model_id))
+        custom = ModelInfo("vision", "compatible", supports_image=True)
+        require_image_input(resolve_model("compatible", "vision", catalog=(custom,)))
+        self.assertIsNone(get_model("deepseek", "deepseek-v4-pro").supports_image)
+        with self.assertRaisesRegex(CapabilityError, "图片能力未确认"):
+            require_image_input(resolve_model("compatible", "unregistered"))
+        with self.assertRaisesRegex(CapabilityError, "明确不支持图片"):
+            require_image_input(ModelInfo("text", "compatible", supports_image=False))
+        with self.assertRaisesRegex(ValueError, "supports_image"):
+            ModelInfo("invalid", "compatible", supports_image=1)
+
     async def test_provider_routing_and_parameter_mappings(self):
         cases = (
             (

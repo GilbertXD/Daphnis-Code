@@ -21,10 +21,9 @@ class CapabilityError(ValueError):
 
 
 def require_image_input(model: ModelInfo) -> None:
-    if (model.provider, model.id) not in {
-        ("mimo", "mimo-v2.6-flash"), ("mimo", "mimo-v2.6-pro"), ("deepseek", "deepseek-flash"),
-    }:
-        raise CapabilityError(f"当前模型 {model.id!r} 不支持 Daphnis 图片输入。")
+    if model.supports_image is not True:
+        reason = "图片能力未确认" if model.supports_image is None else "明确不支持图片"
+        raise CapabilityError(f"当前模型 {model.id!r} 不支持 Daphnis 图片输入（{reason}）。")
 
 
 def require_tools(model: ModelInfo) -> None:

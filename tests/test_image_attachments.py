@@ -10,8 +10,9 @@ from unittest.mock import patch
 
 import httpx
 from PIL import Image
+from saturnus import APIError
 
-from daphnis import Operations, TurnStatus
+from daphnis import CompactionSettings, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.attachments import (
@@ -24,6 +25,7 @@ from daphnis.attachments import (
 from daphnis.history import History
 from daphnis.models import MODELS
 from daphnis.session import Session
+from daphnis.token_budget import image_token_reserve, mimo_image_tokens, request_budget
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
 
@@ -51,6 +53,21 @@ def reply(text, **extra):
     return httpx.Response(200, json={"choices": [{
         "index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text},
     }], **extra})
+
+
+class ImageBudgetTests(unittest.TestCase):
+    def test_provider_estimates_and_mimo_grid_boundaries(self):
+        for dims, expected in (
+            ((1, 1), 9), ((32, 224), 16), ((64, 96), 12), ((64, 128), 8),
+            ((512, 512), 256), ((1024, 256), 256), ((4096, 2048), 8192),
+            ((4097, 2048), 8192), ((4128, 2048), 8064), ((4000, 4000), 8100), ((1, 20_000_000), 8192),
+        ):
+            with self.subTest(dims=dims):
+                self.assertEqual(mimo_image_tokens(*dims), expected)
+                self.assertEqual(mimo_image_tokens(*reversed(dims)), expected)
+                self.assertEqual(image_token_reserve("mimo", *dims), expected + (expected + 9) // 10)
+                self.assertEqual(image_token_reserve("deepseek", *dims), 1024)
+        self.assertEqual(image_token_reserve("compatible", 512, 512), 2048)
 
 
 class ImageStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -127,13 +144,16 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.history = History(self.root / "sessions")
         self.red = image_upload("old.png")
 
-    def runtime(self, handler, *, model_id="deepseek-flash", catalog=MODELS):
+    def runtime(
+        self, handler, *, provider="deepseek", model_id="deepseek-flash", catalog=MODELS, compaction_settings=None,
+    ):
         ops = Operations(Application(
-            workspace=self.root, provider="deepseek", model_id=model_id, catalog=catalog,
+            workspace=self.root, provider=provider, model_id=model_id, catalog=catalog,
             history=History(self.history.directory),
-            connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+            connections={provider: {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
             observe_model_io=True, recent_tokens=0,
-            output_limits={("deepseek", model_id): 128},
+            output_limits={(provider, model_id): 128},
+            compaction_settings=compaction_settings,
         ))
         self.addAsyncCleanup(ops.close)
         return ops
@@ -143,8 +163,10 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_projection_restart_mixed_upload_and_manual_compaction(self):
         primary, summaries, previews = [], [], []
+        summary_mode = "ok"
+        summary_started = asyncio.Event()
 
-        def handler(request):
+        async def handler(request):
             body = json.loads(request.content)
             messages = body["messages"]
             if messages[0]["content"] == TITLE_PROMPT:
@@ -152,6 +174,11 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
                 return reply("Image review")
             if "response_format" in body:
                 summaries.append(messages)
+                if summary_mode == "error":
+                    return httpx.Response(503, json={"error": {"message": "unavailable"}})
+                if summary_mode == "block":
+                    summary_started.set()
+                    await asyncio.Future()
                 return reply('{"goals":"Image review","progress":"Done","files":"old.png","next_steps":""}')
             primary.append(messages)
             return reply("Done")
@@ -192,17 +219,157 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(checkpoint)
         self.assertEqual(checkpoint.through, 2)
         summary_source = json.dumps(summaries, ensure_ascii=False)
-        for field in ("old.png", "image/png", "width", "height"):
+        for field in ("old.png", "image/png", "width", "height", "Image metadata is not visual evidence"):
             self.assertIn(field, summary_source)
         self.assertNotIn("base64", summary_source)
-        # A covered image no longer needs to be read, even if the stored snapshot is lost.
-        old = self.history.load(session_id).attachment_refs[0].images[0]
-        (self.history.attachments.directory / session_id / f"{old.id}.png").unlink()
         result = await resumed.send("Describe the images in the current context", stream=False)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(image_urls(primary[-1]), [image_url(blue), image_url(green)])
         self.assertEqual(len(resumed.message_snapshot()), 6)
+        unchanged = self.history.load(session_id)
+
+        summary_mode = "error"
+        with self.assertRaises(APIError):
+            await resumed.compact()
+        self.assertEqual(self.history.load(session_id).compaction, checkpoint)
+        summary_mode = "block"
+        pending = asyncio.create_task(resumed.compact())
+        await asyncio.wait_for(summary_started.wait(), timeout=5)
+        await resumed.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(self.history.load(session_id).compaction, checkpoint)
+
+        summary_mode = "ok"
+        second = await resumed.compact()
+        self.assertEqual(second.through, 4)
+        after = self.history.load(session_id)
+        self.assertEqual(after.compaction, second)
+        self.assertEqual(after.messages.snapshot(), unchanged.messages.snapshot())
+        self.assertEqual(after.attachment_refs, unchanged.attachment_refs)
+        stored = (item for batch in after.attachment_refs.values() for item in batch.images)
+        for item, upload in zip(stored, (self.red, blue, green), strict=True):
+            self.assertEqual(self.history.attachments.read_image(session_id, item), upload.data)
+        await resumed.close()
+
+        reopened = self.runtime(handler)
+        reopened.restore_session(session_id)
+        self.assertEqual(reopened.compacted_through, 4)
+        result = await reopened.send("Continue from the summary", stream=False)
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(image_urls(primary[-1]), [])
+        self.assertEqual(self.history.load(session_id).attachment_refs, unchanged.attachment_refs)
         self.assertNotIn("base64", self.saved(session_id))
+        self.assertNotIn("base64", json.dumps(summaries))
+
+    async def test_auto_compaction_uses_image_tokens_and_overflow_reuses_the_budget(self):
+        blue = image_upload("blue.png", color="blue")
+        green = image_upload("green.png", color="green")
+        for cause in ("pressure", "overflow"):
+            with self.subTest(cause=cause):
+                calls, summaries, budgets, compactions = [], [], [], []
+
+                def handler(request, *, calls=calls, summaries=summaries, cause=cause):
+                    body = json.loads(request.content)
+                    messages = body["messages"]
+                    if messages[0]["content"] == TITLE_PROMPT:
+                        return reply("Images")
+                    if "response_format" in body:
+                        summaries.append(messages)
+                        return reply('{"goals":"Review images","progress":"Done","files":"old.png","next_steps":""}')
+                    urls = image_urls(messages)
+                    calls.append(messages)
+                    if cause == "overflow" and len(urls) == 3:
+                        return httpx.Response(400, json={"error": {"code": "context_length_exceeded"}})
+                    return reply("Done")
+
+                settings = CompactionSettings(threshold_mode="tokens", threshold_value=2600) if cause == "pressure" else None
+                ops = self.runtime(handler, compaction_settings=settings)
+                ops.subscribe("context.budget", budgets.append)
+                ops.subscribe("compaction.finished", compactions.append)
+                await ops.set_system_prompt("Inspect images.")
+                await ops.set_tools([])
+                first = await ops.send("Review old", attachments=[self.red], stream=False)
+                self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
+                second = await ops.send("Review new", attachments=[blue, green], stream=False)
+                self.assertEqual(second.status, TurnStatus.COMPLETED, second.error)
+                self.assertEqual([event.data["trigger"] for event in compactions], [cause])
+                self.assertEqual(ops.compacted_through, 2)
+                self.assertEqual(image_urls(calls[-1]), [image_url(blue), image_url(green)])
+                self.assertEqual(len(calls), 2 if cause == "pressure" else 3)
+                self.assertEqual(len(summaries), 1)
+                self.assertNotIn("base64", json.dumps(summaries))
+                self.assertEqual(len(self.history.load(ops.session.id).attachment_refs), 2)
+                self.assertIn("old.png", json.dumps(summaries))
+                text = [*calls[-1][:-1], {**calls[-1][-1], "content": "Review new"}]
+                self.assertEqual(budgets[-1].data["input_tokens"],
+                                 request_budget(text, {}, None).input_tokens + 2048)
+                await ops.close()
+
+    async def test_byte_pressure_compacts_old_images_but_keeps_or_rejects_the_newest(self):
+        blue = image_upload("blue.png", color="blue")
+        calls, summary_requests, candidates = [], [], []
+
+        def handler(request):
+            body = json.loads(request.content)
+            messages = body["messages"]
+            if messages[0]["content"] == TITLE_PROMPT:
+                return reply("Images")
+            if "response_format" in body:
+                summary_requests.append(messages)
+                return reply('{"goals":"Review images","progress":"Done","files":"old.png","next_steps":""}')
+            calls.append(image_urls(messages))
+            return reply("Done")
+
+        ops = self.runtime(handler, provider="mimo", model_id="mimo-v2.6-flash")
+        ops.subscribe("compaction.candidate", candidates.append)
+        # Exercise the 32 MiB path without generating or decoding large fixtures.
+        cap = max(len(self.red.data), len(blue.data))
+        with patch("daphnis.agent.MAX_IMAGE_REQUEST_BYTES", cap):
+            first = await ops.send("Review old", attachments=[self.red], stream=False)
+            self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
+            second = await ops.send("Review new", attachments=[blue], stream=False)
+            self.assertEqual(second.status, TurnStatus.COMPLETED, second.error)
+            self.assertEqual(calls, [[image_url(self.red)], [image_url(blue)]])
+            self.assertEqual(len(summary_requests), 1)
+            self.assertEqual(ops.compacted_through, 2)
+            candidate = candidates[-1].data
+            self.assertEqual(candidate["reason"], "image_bytes_reduced")
+            self.assertGreaterEqual(candidate["after_tokens"], candidate["before_tokens"])
+            rejected = await ops.send("Review both", attachments=[blue, self.red], stream=False)
+            self.assertEqual(rejected.status, TurnStatus.FAILED)
+            self.assertIn("图片超过 32 MiB", rejected.error)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(summary_requests), 1)
+            self.assertEqual(ops.compacted_through, 2)
+            self.assertEqual(len(self.history.load(ops.session.id).attachment_refs[4].images), 2)
+
+    async def test_model_switch_checks_target_capability_for_history(self):
+        requests = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            if body["messages"][0]["content"] != TITLE_PROMPT:
+                requests.append(body)
+            return reply("Done")
+
+        original = next(model for model in MODELS if model.id == "deepseek-flash")
+        compatible = replace(original, id="custom-vision")
+        disabled = replace(original, id="custom-text", supports_image=False)
+        ops = self.runtime(handler, catalog=(*MODELS, compatible, disabled))
+        first = await ops.send("Review", attachments=[self.red], stream=False)
+        self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
+        for model_id, reason in (("deepseek-v4-pro", "图片能力未确认"), ("custom-text", "明确不支持图片")):
+            await ops.set_model("deepseek", model_id)
+            rejected = await ops.send("Follow up", stream=False)
+            self.assertEqual(rejected.status, TurnStatus.FAILED)
+            self.assertIn(reason, rejected.error)
+        self.assertEqual(len(requests), 1)
+        await ops.set_model("deepseek", "custom-vision")
+        result = await ops.send("Follow up", stream=False)
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(requests[-1]["model"], "custom-vision")
+        self.assertEqual(image_urls(requests[-1]["messages"]), [image_url(self.red)])
 
     async def test_reopen_without_compaction_and_stream_echo_is_private(self):
         payload = b64encode(self.red.data).decode("ascii")
