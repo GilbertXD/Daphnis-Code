@@ -9,7 +9,8 @@ from saturnus import Messages
 from .attachments import AttachmentBatch
 from .compaction import CompactionCheckpoint
 from .project import validate_project_id
-from .turn_state import RecoveryState, recovery_state
+from .prompt_groups import PromptGroup, validate_messages
+from .turn_state import TURN_ATTEMPT, TURN_STATE, RecoveryState, recovery_state
 from .usage import UsageTotals
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -37,6 +38,8 @@ class Session:
     system_prompt: str | None = None
     project_id: str | None = None
     attachment_refs: dict[int, AttachmentBatch] = field(default_factory=dict)
+
+    prompt_groups: tuple[PromptGroup, ...] = ()
 
     @property
     def recovery(self) -> RecoveryState | None:
@@ -79,6 +82,23 @@ class Session:
                 if batch.submission_id in submissions:
                     raise ValueError("Duplicate Session attachment submission ID.")
                 submissions.add(batch.submission_id)
+        if not isinstance(self.prompt_groups, tuple):
+            raise TypeError("Session prompt_groups must be a tuple.")
+        previous_end = 0
+        group_ids: set[str] = set()
+        for group in self.prompt_groups:
+            if (not isinstance(group, PromptGroup) or group.id in group_ids
+                or group.start < previous_end or group.end > len(self.messages)):
+                raise ValueError("Invalid Session prompt group range or ID.")
+            messages = []
+            for index in range(group.start, group.end):
+                message = self.messages.get(index)
+                if index in self.attachment_refs or message.keys() - {"role", "content", TURN_STATE, TURN_ATTEMPT}:
+                    raise ValueError("Invalid message in Session prompt group.")
+                messages.append((message["role"], message.get("content")))
+            validate_messages(tuple(messages))
+            previous_end = group.end
+            group_ids.add(group.id)
         if not isinstance(self.usage, UsageTotals):
             raise TypeError("usage must be a UsageTotals instance.")
         if self.thinking is not None and (

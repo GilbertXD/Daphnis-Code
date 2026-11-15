@@ -17,6 +17,7 @@ from saturnus import Messages, ValidationError
 from .attachments import AttachmentBatch, AttachmentStore
 from .compaction import CompactionCheckpoint
 from .project import Project, validate_project_id
+from .prompt_groups import PromptGroup
 from .session import Session
 from .tool_state import interrupted_tool_group
 from .turn_state import RecoveryKind
@@ -296,6 +297,7 @@ class History:
             system_prompt=session.system_prompt,
             project_id=session.project_id,
             attachment_refs=session.attachment_refs,
+            prompt_groups=session.prompt_groups,
         )
         data = {
             "version": 2,
@@ -317,6 +319,8 @@ class History:
             data["system_prompt"] = validated.system_prompt
         if validated.project_id is not None:
             data["project_id"] = validated.project_id
+        if validated.prompt_groups:
+            data["prompt_groups"] = [asdict(group) for group in validated.prompt_groups]
         if validated.attachment_refs:
             data["attachment_refs"] = {str(index): asdict(batch) for index, batch in validated.attachment_refs.items()}
         serialized = (json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode()
@@ -375,6 +379,9 @@ class History:
                 raise ValueError("Invalid session compaction checkpoint.")
             checkpoint = CompactionCheckpoint(**checkpoint)
         messages = Messages(data["messages"])
+        groups = data.get("prompt_groups", [])
+        if not isinstance(groups, list) or any(not isinstance(item, dict) for item in groups):
+            raise ValueError("History prompt_groups must be an array of objects.")
         refs = data.get("attachment_refs", {})
         if not isinstance(refs, dict) or not all(
             index.isascii() and index.isdigit() and index == str(int(index)) for index in refs
@@ -394,6 +401,7 @@ class History:
             title=data.get("title"),
             compaction=checkpoint,
             system_prompt=data.get("system_prompt"),
+            prompt_groups=tuple(PromptGroup(**group) for group in groups),
             attachment_refs={int(index): AttachmentBatch.from_json(batch) for index, batch in refs.items()},
         )
         session.project_id = self.resolve_project_id(data.get("project_id"), Path(session.workspace))
