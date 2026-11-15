@@ -79,6 +79,12 @@ class ObservedChatClient(ChatClient):
         }
         if "purpose" in event.data:
             fields["purpose"] = event.data["purpose"]
+        if event.data.get("attachment_sensitive"):
+            await self._events.emit(
+                "model.request", **fields, http_status=response.status_code,
+                omitted="此会话包含附件，模型请求与错误正文已隐藏。",
+            )
+            return
         try:
             await self._events.emit(
                 "model.request",

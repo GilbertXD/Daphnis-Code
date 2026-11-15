@@ -28,10 +28,12 @@ MAX_CONTENT_BYTES = 8 * MAX_FILE_BYTES
 
 def prepare_search(
     arguments: dict[str, Any], workspace: Path, *, excluded: Path | None = None,
+    attachment_directory: Path | None = None,
     approval_mode: ApprovalMode = ApprovalMode.AUTO,
 ) -> Operation:
     root = Target.capture(arguments.get("path", "."), workspace)
-    if excluded is not None and root.path.is_relative_to(excluded):
+    private = tuple(path for path in (excluded, attachment_directory) if path is not None)
+    if any(root.path.is_relative_to(path) for path in private):
         raise ToolError("sensitive_path", "Search cannot read Daphnis Session storage.")
 
     async def run():
@@ -62,7 +64,7 @@ def prepare_search(
                             skipped += 1
                             continue
                         if entry.is_dir(follow_symlinks=False):
-                            if path != excluded and entry.name not in IGNORED_DIRECTORIES:
+                            if path not in private and entry.name not in IGNORED_DIRECTORIES:
                                 stack.append(path)
                             continue
                         if not entry.is_file(follow_symlinks=False):

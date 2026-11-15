@@ -13,6 +13,11 @@ from uuid import uuid4
 from saturnus import ChatClient
 
 from .agent import Agent, TurnResult, TurnStatus, assistant_text
+from .attachments import (
+    ATTACHMENT_ONLY_PROMPT,
+    TextAttachmentInput,
+    prepare_attachments,
+)
 from .compaction import CompactionCheckpoint, CompactionError
 from .compaction_settings import CompactionSettings
 from .context import Context
@@ -228,6 +233,7 @@ class Application:
             trusted=self._trusted_tools,
             redactor=self._history_redactor,
             search_excluded_directory=self._history.directory,
+            attachment_store=self._history.attachments,
             connections=(
                 server
                 for server in self._mcp.values()
@@ -412,9 +418,14 @@ class Application:
     async def _run_turn(
         self, prompt: str | None = None, *, stream: bool = True,
         recovery_action: RecoveryAction | None = None, recovery_key: str | None = None,
+        attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
         self._ensure_idle()
         session = self._session
+        uploads = tuple(attachments)
+        batch = prepare_attachments(uploads, submission_id) if uploads else None
+        if batch and isinstance(prompt, str) and not prompt.strip():
+            prompt = ATTACHMENT_ONLY_PROMPT
         if self._mcp_pending:
             async with self._state_lock:
                 await self._refresh_pending_mcp()
@@ -444,6 +455,10 @@ class Application:
 
         async def run():
             async with self._history.lease(session) as lease:
+                if submission_id is not None and any(
+                    existing.submission_id == submission_id for existing in session.attachment_refs.values()
+                ):
+                    raise ValueError("该附件发送请求已接受。")
                 save_failed = False
                 title_source = None
 
@@ -452,10 +467,17 @@ class Application:
                     if self._session is not session:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
+                        if batch and len(candidate.attachment_refs) > len(session.attachment_refs):
+                            try:
+                                await finish_io(asyncio.to_thread(self._history.attachments.write, session.id, batch, uploads))
+                            except OSError:
+                                raise OSError("无法持久化附件快照。") from None
                         if candidate.title is None:
                             first_user = next(
-                                (message for message in candidate.messages.snapshot()
-                                 if message["role"] == "user"),
+                                (message for index, message in enumerate(candidate.messages.snapshot())
+                                 if message["role"] == "user" and not (
+                                     index in candidate.attachment_refs and message.get("content") == ATTACHMENT_ONLY_PROMPT
+                                 )),
                                 {},
                             )
                             text = sanitize_terminal(assistant_text(first_user))
@@ -482,6 +504,9 @@ class Application:
                         thinking_mode=thinking,
                         output_limit=self._output_limits.get((provider, session.model_id)),
                         persist=persist,
+                        attachment_batch=batch,
+                        attachment_texts=tuple(item.text for item in uploads),
+                        attachment_store=self._history.attachments,
                     )
                     if result.status is TurnStatus.COMPLETED and title_source is not None:
                         await self._name_session(agent, session, title_source, lease=lease)

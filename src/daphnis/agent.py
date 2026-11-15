@@ -25,6 +25,7 @@ from saturnus import (
     get_message,
 )
 
+from .attachments import ATTACHMENT_TOOLS, AttachmentBatch, AttachmentStore
 from .compaction import (
     SUMMARY_POLICY,
     CompactionCheckpoint,
@@ -33,7 +34,7 @@ from .compaction import (
     safe_boundaries,
 )
 from .compaction_settings import CompactionSettings
-from .context import Context, history_range_hint
+from .context import Context, annotate_attachments, attachment_note, history_range_hint
 from .events import EventBus
 from .history import finish_io
 from .model_io import (
@@ -298,19 +299,37 @@ class Agent:
 
     def _model_context(
         self, history: Messages, checkpoint: CompactionCheckpoint | None,
-        *, history_lookup: bool = False,
+        *, history_lookup: bool = False, attachment_notes: dict[int, str] | None = None,
     ) -> list[dict[str, Any]]:
         if checkpoint is None:
-            return self.context.build(history)
+            return self.context.build(history, attachment_notes=attachment_notes)
         return self.context.build(
             history, checkpoint, summary_reasoning=self._provider == "deepseek",
-            history_lookup=history_lookup,
+            history_lookup=history_lookup, attachment_notes=attachment_notes,
         )
 
     def _summary_response_format(self) -> dict[str, str] | None:
         if self._provider in {"mimo", "deepseek"} and not self._custom_compatibility:
             return {"type": "json_object"}
         return None
+
+    def _choose_attachment_notes(
+        self, messages: Messages, checkpoint: CompactionCheckpoint | None, body: dict[str, Any],
+        model: ModelInfo, notes: dict[int, str], index: int, inline: str, can_read: bool,
+    ) -> dict[int, str]:
+        base = self._request_budget(self._model_context(messages, checkpoint, attachment_notes=notes), body, model)
+        added = max(0, model.token_counter.count(inline) - model.token_counter.count(notes[index]))
+        limit = 4000
+        if base.hard_input_limit is not None:
+            limit = min(limit, max(0, base.hard_input_limit - base.input_tokens) // 20)
+        if added <= limit:
+            candidate = {**notes, index: inline}
+            projected = self._model_context(messages, checkpoint, attachment_notes=candidate)
+            if self._request_budget(projected, body, model).fits:
+                return candidate
+        if not can_read:
+            raise ValueError("附件无法安全内联。请缩小文件，或选用支持工具的模型并启用 read_attachment 和 search_attachment。")
+        return notes
 
     async def generate_title(self, *, session: Session, source: str) -> str | None:
         model = resolve_model(session.provider, session.model_id, catalog=self._catalog)
@@ -401,8 +420,11 @@ class Agent:
             recent_tokens=self.compaction_settings.recent_tokens,
             response_format=self._summary_response_format(),
         )
-        raw = session.messages.snapshot()
+        notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
+        raw = annotate_attachments(session.messages.snapshot(), notes)
         fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
+        if notes:
+            fields["attachment_sensitive"] = True
         if raw and len(raw) not in safe_boundaries(raw):
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
@@ -410,7 +432,12 @@ class Agent:
         if through is None:
             await self.events.emit("compaction.candidate", **fields, reason="no_safe_cut")
             return None
-        before = self._request_budget(self._model_context(session.messages, previous), {}, model).input_tokens
+        def budget(candidate):
+            return self._request_budget(
+                self._model_context(session.messages, candidate, attachment_notes=notes), {}, model,
+            ).input_tokens
+
+        before = budget(previous)
         number = 0
 
         async def summarize(messages: list[dict[str, Any]], output_limit: int) -> str:
@@ -421,13 +448,13 @@ class Agent:
                 )
             number += 1
             return await self._request_summary(model, messages, output_limit, {
-                "session_id": session.id, "turn_id": operation_id,
+                **fields,
                 "request_number": number, "purpose": "compaction", "maintenance": True,
             })
 
         return await self._shorter_checkpoint(
             compactor, raw, previous, through, summarize, before,
-            lambda candidate: self._request_budget(self._model_context(session.messages, candidate), {}, model).input_tokens,
+            budget,
             fields, can_retry=lambda: number < min(self.max_maintenance_requests, self.max_total_requests),
         )
 
@@ -484,6 +511,8 @@ class Agent:
         attempted_cuts: set[tuple[int, int]],
         trigger: str = "pressure",
         history_lookup: bool = False,
+        attachment_notes: dict[int, str] | None = None,
+        attachment_refs: dict[int, str] | None = None,
     ) -> tuple[CompactionCheckpoint | None, list[dict[str, Any]]]:
         fields = {**fields, "trigger": trigger}
         overflow = trigger == "overflow"
@@ -493,7 +522,8 @@ class Agent:
         error = None
         failure_reason = None
         try:
-            raw = history.snapshot() if history_lookup or self.compaction_settings.auto_enabled else []
+            raw = (annotate_attachments(history.snapshot(), attachment_refs)
+                   if history_lookup or self.compaction_settings.auto_enabled else [])
             history_tool_ids = {}
             if history_lookup:
                 counts = Counter(message["tool_call_id"] for message in raw if message["role"] == "tool")
@@ -536,7 +566,9 @@ class Agent:
 
                     def project_candidate(candidate: CompactionCheckpoint) -> list[dict[str, Any]]:
                         return compactor.prune(
-                            self._model_context(history, candidate, history_lookup=history_lookup),
+                            self._model_context(
+                                history, candidate, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                            ),
                             history_tool_ids=history_tool_ids,
                         )
 
@@ -590,6 +622,9 @@ class Agent:
         extra_body: dict[str, Any] | None = None,
         extra_headers: dict[str, str] | None = None,
         persist: Callable[[Session], Awaitable[None]] | None = None,
+        attachment_batch: AttachmentBatch | None = None,
+        attachment_texts: tuple[str, ...] = (),
+        attachment_store: AttachmentStore | None = None,
     ) -> TurnResult:
         session_id = session.id
         if session_id in _ACTIVE_SESSIONS:
@@ -597,6 +632,8 @@ class Agent:
         _ACTIVE_SESSIONS.add(session_id)
         turn_id = uuid4().hex
         fields = {"session_id": session_id, "turn_id": turn_id}
+        if session.attachment_refs or attachment_batch:
+            fields["attachment_sensitive"] = True
         status = TurnStatus.FAILED
         error: str | None = None
         notice: str | None = None
@@ -640,6 +677,18 @@ class Agent:
             history_lookup = {"retrieval", "history_read"}.issubset(
                 item["function"]["name"] for item in definitions
             )
+            can_read_attachments = model.supports_tools is True and ATTACHMENT_TOOLS.issubset(
+                item["function"]["name"] for item in definitions
+            )
+            attachment_refs = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
+            attachment_notes = attachment_refs
+
+            def request_options():
+                return prepare_request_options(
+                    model=model, thinking_mode=thinking_mode, tools=definitions or None,
+                    output_limit=output_limit, extra_body=extra_body,
+                    custom_compatibility=self._custom_compatibility,
+                )
             compactor = Compactor(
                 model.context_window, counter=model.token_counter,
                 recent_tokens=self.compaction_settings.recent_tokens,
@@ -656,9 +705,13 @@ class Agent:
 
             async def commit(
                 snapshot: list[dict[str, Any]], *, tool_finished: dict[str, Any] | None = None,
+                batch: AttachmentBatch | None = None,
             ) -> None:
                 check_session()
-                candidate = replace(session, messages=Messages(snapshot), compaction=checkpoint)
+                refs = session.attachment_refs
+                if batch is not None:
+                    refs = {**refs, len(snapshot) - 1: batch}
+                candidate = replace(session, messages=Messages(snapshot), compaction=checkpoint, attachment_refs=refs)
 
                 async def save_and_publish() -> None:
                     nonlocal committed, committed_checkpoint
@@ -669,7 +722,10 @@ class Agent:
                     session.title = candidate.title
                     session.usage = candidate.usage
                     session._saved_revision = candidate._saved_revision
+                    session.attachment_refs = candidate.attachment_refs
                     committed = snapshot
+                    if batch is not None:
+                        await self.events.emit("attachments.committed", **fields, submission_id=batch.submission_id)
                     if committed_checkpoint != checkpoint:
                         committed_checkpoint = checkpoint
                         await self.events.emit("compaction.committed", **fields, through=checkpoint.through)
@@ -742,7 +798,8 @@ class Agent:
                     update_tool_result(committed, index, call_id, content=content),
                     tool_finished={
                         **tool_fields, "status": "ERROR" if tool_error else "COMPLETED",
-                        "content": content, "error": tool_error,
+                        "content": ("[附件工具输出已隐藏]" if call["function"]["name"] in ATTACHMENT_TOOLS else content),
+                        "error": tool_error,
                     },
                 )
 
@@ -794,6 +851,7 @@ class Agent:
 
             await _checkpoint()
             pending = []
+            body = None
             if recovery_action is None:
                 if committed and len(committed) not in safe_boundaries(committed):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
@@ -801,10 +859,32 @@ class Agent:
                 if recovery is not None:
                     index = recovery.message_index
                     snapshot[index] = {**committed[index], TURN_STATE: ABANDONED}
-                await commit(snapshot)
+                if attachment_batch:
+                    index = len(snapshot) - 1
+                    attachment_refs[index] = attachment_note(attachment_batch)
+                    body = request_options()
+                    attachment_notes = self._choose_attachment_notes(
+                        Messages(snapshot), checkpoint, body, model, attachment_refs, index,
+                        attachment_note(attachment_batch, attachment_texts), can_read_attachments,
+                    )
+                await commit(snapshot, batch=attachment_batch)
             else:
                 snapshot = committed.copy()
                 terminating = recovery_action is RecoveryAction.TERMINATE
+                if not terminating and (batch := session.attachment_refs.get(recovery.message_index)):
+                    if attachment_store is None:
+                        raise ValueError("附件快照不可用。")
+                    try:
+                        texts = await asyncio.to_thread(
+                            lambda: tuple(attachment_store.read(session.id, item) for item in batch.files)
+                        )
+                    except (OSError, ValueError):
+                        raise ValueError("原始附件快照不可用。") from None
+                    body = request_options()
+                    attachment_notes = self._choose_attachment_notes(
+                        session.messages, checkpoint, body, model, attachment_refs, recovery.message_index,
+                        attachment_note(batch, texts), can_read_attachments,
+                    )
                 if interrupted is not None:
                     calls, indices = interrupted
                     self._validate_tool_calls(calls)
@@ -835,14 +915,8 @@ class Agent:
                 if len(pending) > self.max_tool_calls:
                     raise RuntimeError("Maximum tool-call count exceeded.")
                 await commit(snapshot)
-            body = prepare_request_options(
-                model=model,
-                thinking_mode=thinking_mode,
-                tools=definitions or None,
-                output_limit=output_limit,
-                extra_body=extra_body,
-                custom_compatibility=self._custom_compatibility,
-            )
+            if body is None:
+                body = request_options()
             for call, index in pending:
                 await process_tool(call, index, {**fields, "request_number": 0})
             attempted_cuts: set[tuple[int, int]] = set()
@@ -850,8 +924,16 @@ class Agent:
             while primary_remaining() > 0:
                 await _checkpoint()
                 maintenance_limited = False
-                messages = self._model_context(session.messages, checkpoint, history_lookup=history_lookup)
+                messages = self._model_context(
+                    session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                )
                 budget = self._request_budget(messages, body, model)
+                if not budget.fits and can_read_attachments and attachment_notes is not attachment_refs:
+                    attachment_notes = attachment_refs
+                    messages = self._model_context(
+                        session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,
+                    )
+                    budget = self._request_budget(messages, body, model)
                 if budget.threshold_blocked_by_reserve and not warned_about_reserve:
                     logger.warning(
                         "压缩阈值（%s Token）不高于输出预留（%s Token）；"
@@ -864,6 +946,7 @@ class Agent:
                         history=session.messages, checkpoint=checkpoint, messages=messages,
                         body=body, model=model, compactor=compactor, summarize=summarize,
                         fields=fields, history_lookup=history_lookup,
+                        attachment_notes=attachment_notes, attachment_refs=attachment_refs,
                         can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                     )
                     budget = self._request_budget(messages, body, model)
@@ -895,6 +978,7 @@ class Agent:
                                 history=session.messages, checkpoint=checkpoint, messages=messages,
                                 body=body, model=model, compactor=compactor, summarize=summarize,
                                 fields=failure_fields, trigger="overflow", history_lookup=history_lookup,
+                                attachment_notes=attachment_notes, attachment_refs=attachment_refs,
                                 can_retry=maintenance_available, attempted_cuts=attempted_cuts,
                             )
                             budget = self._request_budget(reduced, body, model)
@@ -968,7 +1052,8 @@ class Agent:
             error = "Turn cancelled; executed tool side effects are not rolled back."
             raise
         except Exception as exc:  # noqa: BLE001 - Report unexpected failures as failed Turns.
-            error = f"{type(exc).__name__}: {exc}"
+            error = ("模型请求失败。" if fields.get("attachment_sensitive") and isinstance(exc, (APIError, ResponseError))
+                     else f"{type(exc).__name__}: {exc}")
         finally:
             try:
                 if checkpoint != committed_checkpoint:

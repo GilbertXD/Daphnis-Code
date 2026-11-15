@@ -8,6 +8,7 @@ from typing import Any
 
 from saturnus import Messages
 
+from ..attachments import AttachmentBatch, attachment_metadata
 from ..redaction import Redactor
 from ..turn_state import ABANDONED, TURN_STATE
 from .approval import Decision, Operation, ToolError
@@ -95,6 +96,7 @@ def visible_history_text(messages: Messages, index: int, redactor: Redactor) -> 
 
 def prepare_history(
     name: str, arguments: dict[str, Any], messages: Messages, redactor: Redactor,
+    attachments: dict[int, AttachmentBatch] | None = None,
 ) -> Operation:
     async def run():
         if name == "history_operations":
@@ -137,11 +139,14 @@ def prepare_history(
         if start > stop:
             raise ToolError("invalid_range", "Start must not exceed the requested end or text length.")
         page_end = min(stop, start + MAX_PAGE_CHARS)
-        return {
+        result = {
             "ok": True, "notice": HISTORY_NOTICE, "message_id": index, "role": role,
             "start": start, "end": page_end, "length": len(content),
             "content": content[start:page_end], "next_start": page_end if page_end < stop else None,
         }
+        if attachments and index in attachments:
+            result["attachments"] = redactor.json(attachment_metadata(attachments[index]))
+        return result
 
     return Operation(
         decision=Decision.ALLOW, reason="Read exposed text from the current Session.",

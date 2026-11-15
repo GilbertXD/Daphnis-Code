@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from saturnus import ValidationError
 
+from .attachments import TextAttachmentInput
 from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
 from .events import Callback
@@ -573,8 +574,20 @@ class Operations:
             await finish_io(delete_and_select())
         return self.session
 
-    async def send(self, prompt: str, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(prompt, stream=stream)
+    def attachment_snapshot(self) -> dict[int, list[dict[str, str]]]:
+        return {
+            index: [{"id": item.id, "name": item.name} for item in batch.files]
+            for index, batch in self._app._session.attachment_refs.items()
+        }
+
+    def attachment_submitted(self, submission_id: str) -> bool:
+        return any(batch.submission_id == submission_id for batch in self._app._session.attachment_refs.values())
+
+    async def send(
+        self, prompt: str, *, stream: bool = True,
+        attachments: Sequence[TextAttachmentInput] = (), submission_id: str | None = None,
+    ) -> "TurnResult":
+        return await self._app._run_turn(prompt, stream=stream, attachments=attachments, submission_id=submission_id)
 
     @property
     def recovery(self) -> RecoveryState | None:
