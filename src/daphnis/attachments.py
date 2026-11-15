@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
+from zipfile import BadZipFile, ZipFile
 
 from PIL import Image
 
@@ -24,8 +25,11 @@ MAX_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
 MAX_IMAGE_REQUEST_BYTES = 32 * 1024 * 1024
 MAX_IMAGES = 4
 MAX_IMAGE_PIXELS = 20_000_000
+MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENTS = 1
 ATTACHMENT_ONLY_PROMPT = "已附上文本文件。"
 IMAGE_ATTACHMENT_ONLY_PROMPT = "已附上图片。"
+DOCUMENT_ATTACHMENT_ONLY_PROMPT = "已附上文档。"
 ATTACHMENT_TOOLS = frozenset({"read_attachment", "search_attachment"})
 _ID = re.compile(r"[0-9a-f]{32}")
 _BINARY = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -39,21 +43,30 @@ _PRIVATE_NAMES = {"credentials.json", "application_default_credentials.json", "s
 _IMAGE_FORMATS = {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}
 _IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
 _PNG_END = b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
+DOCUMENT_MIME_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+_OFFICE_PARTS = {".docx": "word/document.xml", ".pptx": "ppt/presentation.xml", ".xlsx": "xl/workbook.xml"}
 
 
 def valid_id(value: str) -> bool:
     return isinstance(value, str) and _ID.fullmatch(value) is not None
 
 
-def _name(name: str, *, image: bool = False) -> None:
+def _name(name: str, *, image: bool = False, document: bool = False) -> None:
     if (
         not isinstance(name, str) or not 0 < len(name) <= 255 or name != name.strip()
         or any(char in name for char in "/\\") or any(ord(char) < 32 for char in name)
         or _BINARY.search(name) or name in {".", ".."}
-        or (not image and Path(name).suffix.lower() not in _EXTENSIONS)
+        or (not (image or document) and Path(name).suffix.lower() not in _EXTENSIONS)
         or name.lower().startswith((".env", "id_rsa.", "id_ed25519.", "id_ecdsa.", "id_dsa."))
         or name.lower() in _PRIVATE_NAMES
     ):
+        if document:
+            raise ValueError("文档附件名称无效，不能包含路径或使用已知的凭据文件名。")
         if image:
             raise ValueError("图片附件名称无效，不能包含路径或使用已知的凭据文件名。")
         raise ValueError("附件须为受支持的文本文件，不能包含路径或使用已知的凭据文件名。")
@@ -76,7 +89,15 @@ class ImageAttachmentInput:
     mime_type: str
 
 
-AttachmentInput = TextAttachmentInput | ImageAttachmentInput
+@dataclass(frozen=True)
+class DocumentAttachmentInput:
+    name: str
+    data: bytes
+    mime_type: str
+    reading_mode: str = "text"
+
+
+AttachmentInput = TextAttachmentInput | ImageAttachmentInput | DocumentAttachmentInput
 
 
 def validate_resource_uri(uri: str) -> None:
@@ -232,14 +253,73 @@ class ImageAttachment:
         return {"type": "image", **asdict(self)}
 
 
+def _document_format(name: str, mime_type: str, reading_mode: str) -> str:
+    _name(name, document=True)
+    extension = Path(name).suffix.lower()
+    if extension not in DOCUMENT_MIME_TYPES or mime_type != DOCUMENT_MIME_TYPES[extension]:
+        raise ValueError("文档须为 PDF、DOCX、PPTX 或 XLSX，文件扩展名与 MIME 类型必须一致。")
+    if reading_mode not in ("text", "visual") or (extension == ".xlsx" and reading_mode != "text"):
+        raise ValueError("文档阅读方式无效。XLSX 仅支持文字模式。")
+    return extension
+
+
+def _validate_document_signature(data: bytes, extension: str) -> None:
+    if extension == ".pdf":
+        if data.startswith(b"%PDF-") and b"%%EOF" in data[-1024:]:
+            return
+    elif data.startswith(b"PK\x03\x04"):
+        try:
+            with ZipFile(BytesIO(data)) as archive:
+                # Inspect the container directory without opening or decompressing any part.
+                archive.getinfo("[Content_Types].xml")
+                archive.getinfo(_OFFICE_PARTS[extension])
+            return
+        except (BadZipFile, KeyError, UnicodeError, ValueError):
+            pass
+    raise ValueError("文档文件签名无效，文件可能已损坏或格式不符。")
+
+
+@dataclass(frozen=True)
+class DocumentAttachment:
+    id: str
+    name: str
+    size_bytes: int
+    sha256: str
+    mime_type: str
+    reading_mode: str
+
+    def __post_init__(self) -> None:
+        _document_format(self.name, self.mime_type, self.reading_mode)
+        if (
+            not valid_id(self.id)
+            or type(self.size_bytes) is not int or not 0 < self.size_bytes <= MAX_DOCUMENT_BYTES
+            or not isinstance(self.sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", self.sha256)
+        ):
+            raise ValueError("文档附件元数据无效。")
+
+    def to_json(self) -> dict:
+        return {"type": "document", **asdict(self)}
+
+
+Attachment = TextAttachment | ImageAttachment | DocumentAttachment
+
+
+def attachment_only_prompt(items: Sequence[Attachment | AttachmentInput]) -> str:
+    if any(isinstance(item, (DocumentAttachment, DocumentAttachmentInput)) for item in items):
+        return DOCUMENT_ATTACHMENT_ONLY_PROMPT
+    if any(isinstance(item, (ImageAttachment, ImageAttachmentInput)) for item in items):
+        return IMAGE_ATTACHMENT_ONLY_PROMPT
+    return ATTACHMENT_ONLY_PROMPT
+
+
 @dataclass(frozen=True)
 class AttachmentBatch:
-    files: tuple[TextAttachment | ImageAttachment, ...]
+    files: tuple[Attachment, ...]
     submission_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.files, tuple) or not self.files or not all(
-            isinstance(item, (TextAttachment, ImageAttachment)) for item in self.files
+            isinstance(item, (TextAttachment, ImageAttachment, DocumentAttachment)) for item in self.files
         ):
             raise TypeError("附件引用无效。")
         if len(self.texts) > MAX_FILES:
@@ -250,6 +330,8 @@ class AttachmentBatch:
             raise ValueError("每次最多可发送 4 张图片。")
         if sum(item.size_bytes for item in self.images) > MAX_IMAGE_TOTAL_BYTES:
             raise ValueError("图片附件总大小超过 20 MiB。")
+        if len(self.documents) > MAX_DOCUMENTS:
+            raise ValueError("每轮最多可发送一份文档。")
         if self.submission_id is not None and not valid_id(self.submission_id):
             raise ValueError("附件发送标识无效。")
 
@@ -270,6 +352,8 @@ class AttachmentBatch:
                     files.append(TextAttachment(**item))
                 case "image":
                     files.append(ImageAttachment(**item))
+                case "document":
+                    files.append(DocumentAttachment(**item))
                 case _:
                     raise ValueError("附件类型无效。")
         return cls(tuple(files), data.get("submission_id"))
@@ -282,17 +366,36 @@ class AttachmentBatch:
     def images(self) -> tuple[ImageAttachment, ...]:
         return tuple(item for item in self.files if isinstance(item, ImageAttachment))
 
+    @property
+    def documents(self) -> tuple[DocumentAttachment, ...]:
+        return tuple(item for item in self.files if isinstance(item, DocumentAttachment))
+
 
 def prepare_attachments(uploads: Sequence[AttachmentInput], submission_id: str | None) -> AttachmentBatch:
-    if not 0 < len(uploads) <= MAX_FILES + MAX_IMAGES:
-        raise ValueError("每次最多可发送 10 个文本附件和 4 张图片。")
+    if not 0 < len(uploads) <= MAX_FILES + MAX_IMAGES + MAX_DOCUMENTS:
+        raise ValueError("每次最多可发送 10 个文本附件、4 张图片和一份文档。")
     image_count = sum(isinstance(upload, ImageAttachmentInput) for upload in uploads)
+    document_count = sum(isinstance(upload, DocumentAttachmentInput) for upload in uploads)
     if image_count > MAX_IMAGES:
         raise ValueError("每次最多可发送 4 张图片。")
-    if len(uploads) - image_count > MAX_FILES:
+    if document_count > MAX_DOCUMENTS:
+        raise ValueError("每轮最多可发送一份文档。")
+    if len(uploads) - image_count - document_count > MAX_FILES:
         raise ValueError("每次最多可发送 10 个文本附件。")
     files = []
     for upload in uploads:
+        if isinstance(upload, DocumentAttachmentInput):
+            extension = _document_format(upload.name, upload.mime_type, upload.reading_mode)
+            if not isinstance(upload.data, bytes):
+                raise TypeError("文档附件必须提供 bytes。")
+            if not 0 < len(upload.data) <= MAX_DOCUMENT_BYTES:
+                raise ValueError("文档附件不能为空，且每份最多 10 MiB。")
+            _validate_document_signature(upload.data, extension)
+            files.append(DocumentAttachment(
+                uuid4().hex, upload.name, len(upload.data), sha256(upload.data).hexdigest(),
+                upload.mime_type, upload.reading_mode,
+            ))
+            continue
         if isinstance(upload, ImageAttachmentInput):
             _name(upload.name, image=True)
             if not isinstance(upload.data, bytes):
@@ -378,10 +481,12 @@ class AttachmentStore:
             raise PermissionError("附件存储必须由当前用户独占。")
 
     @staticmethod
-    def _filename(item: TextAttachment | ImageAttachment) -> str:
+    def _filename(item: Attachment) -> str:
+        if isinstance(item, DocumentAttachment):
+            return item.id + Path(item.name).suffix.lower()
         return item.id + (_IMAGE_EXTENSIONS[item.mime_type] if isinstance(item, ImageAttachment) else ".txt")
 
-    def _read(self, directory: int, item: TextAttachment | ImageAttachment) -> bytes:
+    def _read(self, directory: int, item: Attachment) -> bytes:
         fd = os.open(self._filename(item), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(fd, "rb") as stream:
             self._private(stream.fileno())
@@ -403,6 +508,10 @@ class AttachmentStore:
         with self._session_directory(session_id) as (_, directory):
             return self._read(directory, item)
 
+    def read_document(self, session_id: str, item: DocumentAttachment) -> bytes:
+        with self._session_directory(session_id) as (_, directory):
+            return self._read(directory, item)
+
     def write(self, session_id: str, batch: AttachmentBatch, uploads: Sequence[AttachmentInput]) -> None:
         with self._session_directory(session_id, create=True) as (_, directory):
             for item, upload in zip(batch.files, uploads, strict=True):
@@ -410,7 +519,7 @@ class AttachmentStore:
                 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
                 try:
                     with os.fdopen(fd, "wb") as stream:
-                        stream.write(upload.data if isinstance(upload, ImageAttachmentInput) else upload.text.encode("utf-8"))
+                        stream.write(upload.text.encode("utf-8") if isinstance(upload, TextAttachmentInput) else upload.data)
                         stream.flush()
                         os.fchmod(stream.fileno(), 0o400)
                         os.fsync(stream.fileno())

@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING, Any
 from saturnus import ValidationError
 
 from .attachments import (
-    ATTACHMENT_ONLY_PROMPT,
-    IMAGE_ATTACHMENT_ONLY_PROMPT,
+    Attachment,
     AttachmentInput,
+    DocumentAttachment,
     ImageAttachment,
-    TextAttachment,
     TextResourceInput,
+    attachment_only_prompt,
     prepare_attachments,
     resource_snapshot_id,
     valid_id,
@@ -651,7 +651,9 @@ class Operations:
     ) -> bool:
         session = self._app._session
 
-        def identity(item: TextAttachment | ImageAttachment):
+        def identity(item: Attachment):
+            if isinstance(item, DocumentAttachment):
+                return (item.name, item.sha256, item.mime_type, item.reading_mode)
             if isinstance(item, ImageAttachment):
                 return (item.name, item.sha256, item.mime_type)
             return item.id if item.source else (item.name, item.sha256)
@@ -667,7 +669,7 @@ class Operations:
                     item, = prepare_attachments((entry,), submission_id).files
                     received.append(identity(item))
             committed = [identity(item) for item in batch.files]
-            default = IMAGE_ATTACHMENT_ONLY_PROMPT if batch.images else ATTACHMENT_ONLY_PROMPT
+            default = attachment_only_prompt(batch.files)
             if (session.messages.get(index)["content"] != (prompt if prompt.strip() else default)
                 or committed != received):
                 raise ValueError("该附件发送标识已用于不同内容。")

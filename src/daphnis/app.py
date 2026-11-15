@@ -14,13 +14,12 @@ from saturnus import ChatClient
 
 from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
-    ATTACHMENT_ONLY_PROMPT,
-    IMAGE_ATTACHMENT_ONLY_PROMPT,
     AttachmentBatch,
     AttachmentInput,
     ImageAttachmentInput,
     TextAttachmentInput,
     TextResourceInput,
+    attachment_only_prompt,
     prepare_attachments,
 )
 from .compaction import CompactionCheckpoint, CompactionError
@@ -444,6 +443,8 @@ class Application:
         if any(isinstance(item, ImageAttachmentInput) for item in uploads):
             require_image_input(self._model)
         batch = prepare_attachments(uploads, submission_id) if uploads else None
+        if batch and batch.documents:
+            raise ValueError("当前模型不支持文档输入。")
         if prompt_input and (uploads or submission_id is not None):
             raise ValueError("MCP Prompt 必须作为独立任务运行。")
         if prompt_input:
@@ -454,7 +455,7 @@ class Application:
             ):
                 raise ValueError("MCP 资源包含未确认的敏感内容。")
         if batch and isinstance(prompt, str) and not prompt.strip():
-            prompt = IMAGE_ATTACHMENT_ONLY_PROMPT if batch.images else ATTACHMENT_ONLY_PROMPT
+            prompt = attachment_only_prompt(batch.files)
         if self._mcp_pending:
             async with self._state_lock:
                 await self._refresh_pending_mcp()

@@ -4,11 +4,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from .attachments import (
-    ATTACHMENT_ONLY_PROMPT,
-    IMAGE_ATTACHMENT_ONLY_PROMPT,
-    AttachmentBatch,
-)
+from .attachments import AttachmentBatch, attachment_only_prompt
 from .redaction import Redactor
 from .terminal_text import sanitize_terminal
 
@@ -72,10 +68,9 @@ def build_title_source(
             )
         batch = attachment_refs.get(index)
         role_label = role.capitalize() + ": "
-        default = IMAGE_ATTACHMENT_ONLY_PROMPT if batch and batch.images else ATTACHMENT_ONLY_PROMPT
         if (
             isinstance(content, str) and (text := visible(content))
-            and not (batch and text == default)
+            and not (batch and text == attachment_only_prompt(batch.files))
         ):
             texts[order] = role_label + text
             order += 1
