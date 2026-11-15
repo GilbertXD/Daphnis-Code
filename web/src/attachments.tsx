@@ -52,7 +52,8 @@ export function AttachmentLabels({ files, remove }: {
   remove?: (id: string) => void
 }) {
   if (!files.length) return null
-  return <ul className="attachment-labels" aria-label={remove ? '待发送附件' : '消息附件'}>
+  return <ul className={remove ? 'attachment-labels attachment-labels-pending' : 'attachment-labels'}
+    aria-label={remove ? '待发送附件' : '消息附件'}>
     {files.map(({ id, name }) => <li key={id}>
       <span>{name}</span>
       {remove && <button type="button" aria-label={`移除 ${name}`} onClick={() => remove(id)}>×</button>}
