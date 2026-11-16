@@ -12,6 +12,7 @@ from unittest.mock import patch
 import httpx
 
 from daphnis import History, Operations, TurnStatus
+from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.mcp import MCPConnection, MCPPromptError, MCPResourceError
 from daphnis.runtime import open_operations
@@ -30,6 +31,86 @@ def tool_call(name, call_id, **arguments):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sessions_share_one_connection_and_select_their_own_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            advertised = {}
+
+            def handler(request):
+                body = json.loads(request.content)
+                messages = body["messages"]
+                if messages[0]["content"] == TITLE_PROMPT:
+                    message, finish = {"role": "assistant", "content": "Title"}, "stop"
+                elif messages[-1]["role"] == "tool":
+                    result = json.loads(messages[-1]["content"])
+                    message, finish = {"role": "assistant", "content": str(result["structured_content"]["sum"])}, "stop"
+                else:
+                    prompt = messages[-1]["content"]
+                    advertised[prompt] = [item["function"]["name"] for item in body["tools"]]
+                    call = tool_call(advertised[prompt][0], "same-id", a=-1 if prompt == "A" else 30, b=12)
+                    message, finish = {"role": "assistant", "tool_calls": [call]}, "tool_calls"
+                return httpx.Response(200, json={"choices": [{
+                    "index": 0, "message": message, "finish_reason": finish,
+                }]})
+
+            app = Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash", interactive=True,
+                history=History(root / "sessions"), observe_model_io=True,
+                connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+            )
+            ops = Operations(app)
+            a = ops.initial_session_id
+            b = (await ops.new_session(session_id=a)).id
+            await ops.connect_mcp("shared", sys.executable, [str(DEMO), directory])
+            add, special = ops.list_mcp_tools()
+            self.assertNotIn(add, ops.effective_tools(a))
+            self.assertNotIn(add, ops.effective_tools(b))
+            await ops.set_tools((add,), session_id=a)
+            ops.subscribe("tool.approval_requested", lambda event: self._approve_event(ops, event))
+            model_requests = []
+            ops.subscribe("model.request", model_requests.append)
+            client = app._clients["deepseek"]
+            turn = asyncio.create_task(ops.send("A", stream=False, session_id=a))
+            try:
+                async with asyncio.timeout(5):
+                    while not (root / "calls").exists():
+                        await asyncio.sleep(0.01)
+                    with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                        await ops.set_tools((), session_id=a)
+                    with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                        await ops.delete_session(a)
+                    with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                        await ops.refresh_mcp("shared")
+                    await ops.set_model("deepseek", "deepseek-flash", session_id=b)
+                    await ops.set_tools((special,), session_id=b)
+                    self.assertEqual((await ops.send("B", stream=False, session_id=b)).status, TurnStatus.COMPLETED)
+                    self.assertFalse(turn.done())
+                    self.assertIs(app._clients["deepseek"], client)
+                    self.assertEqual(advertised, {"A": [add], "B": [special]})
+                    self.assertEqual(ops.message_snapshot(b)[-1]["content"], "42")
+                    matching = {event.session_id: event.data["body"]["messages"][-1]["content"]
+                                for event in model_requests if event.data["request_number"] == 1
+                                and event.data.get("purpose") != "title"}
+                    self.assertEqual(matching, {a: "A", b: "B"})
+                    project = await ops.create_project("Other", session_id=b)
+                    runtime = app._load_runtime(b)
+                    await ops.move_session(b, project.id)
+                    self.assertEqual(ops.restore_session(b).project_id, project.id)
+                    self.assertIs(app._load_runtime(b), runtime)
+                    await ops.delete_session(b)
+                    with self.assertRaises(FileNotFoundError):
+                        ops.restore_session(b)
+                    await ops.cancel(a)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await turn
+            finally:
+                await ops.close()
+                await asyncio.gather(turn, return_exceptions=True)
+
+    @staticmethod
+    async def _approve_event(ops, event):
+        ops.resolve_approval(event.data["request_id"], ApprovalDecision.ALLOW_ONCE, session_id=event.session_id)
+
     async def test_prompt_protocol_pagination_payloads_and_failure_isolation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,7 +174,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ValueError, "未找到"):
                     await ops.get_mcp_prompt("both", "missing", {})
                 self.assertEqual(await ops.get_mcp_prompt("both", "bundle", {}), bundle)
-                self.assertEqual(ops.message_snapshot(), [])
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), [])
                 self.assertEqual(ops.list_sessions(), ())
             finally:
                 await ops.close()
@@ -175,7 +256,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertLogs("daphnis.runtime", "WARNING"):
                     ops = await open_operations(root)
                 try:
-                    self.assertIn("mcp__good__add", ops.effective_tools)
+                    self.assertIn("mcp__good__add", ops.list_mcp_tools())
+                    self.assertNotIn("mcp__good__add", ops.effective_tools(ops.initial_session_id))
                     statuses = {status.name: status for status in ops.mcp_status()}
                     self.assertEqual(statuses["broken"].state, "Error")
                     self.assertTrue(statuses["broken"].error)
@@ -394,6 +476,7 @@ asyncio.run(main())
             )
             app.events.on("tool.approval_requested", requests.put_nowait)
             ops = Operations(app)
+            session_id = ops.initial_session_id
             log = root / "calls"
 
             def record_execution(event):
@@ -410,11 +493,11 @@ asyncio.run(main())
             ):
                 async with asyncio.timeout(5):
                     event = await requests.get()
-                pending = ops.pending_approval
+                pending = ops.pending_approval(session_id)
                 self.assertEqual(event.data["tool_call_id"], call_id)
                 self.assertEqual(pending.details["server"], server)
                 self.assertTrue(
-                    ops.resolve_approval(pending.request_id, decision)
+                    ops.resolve_approval(pending.request_id, decision, session_id=session_id)
                 )
                 return pending.details
 
@@ -426,10 +509,10 @@ asyncio.run(main())
                 add, special = ops.list_mcp_tools()
                 self.assertEqual(add, "mcp__demo__add")
                 self.assertRegex(special, r"^mcp__demo____[0-9a-f]{32}$")
-                self.assertTrue({add, special}.issubset(ops.enabled_tools))
+                self.assertTrue({add, special}.isdisjoint(ops.enabled_tools(session_id)))
                 self.assertEqual(ops.list_mcp_servers(), ("demo",))
-                await ops.set_tools(("list_directory", add, special))
-                saved = ops.session.id
+                await ops.set_tools(("list_directory", add, special), session_id=session_id)
+                saved = ops.session(session_id).id
                 calls[:] = [
                     tool_call("list_directory", "builtin"),
                     tool_call(add, "approved", a=12, b=30),
@@ -439,7 +522,7 @@ asyncio.run(main())
                     tool_call(add, "large-text", a=-3, b=0),
                     tool_call(add, "large-structure", a=-4, b=0),
                 ]
-                send = asyncio.create_task(ops.send("exercise", stream=False))
+                send = asyncio.create_task(ops.send("exercise", stream=False, session_id=session_id))
                 details = await approve("approved", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual(details["arguments"], {"a": 12, "b": 30})
                 await approve("denied", ApprovalDecision.DENY)
@@ -469,59 +552,59 @@ asyncio.run(main())
                     ["add 12 30", "add 1 2", "math.add -2 0", "add -3 0", "add -4 0"],
                 )
 
-                ops.set_approval_mode("ask")
+                ops.set_approval_mode("ask", session_id=session_id)
                 calls[:] = [
                     tool_call(add, "ask-first", a=1, b=1),
                     tool_call(add, "ask-again", a=1, b=2),
                 ]
-                send = asyncio.create_task(ops.send("ask twice", stream=False))
+                send = asyncio.create_task(ops.send("ask twice", stream=False, session_id=session_id))
                 await approve("ask-first")
                 await approve("ask-again")
                 self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
-                ops.set_approval_mode("auto")
+                ops.set_approval_mode("auto", session_id=session_id)
                 calls[:] = [tool_call(add, "trust-cleared", a=3, b=4)]
-                send = asyncio.create_task(ops.send("return to auto", stream=False))
+                send = asyncio.create_task(ops.send("return to auto", stream=False, session_id=session_id))
                 await approve("trust-cleared", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
-                ops.set_approval_mode("full")
+                ops.set_approval_mode("full", session_id=session_id)
                 calls[:] = [tool_call(special, "full", a=3, b=4)]
-                self.assertEqual((await ops.send("full", stream=False)).status, TurnStatus.COMPLETED)
+                self.assertEqual((await ops.send("full", stream=False, session_id=session_id)).status, TurnStatus.COMPLETED)
                 self.assertEqual(outcomes[-1]["structured_content"], {"sum": 7})
                 self.assertTrue(requests.empty())
-                ops.set_approval_mode("auto")
+                ops.set_approval_mode("auto", session_id=session_id)
 
-                await ops.new_session()
+                session_id = (await ops.new_session(session_id=session_id)).id
                 calls[:] = [tool_call(add, "slow", a=-1, b=0)]
                 with patch("daphnis.mcp._CALL_TIMEOUT", 0.1):
-                    send = asyncio.create_task(ops.send("timeout", stream=False))
+                    send = asyncio.create_task(ops.send("timeout", stream=False, session_id=session_id))
                     await approve("slow")
                     self.assertEqual(
                         (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
                     )
                 self.assertEqual(outcomes[-1]["error"]["code"], "mcp_timeout")
-                self.assertIsNone(ops.pending_approval)
+                self.assertIsNone(ops.pending_approval(session_id))
 
                 calls[:] = [tool_call(add, "cancel", a=-1, b=1)]
-                send = asyncio.create_task(ops.send("cancel", stream=False))
+                send = asyncio.create_task(ops.send("cancel", stream=False, session_id=session_id))
                 await approve("cancel")
                 async with asyncio.timeout(5):
                     while "add -1 1" not in log.read_text():
                         await asyncio.sleep(0.02)
                 with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
                     await ops.disconnect_mcp("demo")
-                await ops.cancel()
+                await ops.cancel(session_id)
                 with self.assertRaises(asyncio.CancelledError):
                     await send
-                self.assertIsNone(ops.pending_approval)
+                self.assertIsNone(ops.pending_approval(session_id))
                 pid = int((root / "pid").read_text())
-                await ops.set_tools(("list_directory", add))
+                await ops.set_tools(("list_directory", add), session_id=session_id)
                 snapshot = app._tools.select([add]).bind(
-                    session=app._runtime.session, events=app.events, turn_id="old-turn"
+                    session=app._runtimes[session_id].session, events=app.events, turn_id="old-turn"
                 )
                 await ops.disconnect_mcp("demo")
                 self.assertNotIn(add, ops.all_tools)
-                self.assertIn(add, ops.enabled_tools)
-                self.assertEqual(ops.effective_tools, ("list_directory",))
+                self.assertIn(add, ops.enabled_tools(session_id))
+                self.assertEqual(ops.effective_tools(session_id), ("list_directory",))
                 offline = await snapshot.execute(tool_call(add, "offline", a=1, b=2))
                 self.assertEqual(offline.value["error"]["code"], "mcp_unavailable")
                 if os.name == "posix":
@@ -529,15 +612,15 @@ asyncio.run(main())
                         os.kill(pid, 0)
 
                 await ops.reconnect_mcp("demo")
-                self.assertIn(add, ops.effective_tools)
-                self.assertNotIn(special, ops.effective_tools)
+                self.assertIn(add, ops.effective_tools(session_id))
+                self.assertNotIn(special, ops.effective_tools(session_id))
                 await ops.disconnect_mcp("demo")
-                ops.restore_session(saved)
-                self.assertIn(add, ops.enabled_tools)
-                self.assertNotIn(add, ops.effective_tools)
+                session_id = ops.restore_session(saved).id
+                self.assertIn(add, ops.enabled_tools(session_id))
+                self.assertNotIn(add, ops.effective_tools(session_id))
                 await ops.reconnect_mcp("demo")
                 calls[:] = [tool_call(add, "reconnected", a=2, b=3)]
-                send = asyncio.create_task(ops.send("reconnected", stream=False))
+                send = asyncio.create_task(ops.send("reconnected", stream=False, session_id=session_id))
                 await approve("reconnected", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual(
                     (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
@@ -548,7 +631,7 @@ asyncio.run(main())
                 (root / "changed").unlink()
                 await ops.refresh_mcp("demo")
                 calls[:] = [tool_call(add, "definition-changed", a=4, b=5)]
-                send = asyncio.create_task(ops.send("changed", stream=False))
+                send = asyncio.create_task(ops.send("changed", stream=False, session_id=session_id))
                 await approve("definition-changed", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual(
                     (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
@@ -561,10 +644,10 @@ asyncio.run(main())
                 )
                 backup = "mcp__backup__add"
                 backup_pid = int((backup_dir / "pid").read_text())
-                self.assertNotIn(backup, ops.enabled_tools)
-                await ops.set_tools((*ops.enabled_tools, backup))
+                self.assertNotIn(backup, ops.enabled_tools(session_id))
+                await ops.set_tools((*ops.enabled_tools(session_id), backup), session_id=session_id)
                 calls[:] = [tool_call(backup, "separate-server", a=2, b=4)]
-                send = asyncio.create_task(ops.send("other server", stream=False))
+                send = asyncio.create_task(ops.send("other server", stream=False, session_id=session_id))
                 await approve("separate-server", server="backup")
                 self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
                 with self.assertRaisesRegex(RuntimeError, "MCP_MISSING_TEST_KEY"):
@@ -577,13 +660,13 @@ asyncio.run(main())
                     async with asyncio.timeout(5):
                         while ops.mcp_status()[0].state != "Error":
                             await asyncio.sleep(0.02)
-                    self.assertIn(add, ops.enabled_tools)
-                    self.assertNotIn(add, ops.effective_tools)
+                    self.assertIn(add, ops.enabled_tools(session_id))
+                    self.assertNotIn(add, ops.effective_tools(session_id))
 
-                await ops.new_session()
+                session_id = (await ops.new_session(session_id=session_id)).id
                 advertised.clear()
                 calls[:] = [tool_call(backup, "backup", a=4, b=7)]
-                send = asyncio.create_task(ops.send("backup", stream=False))
+                send = asyncio.create_task(ops.send("backup", stream=False, session_id=session_id))
                 await approve("backup", server="backup")
                 self.assertEqual(
                     (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
@@ -592,15 +675,15 @@ asyncio.run(main())
                 if os.name == "posix":
                     self.assertNotIn(add, advertised)
                     await ops.reconnect_mcp("demo")
-                    self.assertIn(add, ops.effective_tools)
+                    self.assertIn(add, ops.effective_tools(session_id))
                     self.assertNotIn((saved, add), app._trusted_tools)
                     pid = int((root / "pid").read_text())
                 (root / "changed").touch()
                 await ops.refresh_mcp("demo")
                 self.assertIn("mcp__demo__sum", ops.list_mcp_tools())
-                self.assertNotIn("mcp__demo__sum", ops.enabled_tools)
-                self.assertIn(add, ops.enabled_tools)
-                self.assertNotIn(add, ops.effective_tools)
+                self.assertNotIn("mcp__demo__sum", ops.enabled_tools(session_id))
+                self.assertIn(add, ops.enabled_tools(session_id))
+                self.assertNotIn(add, ops.effective_tools(session_id))
                 (root / "invalid").touch()
                 with self.assertRaisesRegex(RuntimeError, "保留上次目录"):
                     await ops.refresh_mcp("demo")
@@ -754,10 +837,11 @@ asyncio.run(main())
             ops = Operations(app)
 
             async def approve(event):
-                pending = ops.pending_approval
+                pending = ops.pending_approval(ops.initial_session_id)
                 self.assertEqual(pending.details["server"], "remote")
                 ops.resolve_approval(
-                    pending.request_id, ApprovalDecision.ALLOW_ONCE
+                    pending.request_id, ApprovalDecision.ALLOW_ONCE,
+                    session_id=ops.initial_session_id
                 )
 
             app.events.on("tool.approval_requested", approve)
@@ -807,9 +891,9 @@ asyncio.run(main())
                     await connection.get_prompt("greeting", {})
                 self.assertTrue(connection.available)
                 self.assertNotIn("/unexpected", received)
-                await ops.set_tools(("mcp__remote__add",))
+                await ops.set_tools(("mcp__remote__add",), session_id=ops.initial_session_id)
                 await asyncio.wait_for(subscribed.wait(), 5)
-                send = asyncio.create_task(ops.send("add", stream=False))
+                send = asyncio.create_task(ops.send("add", stream=False, session_id=ops.initial_session_id))
                 async with asyncio.timeout(5):
                     await changed.wait()
                     while not app._mcp_pending:
@@ -826,13 +910,13 @@ asyncio.run(main())
                 async with asyncio.timeout(5):
                     while target not in ops.list_mcp_tools():
                         await asyncio.sleep(0.01)
-                self.assertEqual(ops.enabled_tools, ("mcp__remote__add",))
-                self.assertEqual(ops.effective_tools, ())
-                await ops.set_tools((target,), keep_unavailable=True)
+                self.assertEqual(ops.enabled_tools(ops.initial_session_id), ("mcp__remote__add",))
+                self.assertEqual(ops.effective_tools(ops.initial_session_id), ())
+                await ops.set_tools((target,), keep_unavailable=True, session_id=ops.initial_session_id)
                 advertised.clear()
                 self.assertEqual(
                     (
-                        await asyncio.wait_for(ops.send("double", stream=False), 5)
+                        await asyncio.wait_for(ops.send("double", stream=False, session_id=ops.initial_session_id), 5)
                     ).status,
                     TurnStatus.COMPLETED,
                 )
@@ -843,8 +927,8 @@ asyncio.run(main())
                 async with asyncio.timeout(5):
                     while ops.mcp_status()[-1].state != "Error":
                         await asyncio.sleep(0.02)
-                self.assertNotIn(target, ops.effective_tools)
-                self.assertIn(target, ops.enabled_tools)
+                self.assertNotIn(target, ops.effective_tools(ops.initial_session_id))
+                self.assertIn(target, ops.enabled_tools(ops.initial_session_id))
             finally:
                 finish_call.set()
                 await ops.close()

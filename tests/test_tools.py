@@ -110,8 +110,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 ops = Operations(app)
-                self.assertEqual((await ops.send("inspect", stream=False)).status, TurnStatus.COMPLETED)
-                saved = (history.directory / f"{ops.session.id}.json").read_text()
+                self.assertEqual((await ops.send("inspect", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+                saved = (history.directory / f"{ops.initial_session_id}.json").read_text()
             finally:
                 await app.close()
             with patch.dict(os.environ, {"MIMO_API_KEY": secret}):

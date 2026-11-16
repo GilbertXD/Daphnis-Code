@@ -109,24 +109,24 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             ops = runtime()
             try:
                 result = await ops.send("Explain", attachments=[TextAttachmentInput("code.py", "retry-marker\nExact bytes")],
-                                        stream=False, submission_id="b" * 32)
+                                        stream=False, submission_id="b" * 32, session_id=ops.initial_session_id)
                 self.assertEqual(result.status, TurnStatus.FAILED)
-                sid = ops.session.id
+                sid = ops.initial_session_id
                 refs = history.load(sid).attachment_refs
                 self.assertIn("retry-marker\nExact bytes", requests[-1]["messages"][-1]["content"])
-                self.assertEqual(ops.message_snapshot(), [{"role": "user", "content": "Explain"}])
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), [{"role": "user", "content": "Explain"}])
             finally:
                 await ops.close()
 
             ops = runtime()
             try:
                 ops.restore_session(sid)
-                self.assertTrue(ops.attachment_submitted("b" * 32, "Explain", [TextAttachmentInput("code.py", "retry-marker\nExact bytes")]))
-                result = await ops.retry_failed_user(ops.recovery.key, stream=False)
+                self.assertTrue(ops.attachment_submitted("b" * 32, "Explain", [TextAttachmentInput("code.py", "retry-marker\nExact bytes")], session_id=sid))
+                result = await ops.retry_failed_user(ops.recovery(sid).key, stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertEqual(history.load(sid).attachment_refs, refs)
                 self.assertIn("retry-marker\nExact bytes", requests[-1]["messages"][-1]["content"])
-                await ops.send("Next", stream=False)
+                await ops.send("Next", stream=False, session_id=sid)
                 self.assertIn(refs[0].files[0].id, requests[-1]["messages"][1]["content"])
                 self.assertNotIn("retry-marker", requests[-1]["messages"][1]["content"])
                 from daphnis.compaction import CompactionCheckpoint
@@ -141,25 +141,25 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(history.attachments.read(sid, refs[0].files[0]), "retry-marker\nExact bytes")
 
                 large = "large-marker " * 5500
-                await ops.set_tools(["read_attachment", "search_attachment"])
-                result = await ops.send("", attachments=[TextAttachmentInput("large.txt", large)], stream=False)
+                await ops.set_tools(["read_attachment", "search_attachment"], session_id=sid)
+                result = await ops.send("", attachments=[TextAttachmentInput("large.txt", large)], stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertIn("read_attachment", requests[-1]["messages"][-1]["content"])
                 self.assertNotIn("large-marker", requests[-1]["messages"][-1]["content"])
 
-                await ops.set_tools(["read_attachment"])
-                before, count = ops.message_snapshot(), len(requests)
-                result = await ops.send("Reject", attachments=[TextAttachmentInput("large.txt", large)], stream=False)
+                await ops.set_tools(["read_attachment"], session_id=sid)
+                before, count = ops.message_snapshot(sid), len(requests)
+                result = await ops.send("Reject", attachments=[TextAttachmentInput("large.txt", large)], stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.FAILED)
                 self.assertIn("无法安全内联", result.error)
-                self.assertEqual(ops.message_snapshot(), before)
+                self.assertEqual(ops.message_snapshot(sid), before)
                 self.assertEqual(len(requests), count)
                 with patch.object(history.attachments, "write", side_effect=OSError("disk full")):
-                    result = await ops.send("Reject", attachments=[TextAttachmentInput("small.txt", "small")], stream=False)
+                    result = await ops.send("Reject", attachments=[TextAttachmentInput("small.txt", "small")], stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.FAILED)
-                self.assertEqual(ops.message_snapshot(), before)
+                self.assertEqual(ops.message_snapshot(sid), before)
                 with patch.object(history, "save", side_effect=OSError("disk full")):
-                    result = await ops.send("Reject", attachments=[TextAttachmentInput("small.txt", "small")], stream=False)
+                    result = await ops.send("Reject", attachments=[TextAttachmentInput("small.txt", "small")], stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.FAILED)
                 self.assertEqual(history.load(sid).messages.snapshot(), before)
                 self.assertEqual(set(history.load(sid).attachment_refs), {0, 4})
@@ -369,9 +369,9 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             ops = runtime("tiny")
             try:
                 # Smaller than 4,000 tokens, but over five percent of the tiny window's available room.
-                failed = await ops.send("read", attachments=[TextAttachmentInput("short.txt", "abc " * 400)], stream=False)
+                failed = await ops.send("read", attachments=[TextAttachmentInput("short.txt", "abc " * 400)], stream=False, session_id=ops.initial_session_id)
                 self.assertIn("无法安全内联", failed.error)
-                self.assertEqual(ops.message_snapshot(), [])
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), [])
                 self.assertEqual(bodies, [])
             finally:
                 await ops.close()
@@ -380,16 +380,16 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             try:
                 approved = asyncio.Event()
                 ops.subscribe("tool.approval_requested", lambda event: approved.set())
-                ops.set_approval_mode(ApprovalMode.ASK)
-                task = asyncio.create_task(ops.send("read", attachments=uploads, stream=False))
+                ops.set_approval_mode(ApprovalMode.ASK, session_id=ops.initial_session_id)
+                task = asyncio.create_task(ops.send("read", attachments=uploads, stream=False, session_id=ops.initial_session_id))
                 try:
                     await asyncio.wait_for(approved.wait(), 3)
                 finally:
-                    await ops.cancel()
+                    await ops.cancel(ops.initial_session_id)
                 with self.assertRaises(asyncio.CancelledError):
                     await task
-                sid = ops.session.id
-                self.assertEqual(ops.recovery.kind, RecoveryKind.INTERRUPTED_TURN)
+                sid = ops.initial_session_id
+                self.assertEqual(ops.recovery(ops.initial_session_id).kind, RecoveryKind.INTERRUPTED_TURN)
                 refs = history.load(sid).attachment_refs
             finally:
                 await ops.close()
@@ -397,7 +397,7 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
             ops = runtime("large")
             try:
                 ops.restore_session(sid)
-                result = await ops.continue_interrupted_turn(ops.recovery.key, stream=False)
+                result = await ops.continue_interrupted_turn(ops.recovery(sid).key, stream=False, session_id=sid)
                 self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertEqual(history.load(sid).attachment_refs, refs)
                 self.assertEqual(len(list((history.attachments.directory / sid).glob("*.txt"))), 2)

@@ -95,7 +95,7 @@ class WebTests(unittest.TestCase):
                     })
                 return httpx.Response(503, json={"error": {"message": "Title unavailable"}})
             self.requests.append(body)
-            self.titles_at_reply.append(self.history.load(self.bridge.ops.session.id).title)
+            self.titles_at_reply.append(self.history.load(self.bridge.session_id).title)
             last = body["messages"][-1]
             if "Summarize the conversation" in body["messages"][0]["content"]:
                 if self.summary_mode == "hold":
@@ -326,7 +326,7 @@ class WebTests(unittest.TestCase):
         self.assertTrue(self.summary_stopped.is_set())
 
         frame, _ = self.manual_compaction_outcome("cancelled")
-        self.assertFalse(self.bridge.ops.running)
+        self.assertFalse(self.bridge.ops.running(self.bridge.session_id))
         self.assertEqual(frame["state"]["messages"], before)
         self.assertIsNone(self.history.load(sid).compaction)
         self.command("send", sid, 202, prompt="Continue without a checkpoint")

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .agent import TurnResult
     from .app import Application
     from .history import SessionInfo, SessionScan
+    from .session_runtime import SessionRuntime
     from .token_budget import TokenBudget
     from .tools import ApprovalRequest
     from .usage import UsageTotals
@@ -54,14 +55,19 @@ class SessionSnapshot:
 
 
 class Operations:
-    """Use the shared runtime directly; each call reads its current state."""
+    """Shared application operations and explicitly targeted Session operations."""
 
-    def __init__(self, app: "Application") -> None:
+    def __init__(self, app: "Application", *, initial_session_id: str | None = None) -> None:
         self._app = app
+        self.initial_session_id = initial_session_id if initial_session_id is not None else app.initial_session_id
+        if initial_session_id is not None:
+            self.restore_session(initial_session_id)
 
-    @property
-    def session(self) -> SessionSnapshot:
-        session = self._app._runtime.session
+    def _runtime(self, session_id: str) -> "SessionRuntime":
+        return self._app._load_runtime(session_id)
+
+    def session(self, session_id: str) -> SessionSnapshot:
+        session = self._runtime(session_id).session
         workspace = Path(session.workspace)
         project_id = self._app._history.resolve_project_id(session.project_id, workspace)
         return SessionSnapshot(
@@ -69,85 +75,74 @@ class Operations:
             session.title, project_id,
         )
 
-    def message_snapshot(self) -> list[dict[str, Any]]:
+    def message_snapshot(self, session_id: str) -> list[dict[str, Any]]:
         """Return detached copies of committed messages for display."""
-        return self._app._runtime.session.messages.snapshot()
+        return self._runtime(session_id).session.messages.snapshot()
 
     def subscribe(self, name: str, callback: Callback) -> Callable[[], None]:
         """Subscribe to detached event snapshots and return an unsubscribe function."""
         return self._app.events.on(name, callback)
 
-    @property
-    def model(self) -> ModelInfo:
-        return self._app._model
+    def model(self, session_id: str) -> ModelInfo:
+        return self._app._session_model(self._runtime(session_id).session)
 
-    @property
-    def thinking(self) -> str | None:
-        return self._app._runtime.session.thinking
+    def thinking(self, session_id: str) -> str | None:
+        return self._runtime(session_id).session.thinking
 
     @property
     def all_tools(self) -> tuple[str, ...]:
         return self._app._all_tools
 
-    @property
-    def enabled_tools(self) -> tuple[str, ...]:
-        return self._app._runtime.session.enabled_tools
+    def enabled_tools(self, session_id: str) -> tuple[str, ...]:
+        return self._runtime(session_id).session.enabled_tools
 
-    @property
-    def effective_tools(self) -> tuple[str, ...]:
+    def effective_tools(self, session_id: str) -> tuple[str, ...]:
         available = set(self.all_tools)
-        return tuple(name for name in self.enabled_tools if name in available)
+        return tuple(name for name in self.enabled_tools(session_id) if name in available)
 
-    @property
-    def running(self) -> bool:
-        return self._app._runtime.running
+    def running(self, session_id: str) -> bool:
+        return self._runtime(session_id).running
 
-    @property
-    def approval_mode(self) -> ApprovalMode:
-        return self._app._runtime.approval_mode
+    def approval_mode(self, session_id: str) -> ApprovalMode:
+        return self._runtime(session_id).approval_mode
 
-    def set_approval_mode(self, mode: ApprovalMode | str) -> None:
+    def set_approval_mode(self, mode: ApprovalMode | str, *, session_id: str) -> None:
         app = self._app
-        app._ensure_idle()
-        app._runtime.approval_mode = ApprovalMode(mode)
-        if app._runtime.approval_mode is ApprovalMode.ASK:
-            app._trusted_tools.clear()
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
+        runtime.approval_mode = ApprovalMode(mode)
+        if runtime.approval_mode is ApprovalMode.ASK:
+            app._revoke_session_trust(session_id)
 
-    @property
-    def pending_approval(self) -> "ApprovalRequest | None":
-        return deepcopy(self._app._runtime.pending_approval)
+    def pending_approval(self, session_id: str) -> "ApprovalRequest | None":
+        return deepcopy(self._runtime(session_id).pending_approval)
 
-    @property
-    def session_usage(self) -> "UsageTotals":
-        return self._app._runtime.usage.session
+    def session_usage(self, session_id: str) -> "UsageTotals":
+        return self._runtime(session_id).usage.session
 
-    @property
-    def turn_usage(self) -> "UsageTotals | None":
-        return self._app._runtime.usage.turn
+    def turn_usage(self, session_id: str) -> "UsageTotals | None":
+        return self._runtime(session_id).usage.turn
 
-    @property
-    def context_budget(self) -> "TokenBudget | None":
-        observed = self._app._runtime.last_budget
-        session = self.session
+    def context_budget(self, session_id: str) -> "TokenBudget | None":
+        runtime = self._runtime(session_id)
+        session, observed = runtime.session, runtime.last_budget
         if observed is not None and observed[:2] == (session.provider, session.model_id):
             return observed[2]
         return None
 
-    @property
-    def compacting(self) -> bool:
-        return self._app._runtime.compacting
+    def compacting(self, session_id: str) -> bool:
+        return self._runtime(session_id).compacting
 
-    @property
-    def compacted_through(self) -> int:
-        checkpoint = self._app._runtime.session.compaction
+    def compacted_through(self, session_id: str) -> int:
+        checkpoint = self._runtime(session_id).session.compaction
         return checkpoint.through if checkpoint else 0
 
     def configured(self, provider: str) -> bool:
         return provider in self._app._connections
 
-    def list_models(self) -> dict[str, tuple[ModelInfo, ...]]:
+    def list_models(self, session_id: str) -> dict[str, tuple[ModelInfo, ...]]:
         catalog = self._app._catalog
-        model = self.model
+        model = self.model(session_id)
         providers = dict.fromkeys(
             ("deepseek", "mimo", *(item.provider for item in catalog), model.provider)
         )
@@ -158,11 +153,12 @@ class Operations:
             groups[model.provider] = (*groups[model.provider], model)
         return groups
 
-    async def set_model(self, provider: str, model_id: str) -> str:
+    async def set_model(self, provider: str, model_id: str, *, session_id: str) -> str:
         app = self._app
-        app._ensure_idle()
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
         model = app._model_for(provider, model_id)
-        current = app._runtime.session
+        current = runtime.session
         thinking, enabled_tools = current.thinking, current.enabled_tools
         notices = [f"模型：{provider} / {model_id}"]
         if thinking is not None and thinking not in (model.thinking_modes or ()):
@@ -178,36 +174,40 @@ class Operations:
             thinking=thinking,
             enabled_tools=enabled_tools,
         )
-        await app._update_session(app._runtime, updated)
+        await app._update_session(runtime, updated)
         return "\n".join(notices)
 
-    async def set_thinking(self, mode: str | None) -> None:
+    async def set_thinking(self, mode: str | None, *, session_id: str) -> None:
         app = self._app
-        app._ensure_idle()
-        app._validate_thinking(self.model, mode)
-        updated = replace(app._runtime.session, thinking=mode)
-        await app._update_session(app._runtime, updated)
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
+        app._validate_thinking(self.model(session_id), mode)
+        updated = replace(runtime.session, thinking=mode)
+        await app._update_session(runtime, updated)
 
-    def get_system_prompt(self) -> str:
-        return self._app._runtime.session.effective_system_prompt
+    def get_system_prompt(self, session_id: str) -> str:
+        return self._runtime(session_id).session.effective_system_prompt
 
-    async def set_system_prompt(self, prompt: str) -> None:
+    async def set_system_prompt(self, prompt: str, *, session_id: str) -> None:
         app = self._app
-        app._ensure_idle()
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
         if not isinstance(prompt, str):
             raise TypeError("系统提示词必须是字符串。")
-        await app._update_session(app._runtime, replace(app._runtime.session, system_prompt=prompt))
+        await app._update_session(runtime, replace(runtime.session, system_prompt=prompt))
 
-    async def reset_system_prompt(self) -> None:
+    async def reset_system_prompt(self, session_id: str) -> None:
         app = self._app
-        app._ensure_idle()
-        await app._update_session(app._runtime, replace(app._runtime.session, system_prompt=None))
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
+        await app._update_session(runtime, replace(runtime.session, system_prompt=None))
 
     async def set_tools(
-        self, names: Sequence[str], *, keep_unavailable: bool = False
+        self, names: Sequence[str], *, session_id: str, keep_unavailable: bool = False
     ) -> None:
         app = self._app
-        app._ensure_idle()
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
         if isinstance(names, (str, bytes)):
             raise TypeError("names must be a sequence of tool names.")
         selected = tuple(names)
@@ -215,12 +215,12 @@ class Operations:
             available = set(self.all_tools)
             selected += tuple(
                 name
-                for name in self.enabled_tools
+                for name in runtime.session.enabled_tools
                 if name not in available and name not in selected
             )
-        app._validate_tools(self.model, selected, retained=self.enabled_tools)
-        updated = replace(app._runtime.session, enabled_tools=selected)
-        await app._update_session(app._runtime, updated)
+        app._validate_tools(self.model(session_id), selected, retained=runtime.session.enabled_tools)
+        updated = replace(runtime.session, enabled_tools=selected)
+        await app._update_session(runtime, updated)
 
     async def connect_mcp(
         self,
@@ -276,7 +276,7 @@ class Operations:
     def import_mcp(self, path: Path) -> None:
         """Seed managed configuration once, including an intentionally empty list."""
         app = self._app
-        app._ensure_idle()
+        app._ensure_mcp_idle()
         store = app._mcp_store
         if store.path.exists():
             return
@@ -296,8 +296,7 @@ class Operations:
         create: bool = False,
     ) -> str | None:
         app = self._app
-        app._ensure_idle()
-        async with app._state_lock:
+        with app._changing_mcp():
             store = app._mcp_store
             with SessionLease(store.path):
                 configs = store.read()
@@ -321,8 +320,7 @@ class Operations:
 
     async def restart_mcp(self, name: str) -> str | None:
         app = self._app
-        app._ensure_idle()
-        async with app._state_lock:
+        with app._changing_mcp():
             config = app._mcp_store.read().get(name)
             if config is None or not config.enabled:
                 raise ValueError("请先启用 MCP 服务。")
@@ -330,8 +328,7 @@ class Operations:
 
     async def delete_mcp(self, name: str) -> None:
         app = self._app
-        app._ensure_idle()
-        async with app._state_lock:
+        with app._changing_mcp():
             store = app._mcp_store
             with SessionLease(store.path):
                 configs = store.read()
@@ -422,28 +419,19 @@ class Operations:
     def list_projects(self) -> tuple[Project, ...]:
         return self._app._history.list_projects()
 
-    async def create_project(self, name: str, workspace: Path | str | None = None) -> Project:
-        app = self._app
-        app._ensure_idle()
-        root = Path(app._runtime.session.workspace)
+    async def create_project(
+        self, name: str, workspace: Path | str | None = None, *, session_id: str,
+    ) -> Project:
+        root = self.session(session_id).workspace
         if workspace is not None:
             if not str(workspace).strip():
                 raise ValueError("项目需要一个工作区目录。")
             root = root / Path(workspace).expanduser()
-        async with app._state_lock:
-            return await finish_io(asyncio.to_thread(app._history.create_project, name, root))
+        return await finish_io(asyncio.to_thread(self._app._history.create_project, name, root))
 
     async def remove_project(self, project_id: str) -> None:
-        app = self._app
-        app._ensure_idle()
-
-        async def remove() -> None:
-            await asyncio.to_thread(app._history.remove_project, project_id)
-            if app._runtime.session.project_id == project_id:
-                app._runtime.session.project_id = None
-
-        async with app._state_lock:
-            await finish_io(remove())
+        self._app._ensure_open()
+        await finish_io(asyncio.to_thread(self._app._history.remove_project, project_id))
 
     def _project_for_workspace(self, project_id: str) -> Project:
         project = self._app._history.load_project(project_id)
@@ -451,129 +439,105 @@ class Operations:
             raise ValueError("该项目的工作区已移动或不存在。")
         return project
 
-    async def open_project(self, project_id: str | None) -> SessionSnapshot:
-        app = self._app
-        app._ensure_idle()
+    async def open_project(self, project_id: str | None, *, session_id: str) -> SessionSnapshot:
+        current = self._runtime(session_id).session
         if project_id is None:
-            return await self._new_session(app._runtime.session.workspace, None)
+            return self._new_session(current, current.workspace, None)
         project = self._project_for_workspace(project_id)
-        return await self._new_session(project.workspace, project.id)
+        return self._new_session(current, project.workspace, project.id)
 
-    async def new_session(self) -> SessionSnapshot:
-        self._app._ensure_idle()
-        current = self.session
-        return await self._new_session(current.workspace, current.project_id)
+    async def new_session(self, *, session_id: str) -> SessionSnapshot:
+        current = self._runtime(session_id).session
+        project_id = self._app._history.resolve_project_id(current.project_id, current.workspace)
+        return self._new_session(current, current.workspace, project_id)
 
-    async def remember_current_session(self) -> None:
+    async def remember_session(self, session_id: str) -> None:
         """Keep a blank session restorable while a client holds an unsent draft."""
         app = self._app
-        app._ensure_idle()
-        async with app._state_lock:
-            if app._runtime.session._saved_revision is None:
-                await finish_io(app._save_session(app._runtime, app._runtime.session))
+        runtime = self._runtime(session_id)
+        if runtime.session._saved_revision is not None:
+            return
+        app._ensure_idle(runtime)
+        async with runtime.state_lock:
+            await app._save_session(runtime, runtime.session)
 
-    async def _new_session(self, workspace: Path | str, project_id: str | None) -> SessionSnapshot:
-        app = self._app
-        current = app._runtime.session
+    def _new_session(
+        self, source: Session, workspace: Path | str, project_id: str | None,
+    ) -> SessionSnapshot:
         fresh = Session(
             workspace=workspace,
-            provider=current.provider,
-            model_id=current.model_id,
-            thinking=current.thinking,
-            enabled_tools=current.enabled_tools,
+            provider=source.provider,
+            model_id=source.model_id,
+            thinking=source.thinking,
+            enabled_tools=source.enabled_tools,
             project_id=project_id,
         )
-        async def switch() -> None:
-            if app._has_usage_to_save(app._runtime):
-                await app._save_session(app._runtime, current)
-            app._runtime = app._add_runtime(fresh)
+        self._app._add_runtime(fresh)
+        return self.session(fresh.id)
 
-        async with app._state_lock:
-            await finish_io(switch())
-        return self.session
-
-    def restore_session(self, session_id: str) -> None:
-        app = self._app
-        app._ensure_idle()
-        app._runtime = app._load_runtime(session_id)
-        app._use_saved_tool_preferences = True
+    def restore_session(self, session_id: str) -> SessionSnapshot:
+        self._app._validate_session(self._runtime(session_id).session)
+        return self.session(session_id)
 
     async def rename_session(self, session_id: str, title: str) -> None:
-        app = self._app
-        app._ensure_idle()
+        runtime = self._runtime(session_id)
+        self._app._ensure_idle(runtime)
         title = title.strip() if isinstance(title, str) else ""
         if not 0 < len(title) <= 120:
             raise ValueError("会话名称必须包含 1–120 个字符。")
-        if runtime := app._runtimes.get(session_id):
-            await app._update_session(runtime, replace(runtime.session, title=title))
-        else:
-            async with app._state_lock:
-                await app._history.rename(session_id, title)
+        await self._app._update_session(runtime, replace(runtime.session, title=title))
 
     async def move_session(
         self, session_id: str, project_id: str | None, *, expected_workspace: Path | str | None = None,
     ) -> None:
         app = self._app
-        app._ensure_idle()
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
+        session = runtime.session
+        workspace = session.workspace
+        if project_id is not None:
+            try:
+                project = self._project_for_workspace(project_id)
+            except FileNotFoundError as exc:
+                raise ValueError("项目不存在。") from exc
+            if expected_workspace is not None and Path(expected_workspace) != project.workspace:
+                raise ValueError("目标工作目录已变化，请重新确认。")
+            workspace = project.workspace
+        if session.project_id == project_id and session.workspace == workspace:
+            return
+        workspace_changed = session.workspace != workspace
+        recovery = session.recovery
+        if workspace_changed and recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+            raise ValueError("请先继续或终止未完成的工具任务，再更换工作目录。")
+        updated = replace(session, project_id=project_id, workspace=workspace)
 
         async def move() -> None:
-            runtime = app._runtimes.get(session_id)
-            session = runtime.session if runtime else await asyncio.to_thread(app._history.load, session_id)
-            workspace = session.workspace
-            if project_id is not None:
-                try:
-                    project = self._project_for_workspace(project_id)
-                except FileNotFoundError as exc:
-                    raise ValueError("项目不存在。") from exc
-                if expected_workspace is not None and Path(expected_workspace) != project.workspace:
-                    raise ValueError("目标工作目录已变化，请重新确认。")
-                workspace = project.workspace
-            if session.project_id == project_id and session.workspace == workspace:
-                return
-            workspace_changed = session.workspace != workspace
-            recovery = session.recovery
-            if workspace_changed and recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
-                raise ValueError("请先继续或终止未完成的工具任务，再更换工作目录。")
-            updated = replace(session, project_id=project_id, workspace=workspace)
-            if runtime:
-                await app._save_and_publish_session(runtime, updated)
-            else:
-                await app._history.save_async(updated)
+            await app._save_and_publish_session(runtime, updated)
             if workspace_changed:
-                app._trusted_tools.difference_update({key for key in app._trusted_tools if key[0] == session_id})
+                app._revoke_session_trust(session_id)
 
-        async with app._state_lock:
+        async with runtime.state_lock:
             await finish_io(move())
 
-    async def delete_session(self, session_id: str) -> SessionSnapshot:
-        """Delete under the history lease; replace an active session with a blank one."""
+    async def delete_session(self, session_id: str, *, replacement: bool = False) -> SessionSnapshot | None:
+        """Delete under the history lease; optionally return a blank session for the caller."""
         app = self._app
-        app._ensure_idle()
-        current = app._runtime.session
+        runtime = self._runtime(session_id)
+        app._ensure_idle(runtime)
 
-        async def delete_and_select() -> None:
-            if session_id != current.id:
-                runtime = app._runtimes.get(session_id)
-                await app._history.delete(runtime.session if runtime else app._history.load(session_id))
-                app._drop_runtime(session_id)
-                return
-            fresh = Session(
-                workspace=current.workspace,
-                provider=current.provider,
-                model_id=current.model_id,
-                thinking=current.thinking,
-                enabled_tools=current.enabled_tools,
-                project_id=self.session.project_id,
-            )
-            await app._history.delete(current)
+        async def delete() -> SessionSnapshot | None:
+            session = runtime.session
+            await app._history.delete(session)
             app._drop_runtime(session_id)
-            app._runtime = app._add_runtime(fresh)
+            if replacement and not app._closed:
+                project_id = app._history.resolve_project_id(session.project_id, session.workspace)
+                return self._new_session(session, session.workspace, project_id)
+            return None
 
-        async with app._state_lock:
-            await finish_io(delete_and_select())
-        return self.session
+        async with runtime.state_lock:
+            return await finish_io(delete())
 
-    def attachment_snapshot(self) -> dict[int, list[dict[str, str | int]]]:
+    def attachment_snapshot(self, session_id: str) -> dict[int, list[dict[str, str | int]]]:
         return {
             index: [
                 {"id": item.id, "name": item.name, "type": "image", "mime_type": item.mime_type,
@@ -585,7 +549,7 @@ class Operations:
                 else {"id": item.id, "name": item.name, "type": "text", "mime_type": item.mime_type}
                 for item in batch.files
             ]
-            for index, batch in self._app._runtime.session.attachment_refs.items()
+            for index, batch in self._runtime(session_id).session.attachment_refs.items()
         }
 
     async def read_attachment_image(self, session_id: str, message_index: int, attachment_id: str) -> tuple[bytes, str]:
@@ -603,9 +567,13 @@ class Operations:
         kind: type[ImageAttachment] | type[DocumentAttachment],
     ) -> tuple[bytes, ImageAttachment | DocumentAttachment]:
         app = self._app
-        session = app._runtime.session
-        if session.id != session_id or not valid_id(attachment_id) or type(message_index) is not int:
+        if not valid_id(attachment_id) or type(message_index) is not int:
             raise FileNotFoundError("附件不可用。")
+        try:
+            runtime = self._runtime(session_id)
+        except (OSError, ValueError):
+            raise FileNotFoundError("附件不可用。") from None
+        session = runtime.session
         batch = session.attachment_refs.get(message_index)
         item = next((entry for entry in batch.files if isinstance(entry, kind) and entry.id == attachment_id), None) if batch else None
         if item is None:
@@ -618,14 +586,14 @@ class Operations:
                 data = await asyncio.to_thread(store.read_document, session.id, item)
         except (OSError, ValueError):
             raise FileNotFoundError("附件不可用。") from None
-        if app._runtime.session.id != session_id:
+        if app._runtimes.get(session_id) is not runtime:
             raise FileNotFoundError("附件不可用。")
         return data, item
 
     def attachment_submitted(
-        self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str],
+        self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str], *, session_id: str,
     ) -> bool:
-        session = self._app._runtime.session
+        session = self._runtime(session_id).session
 
         def identity(item: Attachment):
             if isinstance(item, DocumentAttachment):
@@ -653,50 +621,56 @@ class Operations:
         return False
 
     async def send(
-        self, prompt: str, *, stream: bool = True,
+        self, prompt: str, *, session_id: str, stream: bool = True,
         attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> "TurnResult":
-        return await self._app._run_turn(self._app._runtime, prompt, stream=stream, attachments=attachments, submission_id=submission_id)
+        return await self._app._run_turn(
+            self._runtime(session_id), prompt, stream=stream, attachments=attachments, submission_id=submission_id,
+        )
 
-    @property
-    def prompt_groups(self) -> tuple[PromptGroup, ...]:
-        return self._app._runtime.session.prompt_groups
+    def prompt_groups(self, session_id: str) -> tuple[PromptGroup, ...]:
+        return self._runtime(session_id).session.prompt_groups
 
-    def prompt_submitted(self, group_id: str, texts: tuple[str, ...]) -> bool:
-        group = next((group for group in self.prompt_groups if group.id == group_id), None)
+    def prompt_submitted(self, group_id: str, texts: tuple[str, ...], *, session_id: str) -> bool:
+        session = self._runtime(session_id).session
+        group = next((group for group in session.prompt_groups if group.id == group_id), None)
         if group is None:
             return False
-        if texts != tuple(self._app._runtime.session.messages.get(i)['content'] for i in range(group.start, group.end)):
+        if texts != tuple(session.messages.get(i)["content"] for i in range(group.start, group.end)):
             raise ValueError("该 MCP Prompt 运行标识已用于不同内容。")
         return True
 
-    async def run_mcp_prompt(self, prompt_input: PromptInput, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(self._app._runtime, stream=stream, prompt_input=prompt_input)
+    async def run_mcp_prompt(self, prompt_input: PromptInput, *, session_id: str, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(self._runtime(session_id), stream=stream, prompt_input=prompt_input)
 
-    @property
-    def recovery(self) -> RecoveryState | None:
-        return self._app._runtime.session.recovery
+    def recovery(self, session_id: str) -> RecoveryState | None:
+        return self._runtime(session_id).session.recovery
 
-    async def retry_failed_user(self, key: str, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(self._app._runtime, stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key)
+    async def retry_failed_user(self, key: str, *, session_id: str, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(
+            self._runtime(session_id), stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key,
+        )
 
-    async def continue_interrupted_turn(self, key: str, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(self._app._runtime, stream=stream, recovery_action=RecoveryAction.CONTINUE, recovery_key=key)
+    async def continue_interrupted_turn(self, key: str, *, session_id: str, stream: bool = True) -> "TurnResult":
+        return await self._app._run_turn(
+            self._runtime(session_id), stream=stream, recovery_action=RecoveryAction.CONTINUE, recovery_key=key,
+        )
 
-    async def terminate_interrupted_turn(self, key: str) -> "TurnResult":
-        return await self._app._run_turn(self._app._runtime, recovery_action=RecoveryAction.TERMINATE, recovery_key=key)
+    async def terminate_interrupted_turn(self, key: str, *, session_id: str) -> "TurnResult":
+        return await self._app._run_turn(
+            self._runtime(session_id), recovery_action=RecoveryAction.TERMINATE, recovery_key=key,
+        )
 
-    async def compact(self) -> CompactionCheckpoint | None:
-        return await self._app._compact_session(self._app._runtime)
+    async def compact(self, session_id: str) -> CompactionCheckpoint | None:
+        return await self._app._compact_session(self._runtime(session_id))
 
-    async def cancel(self) -> None:
-        self._app._ensure_open()
-        await self._app._cancel_turn(self._app._runtime)
+    async def cancel(self, session_id: str) -> None:
+        await self._app._cancel_turn(self._runtime(session_id))
 
     def resolve_approval(
-        self, request_id: str, decision: ApprovalDecision | str
+        self, request_id: str, decision: ApprovalDecision | str, *, session_id: str,
     ) -> bool:
-        return self._app._resolve_approval(self.session.id, request_id, ApprovalDecision(decision))
+        return self._app._resolve_approval(session_id, request_id, ApprovalDecision(decision))
 
     async def close(self) -> None:
         await self._app.close()

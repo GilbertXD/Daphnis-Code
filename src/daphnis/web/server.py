@@ -248,9 +248,9 @@ async def _send_attachments(bridge, session, prompt, submission_id, entries):
         raise RequestError("不能重复添加同一份 MCP 资源草稿。")
     async with bridge.lock:
         ops = bridge.ops
-        if ops.session.id != session:
+        if bridge.session_id != session:
             raise RequestError("当前会话已切换，请重新操作。", 409)
-        if ops.attachment_submitted(submission_id, prompt, entries):
+        if ops.attachment_submitted(submission_id, prompt, entries, session_id=session):
             return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
         attachments = tuple(bridge.resource_draft(session, entry) if isinstance(entry, str) else entry for entry in entries)
         if bridge.upload and bridge.upload[0] == submission_id:
@@ -258,9 +258,9 @@ async def _send_attachments(bridge, session, prompt, submission_id, entries):
             if (prompt, attachments) != (old_prompt, old_attachments):
                 raise RequestError("该附件发送标识已用于不同内容。", 409)
         else:
-            if bridge.run is not None or ops.running:
+            if bridge.run is not None or ops.running(session):
                 raise RequestError("请先等待或停止当前轮。", 409)
-            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+            if ops.recovery(session) and ops.recovery(session).kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
             accepted = bridge.start(prompt, attachments=attachments, submission_id=submission_id)
     error = await asyncio.shield(accepted)
@@ -277,18 +277,18 @@ async def _run_prompt(bridge, session, args):
         raise RequestError("MCP Prompt 运行字段无效。")
     async with bridge.lock:
         ops = bridge.ops
-        if ops.session.id != session:
+        if bridge.session_id != session:
             raise RequestError("当前会话已切换，请重新操作。", 409)
-        if ops.prompt_submitted(preview_id, texts):
+        if ops.prompt_submitted(preview_id, texts, session_id=session):
             return JSONResponse({"notice": None, "revision": bridge.revision}, 202)
         if bridge.prompt_run and bridge.prompt_run[0].id == preview_id:
             previous, accepted = bridge.prompt_run
             if texts != tuple(message["content"] for message in previous.snapshot()):
                 raise RequestError("该 MCP Prompt 运行标识已用于不同内容。", 409)
         else:
-            if bridge.run is not None or ops.running:
+            if bridge.run is not None or ops.running(session):
                 raise RequestError("请先等待或停止当前轮。", 409)
-            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+            if ops.recovery(session) and ops.recovery(session).kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
             preview = bridge.prompt_previews.get(preview_id)
             if preview is None or preview[0] != session:
@@ -323,7 +323,7 @@ async def _run_prompt(bridge, session, args):
 
 async def _execute(bridge, action, session, args, discovery):
     ops = bridge.ops
-    if ops.session.id != session:
+    if bridge.session_id != session:
         raise RequestError("当前会话已切换，请重新操作。", 409)
     if action == "cancel":
         if not bridge.run or bridge.run["id"] != args["run_id"]:
@@ -331,52 +331,54 @@ async def _execute(bridge, action, session, args, discovery):
         await bridge.cancel()
         return None
     if action == "approve":
-        pending = ops.pending_approval
+        pending = ops.pending_approval(session)
         if (
             pending is None
             or (args["decision"] == "trust_session" and not pending.can_trust)
-            or not ops.resolve_approval(args["request_id"], args["decision"])
+            or not ops.resolve_approval(args["request_id"], args["decision"], session_id=session)
         ):
             raise RequestError("该审批已失效或不支持所选选项。", 409)
         return None
-    if bridge.run is not None or ops.running:
+    if bridge.run is not None or ops.running(session):
         raise RequestError("请先等待或停止当前轮。", 409)
     if args.get("keep_draft_session") and (action != "restore" or args["id"] != session):
-        await ops.remember_current_session()
+        await ops.remember_session(session)
     match action:
         case "new":
-            await ops.new_session()
+            bridge.session_id = (await ops.new_session(session_id=session)).id
         case "project_create":
-            await ops.create_project(args["name"], workspace=args["workspace"])
+            await ops.create_project(args["name"], workspace=args["workspace"], session_id=session)
         case "project_open" | "project_remove":
             try:
                 if action == "project_remove":
                     await ops.remove_project(args["project_id"])
                 else:
-                    await ops.open_project(args["project_id"])
+                    bridge.session_id = (await ops.open_project(args["project_id"], session_id=session)).id
             except FileNotFoundError as exc:
                 raise RequestError("项目不存在。", 404) from exc
         case "restore":
             if args["id"] != session:
-                ops.restore_session(args["id"])
+                bridge.session_id = ops.restore_session(args["id"]).id
         case "rename":
             await ops.rename_session(args["id"], args["title"])
         case "move":
             await ops.move_session(args["id"], args["project_id"], expected_workspace=args["workspace"])
         case "delete":
-            await ops.delete_session(args["id"])
+            fresh = await ops.delete_session(args["id"], replacement=args["id"] == session)
+            if fresh is not None:
+                bridge.session_id = fresh.id
             bridge.journals.pop(args["id"], None)
         case "model":
-            return await ops.set_model(args["provider"], args["model_id"])
+            return await ops.set_model(args["provider"], args["model_id"], session_id=session)
         case "thinking":
-            await ops.set_thinking(args["mode"])
+            await ops.set_thinking(args["mode"], session_id=session)
         case "system":
             if args["prompt"] is None:
-                await ops.reset_system_prompt()
+                await ops.reset_system_prompt(session)
             else:
-                await ops.set_system_prompt(args["prompt"])
+                await ops.set_system_prompt(args["prompt"], session_id=session)
         case "tools":
-            await ops.set_tools(args["names"])
+            await ops.set_tools(args["names"], session_id=session)
         case "mcp_save" | "mcp_enable":
             return await ops.save_mcp(**args)
         case "mcp_restart":
@@ -400,18 +402,18 @@ async def _execute(bridge, action, session, args, discovery):
                 options["auth"] = {"type": "bearer", "env": auth_env}
             return await ops.save_mcp(args["name"], enabled=True, options=options, create=True)
         case "set_approval_mode":
-            ops.set_approval_mode(args["mode"])
+            ops.set_approval_mode(args["mode"], session_id=session)
         case "confirm_full":
-            ops.set_approval_mode(ApprovalMode.FULL)
+            ops.set_approval_mode(ApprovalMode.FULL, session_id=session)
         case "send" | "compact":
-            if ops.recovery and ops.recovery.kind is RecoveryKind.INTERRUPTED_TURN:
+            if ops.recovery(session) and ops.recovery(session).kind is RecoveryKind.INTERRUPTED_TURN:
                 raise RequestError("上轮任务未完成，请先选择继续或终止。", 409)
             if action == "compact":
                 bridge.start_compaction()
             else:
                 bridge.start(args["prompt"])
         case "retry" | "continue" | "terminate":
-            recovery = ops.recovery
+            recovery = ops.recovery(session)
             kind = RecoveryKind.FAILED_USER if action == "retry" else RecoveryKind.INTERRUPTED_TURN
             if recovery is None or recovery.kind is not kind or recovery.key != args["key"]:
                 raise RequestError("恢复状态已变化，请刷新后再操作。", 409)
@@ -420,7 +422,7 @@ async def _execute(bridge, action, session, args, discovery):
                 "continue": ops.continue_interrupted_turn,
                 "terminate": ops.terminate_interrupted_turn,
             }[action]
-            bridge.start(None, operation=lambda: operation(recovery.key))
+            bridge.start(None, operation=lambda: operation(recovery.key, session_id=session))
     return None
 
 
@@ -437,13 +439,13 @@ def _resource_preview(item: TextResourceInput, redactor) -> tuple[TextResourceIn
 
 async def _resource_response(bridge, action, session, args):
     ops = bridge.ops
-    if ops.session.id != session:
+    if bridge.session_id != session:
         raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
     server = args["server"]
     redactor = bridge.redactor
     if action == "mcp_read_resource":
         resources = await ops.read_mcp_resource(server, args["uri"], args["arguments"])
-        if ops.session.id != session:
+        if bridge.session_id != session:
             raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
         previews = [_resource_preview(item, redactor) for item in resources]
         return JSONResponse({"mcp_resource_preview": [
@@ -473,13 +475,13 @@ async def _resource_response(bridge, action, session, args):
                 "description": redactor.text(entry.description or ""), "mime_type": redactor.text(entry.mime_type or ""),
                 "variables": variables, "error": error,
             })
-    if ops.session.id != session:
+    if bridge.session_id != session:
         raise RequestError("当前会话已切换，请重新打开 Resources。", 409)
     return JSONResponse({"mcp_resource_catalog": response})
 
 
 async def _prompt_response(bridge, action, session, args):
-    if bridge.ops.session.id != session:
+    if bridge.session_id != session:
         raise RequestError("当前会话已切换，请重新打开模板。", 409)
     redactor = bridge.redactor
     if action == "mcp_list_prompts":
@@ -521,7 +523,7 @@ async def _prompt_response(bridge, action, session, args):
             runnable &= value is not None and message.role in PROMPT_ROLES
             original.append((message.role, value))
             messages.append({"role": message.role, "content": content})
-        if bridge.ops.session.id != session:
+        if bridge.session_id != session:
             raise RequestError("当前会话已切换，请重新打开 Prompts。", 409)
         preview_id = bridge.cache_prompt_preview(
             session, args["server"], args["name"], tuple(original),
@@ -530,7 +532,7 @@ async def _prompt_response(bridge, action, session, args):
             "description": redactor.text(result.description or ""), "messages": messages, "redacted": redacted,
             "preview_id": preview_id,
         }}
-    if bridge.ops.session.id != session:
+    if bridge.session_id != session:
         raise RequestError("当前会话已切换，请重新打开模板。", 409)
     return JSONResponse(response)
 
@@ -582,7 +584,7 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
             if action in _PROMPT_ACTIONS:
                 return await _prompt_response(bridge, action, session, args)
             if action in {"registry_search", "registry_detail"}:
-                if bridge.ops.session.id != session:
+                if bridge.session_id != session:
                     raise RequestError("当前会话已切换，请重新操作。", 409)
                 if action == "registry_search":
                     return JSONResponse({"registry_page": await discovery.search(args["query"], args["cursor"])})

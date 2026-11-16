@@ -64,13 +64,13 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 }},
             )
             ops = Operations(app)
-            a = app._runtime
+            a = app._runtimes[app.initial_session_id]
             a.session.messages.add_user("Original task " * 150)
             a.session.messages.add_assistant("Original answer")
             a.session.messages.add_user("Recent question")
             a.session.messages.add_assistant("Recent answer")
             history.save(a.session)
-            b = app._load_runtime((await ops.new_session()).id)
+            b = app._load_runtime((await ops.new_session(session_id=ops.initial_session_id)).id)
             compaction = asyncio.create_task(app._compact_session(a))
             turn = asyncio.create_task(app._run_turn(b, "independent", stream=False))
             try:
@@ -149,14 +149,14 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                               history=history, connections={"mimo": {"base_url": "https://model.test/v1",
                                                                     "transport": httpx.MockTransport(handler)}})
             self.addAsyncCleanup(app.close)
-            state = app._runtime.session
+            state = app._runtimes[app.initial_session_id].session
             state.messages.add_user("Original task " * 150)
             state.messages.add_assistant("Original answer")
             state.messages.add_user("Most recent task")
             history.save(state)
             candidates = []
             app.events.on("compaction.candidate", candidates.append)
-            checkpoint = await Operations(app).compact()
+            checkpoint = await Operations(app).compact(app.initial_session_id)
             self.assertEqual(len(requests), 3)
             self.assertIn("truncated", requests[1]["messages"][0]["content"])
             self.assertEqual(requests[0]["messages"][1], requests[2]["messages"][1])
@@ -459,7 +459,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.addAsyncCleanup(app.close)
             ops = Operations(app)
-            state = app._runtime.session
+            state = app._runtimes[app.initial_session_id].session
             state.messages.add_user("Original task " * 150)
             state.messages.add(reply(None, finish="tool_calls", calls=[tool_call()])["choices"][0]["message"])
             state.messages.add_tool_result(tool_call_id="call-1", content="Original result " * 100)
@@ -470,7 +470,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(history.load(state.id).compaction)
             original = state.messages.snapshot()
 
-            checkpoint = await ops.compact()
+            checkpoint = await ops.compact(ops.initial_session_id)
             saved = history.load(state.id)
             self.assertEqual(checkpoint, saved.compaction)
             self.assertEqual(saved.compaction.through, 4)
@@ -479,10 +479,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(saved.usage.requests, 2)
             self.assertEqual(bodies[0]["messages"][1], bodies[1]["messages"][1])
             self.assertIn("truncated", bodies[1]["messages"][0]["content"])
-            self.assertIsNone(ops.turn_usage)
-            self.assertIsNone(await ops.compact())
+            self.assertIsNone(ops.turn_usage(ops.initial_session_id))
+            self.assertIsNone(await ops.compact(ops.initial_session_id))
             ops.restore_session(state.id)
-            outcome = await ops.send("Continue", stream=False)
+            outcome = await ops.send("Continue", stream=False, session_id=ops.initial_session_id)
             self.assertEqual(outcome.status, TurnStatus.COMPLETED)
             effective = bodies[-1]["messages"]
             self.assertEqual([message["role"] for message in effective],
@@ -490,22 +490,22 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("untrusted historical data", effective[0]["content"])
             self.assertIn(SUMMARY.replace(", ", ",").replace(": ", ":"), effective[1]["content"])
             self.assertEqual(effective[2:4], original[4:])
-            self.assertEqual(ops.message_snapshot()[:6], original)
+            self.assertEqual(ops.message_snapshot(ops.initial_session_id)[:6], original)
 
-            app._runtime.session.messages.add_user("Another task " * 100)
-            app._runtime.session.messages.add_assistant("Another answer")
-            history.save(app._runtime.session)
+            app._runtimes[app.initial_session_id].session.messages.add_user("Another task " * 100)
+            app._runtimes[app.initial_session_id].session.messages.add_assistant("Another answer")
+            history.save(app._runtimes[app.initial_session_id].session)
             path = history.directory / f"{state.id}.json"
             summary_content = "Invalid summary"
             failures = []
             app.events.on("compaction.finished", failures.append)
             request_count = len(bodies)
             with self.assertRaises(CompactionError) as invalid_summary:
-                await ops.compact()
+                await ops.compact(ops.initial_session_id)
             self.assertEqual(len(bodies) - request_count, 2)
             self.assertEqual(invalid_summary.exception.reason, "summary_json")
             self.assertEqual(failures[-1].data["reason"], "summary_json")
-            self.assertEqual(app._runtime.session.compaction, saved.compaction)
+            self.assertEqual(app._runtimes[app.initial_session_id].session.compaction, saved.compaction)
             self.assertEqual(history.load(state.id).compaction, saved.compaction)
 
             disk_before = path.read_bytes()
@@ -514,10 +514,10 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(history, "_replace", side_effect=OSError("disk unavailable")),
                 self.assertRaisesRegex(OSError, "disk unavailable"),
             ):
-                await ops.compact()
+                await ops.compact(ops.initial_session_id)
             self.assertEqual(path.read_bytes(), disk_before)
-            self.assertEqual(app._runtime.session.compaction, saved.compaction)
-            updated = await ops.compact()
+            self.assertEqual(app._runtimes[app.initial_session_id].session.compaction, saved.compaction)
+            updated = await ops.compact(ops.initial_session_id)
             self.assertGreater(updated.through, saved.compaction.through)
             self.assertEqual(history.load(state.id).compaction, updated)
             self.assertIn("Prior summary: {", bodies[-1]["messages"][1]["content"])
@@ -815,11 +815,11 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.addAsyncCleanup(app.close)
             ops = Operations(app)
-            await ops.set_tools(())
-            app._runtime.session.messages.add_user("original " * 600)
-            app._runtime.session.messages.add_assistant("answer")
-            history.save(app._runtime.session)
-            before = history.load(ops.session.id)
+            await ops.set_tools((), session_id=ops.initial_session_id)
+            app._runtimes[app.initial_session_id].session.messages.add_user("original " * 600)
+            app._runtimes[app.initial_session_id].session.messages.add_assistant("answer")
+            history.save(app._runtimes[app.initial_session_id].session)
+            before = history.load(ops.initial_session_id)
             replace_file = history._replace
 
             def fail_final_save(path, data):
@@ -828,20 +828,20 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
                 replace_file(path, data)
 
             with patch.object(history, "_replace", side_effect=fail_final_save):
-                result = await ops.send("continue", stream=False)
+                result = await ops.send("continue", stream=False, session_id=ops.initial_session_id)
             self.assertEqual(result.status, TurnStatus.FAILED)
             self.assertIn("disk unavailable", result.error)
-            disk = history.load(ops.session.id)
+            disk = history.load(ops.initial_session_id)
             self.assertEqual(disk.messages.snapshot(), [
                 *before.messages.snapshot(), {"role": "user", "content": "continue"},
             ])
             self.assertIsNone(disk.compaction)
-            self.assertEqual(disk.messages.snapshot(), ops.message_snapshot())
-            self.assertIsNone(app._runtime.session.compaction)
-            self.assertEqual((await ops.send("continue again", stream=False)).status, TurnStatus.COMPLETED)
-            restored = history.load(ops.session.id)
-            self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
-            self.assertEqual(restored.compaction, app._runtime.session.compaction)
+            self.assertEqual(disk.messages.snapshot(), ops.message_snapshot(ops.initial_session_id))
+            self.assertIsNone(app._runtimes[app.initial_session_id].session.compaction)
+            self.assertEqual((await ops.send("continue again", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+            restored = history.load(ops.initial_session_id)
+            self.assertEqual(restored.messages.snapshot(), ops.message_snapshot(ops.initial_session_id))
+            self.assertEqual(restored.compaction, app._runtimes[app.initial_session_id].session.compaction)
 
 
 class OverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):

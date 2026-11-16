@@ -2,8 +2,8 @@
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
-from contextlib import AsyncExitStack
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AsyncExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import fields, replace
 from pathlib import Path
@@ -28,8 +28,6 @@ from .context import Context
 from .events import Event, EventBus
 from .history import (
     History,
-    SessionBusyError,
-    SessionConflictError,
     SessionLease,
     finish_io,
 )
@@ -129,10 +127,9 @@ class Application:
         self._output_limits = dict(output_limits or {})
         self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
-        self._state_lock = asyncio.Lock()
+        self._mcp_update: asyncio.Future[None] | None = None
         self._mcp_pending: set[MCPConnection] = set()
         self._tools = self._mcp_catalog()
-        self._use_saved_tool_preferences = False
         model = self._model_for(provider, model_id)
         session = Session(
             workspace=workspace,
@@ -144,7 +141,8 @@ class Application:
             raise ValueError("Workspace 必须是现有目录。")
         self.events = EventBus()
         self._runtimes: dict[str, SessionRuntime] = {}
-        self._runtime = self._add_runtime(session)
+        self._add_runtime(session)
+        self.initial_session_id = session.id
         for name in ("context.budget", "compaction.started", "compaction.finished"):
             self.events.on(name, self._observe_context)
         self._client(provider)
@@ -162,12 +160,15 @@ class Application:
         if runtime := self._runtimes.get(session_id):
             return runtime
         session = self._history.load(session_id)
-        if not Path(session.workspace).is_dir():
-            raise ValueError("该会话原工作区已不存在。")
         if "history_search" in session.enabled_tools:
             session = replace(session, enabled_tools=tuple(dict.fromkeys(
                 "retrieval" if name == "history_search" else name for name in session.enabled_tools
             )))
+        return self._add_runtime(session)
+
+    def _validate_session(self, session: Session) -> None:
+        if not Path(session.workspace).is_dir():
+            raise ValueError("该会话原工作区已不存在。")
         model = self._model_for(session.provider, session.model_id)
         self._validate_thinking(model, session.thinking)
         self._validate_tools(
@@ -175,11 +176,13 @@ class Application:
             session.enabled_tools,
             retained=tuple(name for name in session.enabled_tools if name.startswith(TOOL_PREFIX)),
         )
-        return self._add_runtime(session)
 
     def _drop_runtime(self, session_id: str) -> None:
         if runtime := self._runtimes.pop(session_id, None):
             runtime.usage.close()
+        self._revoke_session_trust(session_id)
+
+    def _revoke_session_trust(self, session_id: str) -> None:
         self._trusted_tools.difference_update({key for key in self._trusted_tools if key[0] == session_id})
 
     def _observe_context(self, event: Event) -> None:
@@ -250,10 +253,6 @@ class Application:
             )
         return self._document_adapters[provider]
 
-    @property
-    def _model(self) -> ModelInfo:
-        return self._session_model(self._runtime.session)
-
     def _session_model(self, session: Session) -> ModelInfo:
         return resolve_model(session.provider, session.model_id, catalog=self._catalog)
 
@@ -261,15 +260,35 @@ class Application:
         if self._closed:
             raise RuntimeError("Application 已关闭。")
 
-    def _ensure_idle(self, runtime: SessionRuntime | None = None) -> None:
+    def _ensure_idle(self, runtime: SessionRuntime) -> None:
         self._ensure_open()
-        if runtime is not None and self._runtimes.get(runtime.session.id) is not runtime:
+        if self._runtimes.get(runtime.session.id) is not runtime:
             raise FileNotFoundError("会话已关闭。")
-        runtimes = self._runtimes.values() if runtime is None else (runtime,)
-        if any(item.running for item in runtimes):
+        if runtime.running:
             raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
-        if self._state_lock.locked():
-            raise RuntimeError("请等待会话或 MCP 更新完成。")
+        if runtime.state_lock.locked():
+            raise RuntimeError("请等待当前会话更新完成。")
+
+    def _active_tasks(self) -> list[asyncio.Task]:
+        return [runtime.task for runtime in self._runtimes.values() if runtime.task is not None and runtime.running]
+
+    def _ensure_mcp_idle(self) -> None:
+        self._ensure_open()
+        if self._mcp_update is not None:
+            raise RuntimeError("请等待 MCP 更新完成。")
+        if self._active_tasks():
+            raise RuntimeError("请先等待或取消当前 Turn，再更新 MCP。")
+
+    @contextmanager
+    def _changing_mcp(self) -> Iterator[None]:
+        # Reserve the shared catalog without holding a lock during network I/O.
+        self._ensure_mcp_idle()
+        update = self._mcp_update = asyncio.get_running_loop().create_future()
+        try:
+            yield
+        finally:
+            self._mcp_update = None
+            update.set_result(None)
 
     @property
     def _all_tools(self) -> tuple[str, ...]:
@@ -285,7 +304,7 @@ class Application:
     async def _mcp_error(self, name: str, error: str) -> None:
         self._revoke_mcp_trust(name)
         await self.events.emit(
-            "mcp.error", session_id=self._runtime.session.id, turn_id="", server=name, error=error
+            "mcp.error", session_id="", turn_id="", server=name, error=error
         )
 
     def _mcp_prompt_connection(self, server: str) -> MCPConnection:
@@ -331,8 +350,7 @@ class Application:
         )
 
     async def _connect_mcp(self, connection: MCPConnection) -> None:
-        self._ensure_idle()
-        async with self._state_lock:
+        with self._changing_mcp():
             await self._start_mcp(connection)
 
     async def _start_mcp(self, connection: MCPConnection) -> None:
@@ -353,34 +371,10 @@ class Application:
             error = "无法注册 MCP 工具定义。"
         else:
             if connection._can_publish():
-                try:
-                    if (
-                        previous is None
-                        and discovered
-                        and not self._use_saved_tool_preferences
-                        and self._model.supports_tools is True
-                    ):
-                        session = replace(
-                            self._runtime.session,
-                            enabled_tools=(*self._runtime.session.enabled_tools, *discovered),
-                        )
-                        await finish_io(self._save_and_publish_session(self._runtime, session))
-                except (SessionBusyError, SessionConflictError, asyncio.CancelledError) as exc:
-                    connection.tools = previous_tools
-                    await finish_io(connection.aclose())
-                    if not isinstance(exc, asyncio.CancelledError):
-                        connection.state, connection.error = "Error", "无法保存 MCP 工具启用偏好。"
-                    raise
-                except (OSError, TypeError, ValueError):
-                    error = "无法保存 MCP 工具启用偏好。"
-                else:
-                    if not self._closed and connection._can_publish():
-                        connection.state = "Connected"
-                        self._tools = tools
-                        return
-                    error = connection.error or "MCP 连接在发布前已中断。"
-            else:
-                error = connection.error or "MCP 连接在发布前已中断。"
+                connection.state = "Connected"
+                self._tools = tools
+                return
+            error = connection.error or "MCP 连接在发布前已中断。"
         connection.tools = previous_tools
         await connection.aclose()
         if self._closed:
@@ -389,16 +383,14 @@ class Application:
         raise RuntimeError(error)
 
     async def _disconnect_mcp(self, name: str) -> None:
-        self._ensure_idle()
-        async with self._state_lock:
+        with self._changing_mcp():
             connection = self._mcp[name]
             self._revoke_mcp_trust(name)
             await connection.aclose()
             self._tools = self._mcp_catalog()
 
     async def _refresh_mcp(self, name: str) -> None:
-        self._ensure_idle()
-        async with self._state_lock:
+        with self._changing_mcp():
             connection = self._mcp.get(name)
             if connection is None or not connection.available:
                 raise ValueError(f"MCP Server {name!r} 未连接。")
@@ -424,36 +416,30 @@ class Application:
             {name for name in previous if previous[name] != discovered.get(name)},
         )
         await self.events.emit(
-            "mcp.tools_changed", session_id=self._runtime.session.id, turn_id="", server=connection.name
+            "mcp.tools_changed", session_id="", turn_id="", server=connection.name
         )
 
     async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
-        # The active Turn keeps its definitions, but not its automatic authorization.
+        # Active Turns keep their definitions; revoke automatic trust immediately.
         self._revoke_mcp_trust(connection.name)
         self._mcp_pending.add(connection)
         try:
-            while not self._closed and connection in self._mcp_pending:
-                async with self._state_lock:
-                    active = [runtime.task for runtime in self._runtimes.values() if runtime.running]
-                    if not active:
-                        await self._refresh_pending_mcp()
-                        return
-                # Wait without adopting cancellation or failure from the Turn.
-                await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            while not self._closed and self._mcp.get(connection.name) is connection and connection.available:
+                if self._mcp_update is not None:
+                    await asyncio.wait((self._mcp_update,))
+                    continue
+                if active := self._active_tasks():
+                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    continue
+                with self._changing_mcp():
+                    try:
+                        await self._refresh_mcp_catalog(connection)
+                    except RuntimeError as exc:
+                        if not self._closed:
+                            await self._mcp_error(connection.name, str(exc))
+                return
         finally:
             self._mcp_pending.discard(connection)
-
-    async def _refresh_pending_mcp(self) -> None:
-        while self._mcp_pending and not self._closed:
-            connection = self._mcp_pending.pop()
-            if (
-                self._mcp.get(connection.name) is connection
-                and connection.available
-            ):
-                try:
-                    await self._refresh_mcp_catalog(connection)
-                except RuntimeError as exc:
-                    await self._mcp_error(connection.name, str(exc))
 
     async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
@@ -507,8 +493,10 @@ class Application:
         attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
         self._ensure_idle(runtime)
+        if self._mcp_update is not None:
+            raise RuntimeError("请等待 MCP 更新完成。")
         session = runtime.session
-        model = self._session_model(session)
+        model = self._model_for(session.provider, session.model_id)
         uploads = tuple(attachments)
         if any(isinstance(item, ImageAttachmentInput) for item in uploads):
             require_image_input(model)
@@ -745,7 +733,8 @@ class Application:
         runtime.session = session
 
     async def _update_session(self, runtime: SessionRuntime, session: Session) -> None:
-        async with self._state_lock:
+        self._ensure_idle(runtime)
+        async with runtime.state_lock:
             await finish_io(self._save_and_publish_session(runtime, session))
 
     def _has_usage_to_save(self, runtime: SessionRuntime) -> bool:
@@ -769,31 +758,34 @@ class Application:
         await asyncio.shield(self._close_task)
 
     async def _close_resources(self) -> None:
+        runtimes = tuple(self._runtimes.values())
         async with AsyncExitStack() as stack:
-            for client in self._clients.values():
-                stack.push_async_callback(client.aclose)
-            for adapter in self._document_adapters.values():
-                if adapter is not None:
-                    stack.push_async_callback(adapter.aclose)
             try:
                 results = await asyncio.gather(
-                    *(self._cancel_turn(runtime) for runtime in self._runtimes.values()),
-                    return_exceptions=True,
+                    *(self._cancel_turn(runtime) for runtime in runtimes), return_exceptions=True,
                 )
+                if self._mcp_update is not None:
+                    await self._mcp_update
+                for runtime in runtimes:
+                    async with runtime.state_lock:
+                        pass  # Wait for any in-flight settings or history write.
                 self.events.clear()
                 await self.events.drain(timeout=_EVENT_DRAIN_TIMEOUT)
                 for result in results:
                     if isinstance(result, BaseException):
                         raise result
             finally:
-                async with self._state_lock:
-                    for connection in self._mcp.values():
-                        stack.push_async_callback(connection.aclose)
-                    if self._mcp:
-                        self._mcp.clear()
-                        self._tools = self._mcp_catalog()
-                self._trusted_tools.clear()
-                for runtime in self._runtimes.values():
+                for client in self._clients.values():
+                    stack.push_async_callback(client.aclose)
+                for adapter in self._document_adapters.values():
+                    if adapter is not None:
+                        stack.push_async_callback(adapter.aclose)
+                for connection in self._mcp.values():
+                    stack.push_async_callback(connection.aclose)
+                self._mcp.clear()
+                self._tools = self._mcp_catalog()
+                for runtime in runtimes:
                     runtime.usage.close()
                 self._runtimes.clear()
+                self._trusted_tools.clear()
                 self.events.clear()

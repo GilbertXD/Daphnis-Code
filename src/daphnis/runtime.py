@@ -25,7 +25,7 @@ async def open_operations(
     """Start an interactive runtime from server-side configuration."""
     load_dotenv(Path.cwd() / ".env", override=False)
     provider, model_id, connections = environment_connections()
-    ops = Operations(Application(
+    app = Application(
         workspace=workspace,
         provider=provider,
         model_id=model_id,
@@ -33,10 +33,9 @@ async def open_operations(
         **environment_context_options(),
         interactive=True,
         observe_model_io=observe_model_io,
-    ))
+    )
     try:
-        if session_id is not None:
-            ops.restore_session(session_id)
+        ops = Operations(app, initial_session_id=session_id)
         if config := os.getenv("DAPHNIS_MCP_CONFIG"):
             try:
                 ops.import_mcp(Path(config).expanduser())
@@ -55,6 +54,6 @@ async def open_operations(
             except (OSError, RuntimeError, TypeError, ValueError):
                 logger.warning("无法恢复 MCP 服务 %s，可在管理界面重试。", server.name)
     except BaseException:
-        await ops.close()
+        await app.close()
         raise
     return ops

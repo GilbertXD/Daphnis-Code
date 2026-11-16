@@ -185,8 +185,8 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
 
         ops = self.runtime(handler)
         ops.subscribe("model.request", previews.append)
-        system = ops.get_system_prompt()
-        result = await ops.send("Inspect old", attachments=[self.red], stream=False)
+        system = ops.get_system_prompt(ops.initial_session_id)
+        result = await ops.send("Inspect old", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(primary[-1][0], {"role": "system", "content": system})
         self.assertEqual(primary[-1][1], {"role": "user", "content": [
@@ -198,7 +198,7 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         green = image_upload("latest.jpg", "JPEG", "green")
         uploads = [blue, TextAttachmentInput("notes.txt", "inline notes"), green]
         submission = "a" * 32
-        result = await ops.send("Compare", attachments=uploads, stream=False, submission_id=submission)
+        result = await ops.send("Compare", attachments=uploads, stream=False, submission_id=submission, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         newest = primary[-1][-1]["content"]
         self.assertIn("inline notes", newest[0]["text"])
@@ -206,42 +206,42 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(previews)
         self.assertTrue(all(event.data.get("omitted") for event in previews))
         self.assertNotIn("data:image/", json.dumps([event.data for event in previews]))
-        session_id = ops.session.id
+        session_id = ops.initial_session_id
         self.assertNotIn("base64", self.saved(session_id))
         await ops.close()
 
         resumed = self.runtime(handler)
         resumed.restore_session(session_id)
-        self.assertTrue(resumed.attachment_submitted(submission, "Compare", uploads))
-        self.assertEqual([message["content"] for message in resumed.message_snapshot()],
+        self.assertTrue(resumed.attachment_submitted(submission, "Compare", uploads, session_id=session_id))
+        self.assertEqual([message["content"] for message in resumed.message_snapshot(session_id)],
                          ["Inspect old", "Done", "Compare", "Done"])
-        checkpoint = await resumed.compact()
+        checkpoint = await resumed.compact(session_id)
         self.assertIsNotNone(checkpoint)
         self.assertEqual(checkpoint.through, 2)
         summary_source = json.dumps(summaries, ensure_ascii=False)
         for field in ("old.png", "image/png", "width", "height", "Image metadata is not visual evidence"):
             self.assertIn(field, summary_source)
         self.assertNotIn("base64", summary_source)
-        result = await resumed.send("Describe the images in the current context", stream=False)
+        result = await resumed.send("Describe the images in the current context", stream=False, session_id=session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(image_urls(primary[-1]), [image_url(blue), image_url(green)])
-        self.assertEqual(len(resumed.message_snapshot()), 6)
+        self.assertEqual(len(resumed.message_snapshot(session_id)), 6)
         unchanged = self.history.load(session_id)
 
         summary_mode = "error"
         with self.assertRaises(APIError):
-            await resumed.compact()
+            await resumed.compact(session_id)
         self.assertEqual(self.history.load(session_id).compaction, checkpoint)
         summary_mode = "block"
-        pending = asyncio.create_task(resumed.compact())
+        pending = asyncio.create_task(resumed.compact(session_id))
         await asyncio.wait_for(summary_started.wait(), timeout=5)
-        await resumed.cancel()
+        await resumed.cancel(session_id)
         with self.assertRaises(asyncio.CancelledError):
             await pending
         self.assertEqual(self.history.load(session_id).compaction, checkpoint)
 
         summary_mode = "ok"
-        second = await resumed.compact()
+        second = await resumed.compact(session_id)
         self.assertEqual(second.through, 4)
         after = self.history.load(session_id)
         self.assertEqual(after.compaction, second)
@@ -254,8 +254,8 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = self.runtime(handler)
         reopened.restore_session(session_id)
-        self.assertEqual(reopened.compacted_through, 4)
-        result = await reopened.send("Continue from the summary", stream=False)
+        self.assertEqual(reopened.compacted_through(session_id), 4)
+        result = await reopened.send("Continue from the summary", stream=False, session_id=session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(image_urls(primary[-1]), [])
         self.assertEqual(self.history.load(session_id).attachment_refs, unchanged.attachment_refs)
@@ -287,19 +287,19 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
                 ops = self.runtime(handler, compaction_settings=settings)
                 ops.subscribe("context.budget", budgets.append)
                 ops.subscribe("compaction.finished", compactions.append)
-                await ops.set_system_prompt("Inspect images.")
-                await ops.set_tools([])
-                first = await ops.send("Review old", attachments=[self.red], stream=False)
+                await ops.set_system_prompt("Inspect images.", session_id=ops.initial_session_id)
+                await ops.set_tools([], session_id=ops.initial_session_id)
+                first = await ops.send("Review old", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
                 self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
-                second = await ops.send("Review new", attachments=[blue, green], stream=False)
+                second = await ops.send("Review new", attachments=[blue, green], stream=False, session_id=ops.initial_session_id)
                 self.assertEqual(second.status, TurnStatus.COMPLETED, second.error)
                 self.assertEqual([event.data["trigger"] for event in compactions], [cause])
-                self.assertEqual(ops.compacted_through, 2)
+                self.assertEqual(ops.compacted_through(ops.initial_session_id), 2)
                 self.assertEqual(image_urls(calls[-1]), [image_url(blue), image_url(green)])
                 self.assertEqual(len(calls), 2 if cause == "pressure" else 3)
                 self.assertEqual(len(summaries), 1)
                 self.assertNotIn("base64", json.dumps(summaries))
-                self.assertEqual(len(self.history.load(ops.session.id).attachment_refs), 2)
+                self.assertEqual(len(self.history.load(ops.initial_session_id).attachment_refs), 2)
                 self.assertIn("old.png", json.dumps(summaries))
                 text = [*calls[-1][:-1], {**calls[-1][-1], "content": "Review new"}]
                 self.assertEqual(budgets[-1].data["input_tokens"],
@@ -326,23 +326,23 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         # Exercise the 32 MiB path without generating or decoding large fixtures.
         cap = max(len(self.red.data), len(blue.data))
         with patch("daphnis.agent.MAX_IMAGE_REQUEST_BYTES", cap):
-            first = await ops.send("Review old", attachments=[self.red], stream=False)
+            first = await ops.send("Review old", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
             self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
-            second = await ops.send("Review new", attachments=[blue], stream=False)
+            second = await ops.send("Review new", attachments=[blue], stream=False, session_id=ops.initial_session_id)
             self.assertEqual(second.status, TurnStatus.COMPLETED, second.error)
             self.assertEqual(calls, [[image_url(self.red)], [image_url(blue)]])
             self.assertEqual(len(summary_requests), 1)
-            self.assertEqual(ops.compacted_through, 2)
+            self.assertEqual(ops.compacted_through(ops.initial_session_id), 2)
             candidate = candidates[-1].data
             self.assertEqual(candidate["reason"], "image_bytes_reduced")
             self.assertGreaterEqual(candidate["after_tokens"], candidate["before_tokens"])
-            rejected = await ops.send("Review both", attachments=[blue, self.red], stream=False)
+            rejected = await ops.send("Review both", attachments=[blue, self.red], stream=False, session_id=ops.initial_session_id)
             self.assertEqual(rejected.status, TurnStatus.FAILED)
             self.assertIn("图片超过 32 MiB", rejected.error)
             self.assertEqual(len(calls), 2)
             self.assertEqual(len(summary_requests), 1)
-            self.assertEqual(ops.compacted_through, 2)
-            self.assertEqual(len(self.history.load(ops.session.id).attachment_refs[4].images), 2)
+            self.assertEqual(ops.compacted_through(ops.initial_session_id), 2)
+            self.assertEqual(len(self.history.load(ops.initial_session_id).attachment_refs[4].images), 2)
 
     async def test_model_switch_checks_target_capability_for_history(self):
         requests = []
@@ -357,16 +357,16 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         compatible = replace(original, id="custom-vision")
         disabled = replace(original, id="custom-text", supports_image=False)
         ops = self.runtime(handler, catalog=(*MODELS, compatible, disabled))
-        first = await ops.send("Review", attachments=[self.red], stream=False)
+        first = await ops.send("Review", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(first.status, TurnStatus.COMPLETED, first.error)
         for model_id, reason in (("deepseek-v4-pro", "图片能力未确认"), ("custom-text", "明确不支持图片")):
-            await ops.set_model("deepseek", model_id)
-            rejected = await ops.send("Follow up", stream=False)
+            await ops.set_model("deepseek", model_id, session_id=ops.initial_session_id)
+            rejected = await ops.send("Follow up", stream=False, session_id=ops.initial_session_id)
             self.assertEqual(rejected.status, TurnStatus.FAILED)
             self.assertIn(reason, rejected.error)
         self.assertEqual(len(requests), 1)
-        await ops.set_model("deepseek", "custom-vision")
-        result = await ops.send("Follow up", stream=False)
+        await ops.set_model("deepseek", "custom-vision", session_id=ops.initial_session_id)
+        result = await ops.send("Follow up", stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(requests[-1]["model"], "custom-vision")
         self.assertEqual(image_urls(requests[-1]["messages"]), [image_url(self.red)])
@@ -396,28 +396,29 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
 
         ops = self.runtime(handler)
         ops.subscribe("model.finished", events.append)
-        result = await ops.send("", attachments=[self.red], stream=False)
+        result = await ops.send("", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
-        self.assertEqual(ops.message_snapshot()[0]["content"], "已附上图片。")
-        sid = ops.session.id
+        self.assertEqual(ops.message_snapshot(ops.initial_session_id)[0]["content"], "已附上图片。")
+        sid = ops.initial_session_id
         await ops.close()
 
         resumed = self.runtime(handler)
         resumed.restore_session(sid)
         bridge = Bridge(resumed, Redactor(()))
+        bridge.session_id = sid
         for name in ("model.request", "model.delta", "model.finished"):
             resumed.subscribe(name, events.append)
         resumed.subscribe("model.delta", lambda _: frames.append(bridge.frame()))
         bridge.start("Describe the previous image")
         await bridge.task
         self.assertEqual(observed_urls, [[image_url(self.red)], [image_url(self.red)]])
-        self.assertEqual(len(resumed.message_snapshot()), 4)
+        self.assertEqual(len(resumed.message_snapshot(sid)), 4)
         visible = json.dumps([self.saved(sid), bridge.frame(), *frames, *(event.data for event in events)])
         self.assertIn("Still visible.", visible)
         self.assertNotIn("base64", visible)
         self.assertNotIn(payload, visible)
         self.assertTrue(frames)
-        self.assertEqual([message["role"] for message in resumed.message_snapshot()], ["user", "assistant"] * 2)
+        self.assertEqual([message["role"] for message in resumed.message_snapshot(sid)], ["user", "assistant"] * 2)
 
     async def test_persistence_failure_http_failure_cancel_and_corrupt_snapshot(self):
         started = asyncio.Event()
@@ -437,24 +438,24 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
             return reply("Recovered")
 
         ops = self.runtime(handler)
-        sid = ops.session.id
+        sid = ops.initial_session_id
         with patch("daphnis.attachments.AttachmentStore.write", side_effect=OSError("disk full")):
-            result = await ops.send("Save this", attachments=[self.red], stream=False)
+            result = await ops.send("Save this", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("持久化", result.error)
-        self.assertEqual(ops.attachment_snapshot(), {})
+        self.assertEqual(ops.attachment_snapshot(ops.initial_session_id), {})
         self.assertFalse((self.history.directory / f"{sid}.json").exists())
         self.assertEqual(requested, [])
 
-        result = await ops.send("Save this", attachments=[self.red], stream=False)
+        result = await ops.send("Save this", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.error, "模型请求失败。")
         refs = self.history.load(sid).attachment_refs
-        self.assertEqual(len(ops.message_snapshot()), 1)
+        self.assertEqual(len(ops.message_snapshot(ops.initial_session_id)), 1)
         self.assertEqual(len(refs[0].images), 1)
         mode = "block"
-        retry = asyncio.create_task(ops.retry_failed_user(ops.recovery.key, stream=False))
+        retry = asyncio.create_task(ops.retry_failed_user(ops.recovery(ops.initial_session_id).key, stream=False, session_id=ops.initial_session_id))
         await asyncio.wait_for(started.wait(), timeout=5)
-        await ops.cancel()
+        await ops.cancel(ops.initial_session_id)
         with self.assertRaises(asyncio.CancelledError):
             await retry
         self.assertEqual(self.history.load(sid).attachment_refs, refs)
@@ -472,7 +473,7 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         path.chmod(0o400)
         with self.assertRaisesRegex(OSError, "校验"):
             self.history.attachments.read_image(sid, item)
-        result = await ops.retry_failed_user(ops.recovery.key, stream=False)
+        result = await ops.retry_failed_user(ops.recovery(sid).key, stream=False, session_id=sid)
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("图片附件快照不可用", result.error)
         self.assertEqual(len(requested), 2)
@@ -481,10 +482,10 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         path.chmod(0o600)
         path.write_bytes(data)
         path.chmod(0o400)
-        result = await ops.retry_failed_user(ops.recovery.key, stream=False)
+        result = await ops.retry_failed_user(ops.recovery(sid).key, stream=False, session_id=sid)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(requested, [[image_url(self.red)]] * 3)
-        self.assertEqual(len(ops.message_snapshot()), 2)
+        self.assertEqual(len(ops.message_snapshot(sid)), 2)
         self.assertEqual(self.history.load(sid).attachment_refs, refs)
 
     async def test_unsupported_model_and_unsafe_context_do_not_send(self):
@@ -493,16 +494,16 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
 
         ops = self.runtime(unexpected_request, model_id="deepseek-v4-pro")
         with self.assertRaisesRegex(ValueError, "不支持 Daphnis 图片"):
-            await ops.send("Inspect", attachments=[self.red], stream=False)
-        self.assertEqual(ops.message_snapshot(), [])
+            await ops.send("Inspect", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
+        self.assertEqual(ops.message_snapshot(ops.initial_session_id), [])
         await ops.close()
 
         for context_window, error in ((None, "上限未知"), (1_000, "超过上下文安全上限")):
             catalog = tuple(replace(model, context_window=context_window) if model.id == "deepseek-flash"
                             else model for model in MODELS)
             ops = self.runtime(unexpected_request, catalog=catalog)
-            result = await ops.send("Inspect", attachments=[self.red], stream=False)
+            result = await ops.send("Inspect", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
             self.assertEqual(result.status, TurnStatus.FAILED)
             self.assertIn(error, result.error)
-            self.assertTrue(self.history.load(ops.session.id).attachment_refs)
+            self.assertTrue(self.history.load(ops.initial_session_id).attachment_refs)
             await ops.close()

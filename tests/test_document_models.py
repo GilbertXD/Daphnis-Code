@@ -201,19 +201,19 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
         for name in ("model.request", "model.finished", "context.budget"):
             ops.subscribe(name, events.append)
         upload = document()
-        failed = await ops.send("Read", attachments=[upload], stream=False)
+        failed = await ops.send("Read", attachments=[upload], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(failed.status, TurnStatus.FAILED)
-        session = ops.session.id
+        session = ops.initial_session_id
         refs = self.history.load(session).attachment_refs
         original = self.service.saved[0]["id"]
         self.invalid = True
-        result = await ops.retry_failed_user(ops.recovery.key, stream=False)
+        result = await ops.retry_failed_user(ops.recovery(ops.initial_session_id).key, stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual([file_ids(body["messages"]) for body in self.wire],
                          [[original], [original], [self.service.saved[1]["id"]]])
         self.assertEqual(len(self.service.uploads), 2)
         self.assertEqual(self.history.load(session).attachment_refs, refs)
-        self.assertEqual(len(ops.message_snapshot()), 2)
+        self.assertEqual(len(ops.message_snapshot(ops.initial_session_id)), 2)
         self.assertTrue(any(e.name == "context.budget" and e.data["unknown_documents"] == 1 for e in events))
         data = (self.history.directory / f"{session}.json").read_text() + json.dumps([e.data for e in events])
         self.assertNotIn("file-api-", data)
@@ -221,15 +221,15 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compaction_restore_and_switch_preserve_only_effective_documents(self):
         first = self.runtime()
+        session = first.initial_session_id
         a, b = document(name="alpha"), document(".docx", name="beta")
         for prompt, attachments in (("Read A", [a]), ("About A", []), ("Read B", [b])):
-            result = await first.send(prompt, attachments=attachments, stream=False)
+            result = await first.send(prompt, attachments=attachments, stream=False, session_id=session)
             self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
-        session = first.session.id
         original = self.history.load(session)
         a_ref, b_ref = (item["id"] for item in self.service.saved)
         self.assertEqual(file_ids(self.wire[2]["messages"]), [a_ref, b_ref])
-        checkpoint = await first.compact()
+        checkpoint = await first.compact(session)
         self.assertEqual(checkpoint.through, 4)
         self.assertNotIn("file-api-", json.dumps(self.wire[-1]))
         self.assertIn("alpha.pdf", json.dumps(self.wire[-1]))
@@ -238,18 +238,18 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
 
         reopened = self.runtime()
         reopened.restore_session(session)
-        result = await reopened.send("About B", stream=False)
+        result = await reopened.send("About B", stream=False, session_id=session)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(file_ids(self.wire[-1]["messages"]), [b_ref])
         self.assertEqual(len(self.service.uploads), 2)
-        await reopened.set_model("mimo", "mimo-v2.6-flash")
+        await reopened.set_model("mimo", "mimo-v2.6-flash", session_id=session)
         count = len(self.wire)
-        blocked = await reopened.send("Try another model", stream=False)
+        blocked = await reopened.send("Try another model", stream=False, session_id=session)
         self.assertEqual(blocked.status, TurnStatus.FAILED)
         self.assertIn("不支持有效上下文中的文档", blocked.error)
         self.assertEqual(len(self.wire), count)
-        await reopened.compact()
-        result = await reopened.retry_failed_user(reopened.recovery.key, stream=False)
+        await reopened.compact(session)
+        result = await reopened.retry_failed_user(reopened.recovery(session).key, stream=False, session_id=session)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual(self.wire[-1]["model"], "mimo-v2.6-flash")
         self.assertEqual(file_ids(self.wire[-1]["messages"]), [])
@@ -262,16 +262,16 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_during_upload_never_calls_chat_and_latest_document_overflow_is_explicit(self):
         ops = self.runtime()
         self.service.hold = True
-        running = asyncio.create_task(ops.send("Read", attachments=[document()], stream=False))
+        running = asyncio.create_task(ops.send("Read", attachments=[document()], stream=False, session_id=ops.initial_session_id))
         await asyncio.wait_for(self.service.started.wait(), 3)
-        await ops.cancel()
+        await ops.cancel(ops.initial_session_id)
         with self.assertRaises(asyncio.CancelledError):
             await running
         self.assertEqual(self.wire, [])
         self.overflow = True
-        result = await ops.retry_failed_user(ops.recovery.key, stream=False)
+        result = await ops.retry_failed_user(ops.recovery(ops.initial_session_id).key, stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.FAILED)
         self.assertIn("文档和当前上下文超过模型上限", result.error)
         self.assertEqual(len(self.service.uploads), 1)
         self.assertEqual(len(self.wire), 1)
-        self.assertTrue(self.history.load(ops.session.id).attachment_refs)
+        self.assertTrue(self.history.load(ops.initial_session_id).attachment_refs)

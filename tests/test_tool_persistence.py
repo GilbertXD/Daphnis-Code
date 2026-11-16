@@ -62,18 +62,16 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
             }},
             history=self.history, interactive=interactive, max_primary_requests=max_primary_requests,
         )
-        ops = Operations(app)
+        ops = Operations(app, initial_session_id=restore)
         self.addAsyncCleanup(ops.close)
-        if restore is not None:
-            ops.restore_session(restore)
         return ops
 
     def saved(self, ops):
-        return self.history.load(ops.session.id).messages.snapshot()
+        return self.history.load(ops.initial_session_id).messages.snapshot()
 
     def approve_writes(self, ops):
         async def approve(event):
-            ops.resolve_approval(event.data["request_id"], "allow_once")
+            ops.resolve_approval(event.data["request_id"], "allow_once", session_id=ops.initial_session_id)
 
         ops.subscribe("tool.approval_requested", approve)
 
@@ -94,22 +92,22 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     prompt = PromptInput("writes", "test", "writes", (
                         ("assistant", "Sample response"), ("user", "Write files"),
                     ))
-                    pending = ops.run_mcp_prompt(prompt, stream=False)
+                    pending = ops.run_mcp_prompt(prompt, stream=False, session_id=ops.initial_session_id)
                 else:
-                    pending = ops.send("write files", stream=False)
+                    pending = ops.send("write files", stream=False, session_id=ops.initial_session_id)
                 paused = await asyncio.wait_for(pending, 3)
                 self.assertEqual(paused.status, TurnStatus.PAUSED_LIMIT)
                 original = tool_results(self.saved(ops))
-                resumed = self.application(restore=ops.session.id)
-                self.assertEqual(resumed.recovery.message_index, 0)
-                key = resumed.recovery.key
+                resumed = self.application(restore=ops.initial_session_id)
+                self.assertEqual(resumed.recovery(resumed.initial_session_id).message_index, 0)
+                key = resumed.recovery(resumed.initial_session_id).key
                 if terminate:
-                    result = await resumed.terminate_interrupted_turn(key)
+                    result = await resumed.terminate_interrupted_turn(key, session_id=resumed.initial_session_id)
                     self.assertEqual(result.status, TurnStatus.TERMINATED)
                     self.assertEqual(len(self.requests), 1)
-                    resumed.restore_session(ops.session.id)
-                    self.assertIsNone(resumed.recovery)
-                    self.assertEqual((await resumed.send("new task", stream=False)).status, TurnStatus.COMPLETED)
+                    resumed.restore_session(ops.initial_session_id)
+                    self.assertIsNone(resumed.recovery(resumed.initial_session_id))
+                    self.assertEqual((await resumed.send("new task", stream=False, session_id=resumed.initial_session_id)).status, TurnStatus.COMPLETED)
                     projected = tool_results(self.requests[-1])
                     self.assertEqual(projected[:-1], original[:-1])
                     last = json.loads(projected[-1]["content"])
@@ -117,11 +115,11 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(last["ok"])
                     self.assertEqual(last, json.loads(original[-1]["content"]))
                 else:
-                    result = await resumed.continue_interrupted_turn(key, stream=False)
+                    result = await resumed.continue_interrupted_turn(key, stream=False, session_id=resumed.initial_session_id)
                     self.assertEqual(result.status, TurnStatus.COMPLETED)
                     self.assertEqual(self.requests[-1][-1]["role"], "tool")
                 self.assertEqual(tool_results(self.saved(resumed)), original)
-                self.assertIsNone(resumed.recovery)
+                self.assertIsNone(resumed.recovery(resumed.initial_session_id))
 
     async def test_group_and_each_transition_are_saved_before_notifications(self):
         self.calls.append(write_call("invalid", content="missing path"))
@@ -131,11 +129,11 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         def record(event):
             saved = self.saved(ops)
-            observed.append((event.name, event.data, saved, ops.message_snapshot()))
+            observed.append((event.name, event.data, saved, ops.message_snapshot(ops.initial_session_id)))
 
         for name in ("tool.started", "tool.executing", "tool.finished"):
             ops.subscribe(name, record)
-        result = await asyncio.wait_for(ops.send("write files", stream=False), 3)
+        result = await asyncio.wait_for(ops.send("write files", stream=False, session_id=ops.initial_session_id), 3)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         self.assertEqual([
             (name, data["tool_call_id"], [msg.get(TOOL_STATE) for msg in tool_results(saved)])
@@ -180,23 +178,23 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                     replace_file(path, data)
 
                 with patch.object(self.history, "_replace", side_effect=save):
-                    result = await asyncio.wait_for(ops.send("write files", stream=False), 3)
+                    result = await asyncio.wait_for(ops.send("write files", stream=False, session_id=ops.initial_session_id), 3)
                 self.assertEqual(result.status, TurnStatus.FAILED)
                 self.assertIn("injected save failure", result.error)
                 self.assertEqual(result.external_side_effects_possible, effect)
                 self.assertEqual(observed, expected_events)
                 self.assertEqual(len(self.requests), 1)
                 saved = self.saved(ops)
-                self.assertEqual(ops.message_snapshot(), saved)
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), saved)
                 self.assertEqual([msg.get(TOOL_STATE) for msg in tool_results(saved)], saved_states)
                 self.assertEqual((self.root / "a.txt").exists(), effect)
                 self.assertFalse((self.root / "b.txt").exists())
 
         # The real write succeeded before its result save failed. Recovery must
         # preserve that uncertainty even though this test knows the file exists.
-        resumed = self.application(interactive=True, restore=ops.session.id)
+        resumed = self.application(interactive=True, restore=ops.initial_session_id)
         self.approve_writes(resumed)
-        result = await asyncio.wait_for(resumed.continue_interrupted_turn(resumed.recovery.key, stream=False), 3)
+        result = await asyncio.wait_for(resumed.continue_interrupted_turn(resumed.recovery(resumed.initial_session_id).key, stream=False, session_id=resumed.initial_session_id), 3)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
         first, second = tool_results(self.saved(resumed))
         self.assertEqual(json.loads(first["content"])["error"]["code"], "execution_result_unknown")
@@ -213,7 +211,7 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 asyncio.current_task().cancel()
 
         ops.subscribe("tool.started", interrupt)
-        task = asyncio.create_task(ops.send("write files", stream=False))
+        task = asyncio.create_task(ops.send("write files", stream=False, session_id=ops.initial_session_id))
         with self.assertRaises(asyncio.CancelledError):
             await asyncio.wait_for(task, 3)
         await ops.close()
@@ -222,13 +220,13 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                          [PENDING, PENDING, PENDING, PENDING])
         self.assertFalse((self.root / "a.txt").exists())
 
-        resumed = self.application(interactive=True, restore=ops.session.id)
-        resumed.restore_session(ops.session.id)
-        self.assertEqual(resumed.message_snapshot(), interrupted)
+        resumed = self.application(interactive=True, restore=ops.initial_session_id)
+        resumed.restore_session(ops.initial_session_id)
+        self.assertEqual(resumed.message_snapshot(resumed.initial_session_id), interrupted)
         self.assertEqual(len(self.requests), 1)
         with self.assertRaisesRegex(ValueError, "继续"):
-            await resumed.compact()
-        blocked = await resumed.send("new task", stream=False)
+            await resumed.compact(resumed.initial_session_id)
+        blocked = await resumed.send("new task", stream=False, session_id=resumed.initial_session_id)
         self.assertEqual(blocked.status, TurnStatus.FAILED)
         self.assertIn("继续", blocked.error)
         self.assertEqual(len(self.requests), 1)
@@ -237,15 +235,15 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
         approvals, executed = asyncio.Queue(), []
         resumed.subscribe("tool.approval_requested", approvals.put_nowait)
         resumed.subscribe("tool.executing", lambda event: executed.append(event.data["tool_call_id"]))
-        old_key = resumed.recovery.key
-        task = asyncio.create_task(resumed.continue_interrupted_turn(old_key, stream=False))
+        old_key = resumed.recovery(resumed.initial_session_id).key
+        task = asyncio.create_task(resumed.continue_interrupted_turn(old_key, stream=False, session_id=resumed.initial_session_id))
         try:
             for name, decision in (("a", "deny"), ("b", "deny"), ("c", "allow_once"), ("d", "allow_once")):
                 event = await asyncio.wait_for(approvals.get(), 2)
                 self.assertEqual(event.data["tool_call_id"], name)
                 if name == "c":
                     (self.root / "c.txt").write_text("changed during approval")
-                self.assertTrue(resumed.resolve_approval(event.data["request_id"], decision))
+                self.assertTrue(resumed.resolve_approval(event.data["request_id"], decision, session_id=resumed.initial_session_id))
             result = await asyncio.wait_for(task, 2)
         finally:
             if not task.done():
@@ -264,8 +262,8 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
                          ["permission_denied", "target_changed"])
         self.assertTrue(results[3]["ok"])
         self.assertEqual(self.requests[1][1:], project_turn_messages(saved[:-1]))
-        resumed.restore_session(ops.session.id)
-        self.assertIsNone(resumed.recovery)
-        self.assertEqual((await resumed.continue_interrupted_turn(old_key, stream=False)).status, TurnStatus.FAILED)
+        resumed.restore_session(ops.initial_session_id)
+        self.assertIsNone(resumed.recovery(resumed.initial_session_id))
+        self.assertEqual((await resumed.continue_interrupted_turn(old_key, stream=False, session_id=resumed.initial_session_id)).status, TurnStatus.FAILED)
         self.assertEqual(executed, ["d"])
         self.assertEqual(tool_results(self.saved(resumed)), tool_results(saved))

@@ -84,8 +84,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
             )
             ops = Operations(app)
-            a = app._runtime
-            b = app._load_runtime((await ops.new_session()).id)
+            a = app._runtimes[app.initial_session_id]
+            b = app._load_runtime((await ops.new_session(session_id=ops.initial_session_id)).id)
             self.assertIs(app._load_runtime(a.session.id), a)
             approvals = asyncio.Queue()
             app.events.on("tool.approval_requested", approvals.put_nowait)
@@ -148,15 +148,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 output_limits={("mimo", "b"): 500},
             ))
             self.addAsyncCleanup(ops.close)
-            self.assertEqual((await ops.send("one", stream=False)).status, TurnStatus.COMPLETED)
-            budget = ops.context_budget
+            self.assertEqual((await ops.send("one", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+            budget = ops.context_budget(ops.initial_session_id)
             self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (7500, 1500, 9500))
             self.assertNotIn("max_completion_tokens", bodies[-1])
 
-            await ops.set_model("mimo", "b")
-            self.assertIsNone(ops.context_budget)
-            self.assertEqual((await ops.send("two", stream=False)).status, TurnStatus.COMPLETED)
-            budget = ops.context_budget
+            await ops.set_model("mimo", "b", session_id=ops.initial_session_id)
+            self.assertIsNone(ops.context_budget(ops.initial_session_id))
+            self.assertEqual((await ops.send("two", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+            budget = ops.context_budget(ops.initial_session_id)
             self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (12000, 500, 19000))
             self.assertEqual(bodies[-1]["max_completion_tokens"], 500)
 
@@ -192,22 +192,22 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
             ops = Operations(app)
             try:
-                default = ops.get_system_prompt()
-                history.save(app._runtime.session)
-                ops.restore_session(ops.session.id)
-                self.assertEqual(ops.get_system_prompt(), default)
-                await ops.set_system_prompt(custom)
-                ops.restore_session(ops.session.id)
-                self.assertEqual(ops.get_system_prompt(), custom)
-                result = await ops.send("test", stream=False)
+                default = ops.get_system_prompt(ops.initial_session_id)
+                history.save(app._runtimes[app.initial_session_id].session)
+                ops.restore_session(ops.initial_session_id)
+                self.assertEqual(ops.get_system_prompt(ops.initial_session_id), default)
+                await ops.set_system_prompt(custom, session_id=ops.initial_session_id)
+                ops.restore_session(ops.initial_session_id)
+                self.assertEqual(ops.get_system_prompt(ops.initial_session_id), custom)
+                result = await ops.send("test", stream=False, session_id=ops.initial_session_id)
                 self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
                 self.assertEqual(seen[0][0], {"role": "system", "content": custom})
                 errors = [json.loads(item["content"])["error"]["code"] for item in seen[1] if item["role"] == "tool"]
                 self.assertEqual(errors, ["permission_denied", "command_blocked"])
                 self.assertFalse((root / "denied.txt").exists())
-                await ops.reset_system_prompt()
-                self.assertIsNone(history.load(ops.session.id).system_prompt)
-                self.assertEqual(ops.get_system_prompt(), default)
+                await ops.reset_system_prompt(ops.initial_session_id)
+                self.assertIsNone(history.load(ops.initial_session_id).system_prompt)
+                self.assertEqual(ops.get_system_prompt(ops.initial_session_id), default)
             finally:
                 await ops.close()
 
@@ -242,24 +242,24 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             approvals = asyncio.Queue()
             app.events.on("tool.approval_requested", approvals.put_nowait)
 
-            send = asyncio.create_task(ops.send("create both", stream=False))
+            send = asyncio.create_task(ops.send("create both", stream=False, session_id=ops.initial_session_id))
             try:
                 async with asyncio.timeout(3):
                     await approvals.get()
-                    first = ops.pending_approval
-                    self.assertTrue(ops.resolve_approval(first.request_id, "allow_once"))
-                    self.assertFalse(ops.resolve_approval(first.request_id, "allow_once"))
+                    first = ops.pending_approval(ops.initial_session_id)
+                    self.assertTrue(ops.resolve_approval(first.request_id, "allow_once", session_id=ops.initial_session_id))
+                    self.assertFalse(ops.resolve_approval(first.request_id, "allow_once", session_id=ops.initial_session_id))
                     second_event = await approvals.get()
-                    second = ops.pending_approval
+                    second = ops.pending_approval(ops.initial_session_id)
                     self.assertEqual(first.tool_call_id, second.tool_call_id)
-                    self.assertFalse(ops.resolve_approval(first.request_id, "trust_session"))
-                    self.assertFalse(ops.resolve_approval(first.request_id, "allow_once"))
+                    self.assertFalse(ops.resolve_approval(first.request_id, "trust_session", session_id=ops.initial_session_id))
+                    self.assertFalse(ops.resolve_approval(first.request_id, "allow_once", session_id=ops.initial_session_id))
                     self.assertFalse((root / "file1").exists())
                     self.assertEqual(second_event.data["request_id"], second.request_id)
-                    self.assertTrue(ops.resolve_approval(second.request_id, "allow_once"))
+                    self.assertTrue(ops.resolve_approval(second.request_id, "allow_once", session_id=ops.initial_session_id))
                     self.assertEqual((await send).status, TurnStatus.COMPLETED)
                 self.assertEqual((root / "file1").read_text(), "ok\n")
-                self.assertFalse(ops.resolve_approval(second.request_id, "trust_session"))
+                self.assertFalse(ops.resolve_approval(second.request_id, "trust_session", session_id=ops.initial_session_id))
             finally:
                 await ops.close()
                 await asyncio.gather(send, return_exceptions=True)
@@ -333,14 +333,14 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             a = Operations(Application(**options, history=history))
             b = Operations(Application(**options, history=History(history.directory)))
             try:
-                history.save(a._app._runtime.session)
-                await a.set_thinking("high")
-                b.restore_session(a.session.id)
-                await a.send("first writer", stream=False)
+                history.save(a._app._runtimes[a.initial_session_id].session)
+                await a.set_thinking("high", session_id=a.initial_session_id)
+                b.restore_session(a.initial_session_id)
+                await a.send("first writer", stream=False, session_id=a.initial_session_id)
                 with self.assertRaisesRegex(RuntimeError, "Session write conflict"):
-                    await b.send("stale writer", stream=False)
+                    await b.send("stale writer", stream=False, session_id=a.initial_session_id)
                 self.assertEqual(len(model_calls), 2)
-                saved = history.load(a.session.id).messages.snapshot()
+                saved = history.load(a.initial_session_id).messages.snapshot()
                 self.assertEqual(saved[0]["content"], "first writer")
                 self.assertEqual(len(saved), 2)
             finally:
@@ -375,7 +375,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     "max_primary_requests": 1 if scenario == "save_failure" else 20,
                 }
                 ops = Operations(Application(**options))
-                session_id = ops.session.id
+                session_id = ops.initial_session_id
                 replace_file = history._replace
 
                 def save(path, data):
@@ -385,11 +385,11 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
                 try:
                     with patch.object(history, "_replace", side_effect=save):
-                        result = await ops.send("check files", stream=False)
+                        result = await ops.send("check files", stream=False, session_id=session_id)
                     self.assertEqual(result.status, TurnStatus.FAILED)
                     user = [{"role": "user", "content": "check files"}]
                     self.assertEqual(requests[0], user)
-                    snapshot = ops.message_snapshot()
+                    snapshot = ops.message_snapshot(ops.initial_session_id)
                     if scenario == "after_tools":
                         self.assertEqual(requests[1], snapshot)
                         self.assertEqual([message["role"] for message in snapshot], ["user", "assistant", "tool", "tool"])
@@ -408,7 +408,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 restored = Operations(Application(**options))
                 try:
                     restored.restore_session(session_id)
-                    self.assertEqual(restored.message_snapshot(), snapshot)
+                    self.assertEqual(restored.message_snapshot(session_id), snapshot)
                 finally:
                     await restored.close()
 
@@ -436,14 +436,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             ))
             self.addAsyncCleanup(ops.close)
             title_requests = 0
+            session_id = ops.initial_session_id
             with patch("daphnis.app._TITLE_TIMEOUT", 0.05):
                 for output in ("", "长" * 41, None):
-                    result = await ops.send("first task", stream=False)
+                    result = await ops.send("first task", stream=False, session_id=session_id)
                     self.assertEqual(result.status, TurnStatus.COMPLETED)
-                    saved = history.load(ops.session.id)
+                    saved = history.load(session_id)
                     self.assertEqual(saved.title, "first task")
                     self.assertEqual(saved.messages.snapshot()[-1]["content"], "done")
-                    await ops.new_session()
+                    session_id = (await ops.new_session(session_id=session_id)).id
             self.assertEqual(title_requests, 3)
 
     async def test_cancel_title_keeps_completed_reply_and_fallback(self):
@@ -465,9 +466,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 history=history,
             ))
             self.addAsyncCleanup(ops.close)
-            session_id = ops.session.id
+            session_id = ops.initial_session_id
             path = history.directory / f"{session_id}.json"
-            task = asyncio.create_task(ops.send("first task", stream=False))
+            task = asyncio.create_task(ops.send("first task", stream=False, session_id=ops.initial_session_id))
             await asyncio.wait_for(naming.wait(), 2)
             saved = history.load(session_id)
             self.assertEqual(saved.title, "first task")
@@ -475,10 +476,10 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(SessionBusyError), SessionLease(path):
                 self.fail("The title request should still hold the session lease.")
 
-            await ops.cancel()
+            await ops.cancel(ops.initial_session_id)
             self.assertEqual((await task).status, TurnStatus.COMPLETED)
             self.assertEqual(history.load(session_id).title, "first task")
-            self.assertIsNone(ops.recovery)
+            self.assertIsNone(ops.recovery(ops.initial_session_id))
 
     async def test_cancel_during_background_save_keeps_session_busy(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -501,7 +502,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 replace_file(*args)
 
             with patch.object(history, "_replace", side_effect=slow_replace):
-                send = asyncio.create_task(ops.send("save", stream=False))
+                send = asyncio.create_task(ops.send("save", stream=False, session_id=ops.initial_session_id))
                 try:
                     async with asyncio.timeout(3):
                         while not entered.is_set():
@@ -513,15 +514,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(send.done())
                     self.assertFalse(send.done())
                     other = History(history.directory)
-                    peer = replace(ops._app._runtime.session)
+                    peer = replace(ops._app._runtimes[ops.initial_session_id].session)
                     with self.assertRaisesRegex(RuntimeError, "Session is busy"):
                         other.save(peer)
                     release.set()
                     with self.assertRaises(asyncio.CancelledError):
                         await send
-                    self.assertEqual(other.load(ops.session.id).messages.snapshot(),
+                    self.assertEqual(other.load(ops.initial_session_id).messages.snapshot(),
                                      [{"role": "user", "content": "save"}])
-                    self.assertEqual(len(ops.message_snapshot()), 1)
+                    self.assertEqual(len(ops.message_snapshot(ops.initial_session_id)), 1)
                 finally:
                     release.set()
                     await asyncio.gather(send, return_exceptions=True)
@@ -563,12 +564,12 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 }},
                 history=History(history.directory),
             ))
-            seed = app._runtime.session
+            seed = app._runtimes[app.initial_session_id].session
             history.save(seed)
             ops.restore_session(seed.id)
             pending = asyncio.Event()
             app.events.on("tool.approval_requested", lambda event: pending.set())
-            send = asyncio.create_task(ops.send("pause", stream=False))
+            send = asyncio.create_task(ops.send("pause", stream=False, session_id=ops.initial_session_id))
             child = """
 import asyncio, sys
 from daphnis import History, Operations
@@ -586,7 +587,7 @@ async def main():
     ))
     try:
         ops.restore_session(session_id)
-        for attempt in (lambda: ops.send("conflict", stream=False), lambda: ops.set_thinking(None)):
+        for attempt in (lambda: ops.send("conflict", stream=False, session_id=session_id), lambda: ops.set_thinking(None, session_id=session_id)):
             try:
                 await asyncio.wait_for(attempt(), .5)
             except RuntimeError as exc:
@@ -611,19 +612,19 @@ asyncio.run(main())
                 self.assertEqual(process.returncode, 0, stderr.decode())
                 self.assertEqual(history._path(seed.id).read_bytes(), initial)
                 self.assertFalse((root / "effect").exists())
-                self.assertEqual((await peer.send("independent", stream=False)).status, TurnStatus.COMPLETED)
-                request = ops.pending_approval
-                await ops.cancel()
+                self.assertEqual((await peer.send("independent", stream=False, session_id=peer.initial_session_id)).status, TurnStatus.COMPLETED)
+                request = ops.pending_approval(ops.initial_session_id)
+                await ops.cancel(ops.initial_session_id)
                 with self.assertRaises(asyncio.CancelledError):
                     await send
-                self.assertIsNone(ops.pending_approval)
-                self.assertFalse(ops.resolve_approval(request.request_id, "allow_once"))
+                self.assertIsNone(ops.pending_approval(ops.initial_session_id))
+                self.assertFalse(ops.resolve_approval(request.request_id, "allow_once", session_id=ops.initial_session_id))
                 saved = history.load(seed.id)
                 self.assertEqual(saved.messages.get(-1)[TOOL_STATE], PENDING)
                 self.assertEqual(saved.usage.total_tokens, 5)
                 peer.restore_session(seed.id)
-                self.assertEqual((await peer.send("retry", stream=False)).status, TurnStatus.FAILED)
-                self.assertEqual((await peer.continue_interrupted_turn(peer.recovery.key, stream=False)).status, TurnStatus.COMPLETED)
+                self.assertEqual((await peer.send("retry", stream=False, session_id=seed.id)).status, TurnStatus.FAILED)
+                self.assertEqual((await peer.continue_interrupted_turn(peer.recovery(seed.id).key, stream=False, session_id=seed.id)).status, TurnStatus.COMPLETED)
                 self.assertFalse((root / "effect").exists())
             finally:
                 if process is not None and process.returncode is None:
@@ -679,28 +680,28 @@ asyncio.run(main())
             )
             ops = Operations(app)
             try:
-                await ops.set_thinking("high")
+                await ops.set_thinking("high", session_id=ops.initial_session_id)
                 with self.assertRaises(CapabilityError):
-                    await ops.set_thinking("invalid")
-                self.assertEqual(ops.thinking, "high")
-                self.assertEqual(ops.enabled_tools, ops.all_tools)
+                    await ops.set_thinking("invalid", session_id=ops.initial_session_id)
+                self.assertEqual(ops.thinking(ops.initial_session_id), "high")
+                self.assertEqual(ops.enabled_tools(ops.initial_session_id), ops.all_tools)
                 with self.assertRaises(ValidationError):
-                    await ops.set_tools(("missing_tool",))
-                self.assertEqual(ops.enabled_tools, ops.all_tools)
-                await ops.set_tools(("read_file",))
-                result = await ops.send("hello", stream=False)
+                    await ops.set_tools(("missing_tool",), session_id=ops.initial_session_id)
+                self.assertEqual(ops.enabled_tools(ops.initial_session_id), ops.all_tools)
+                await ops.set_tools(("read_file",), session_id=ops.initial_session_id)
+                result = await ops.send("hello", stream=False, session_id=ops.initial_session_id)
                 self.assertEqual(result.status, TurnStatus.COMPLETED)
-                old = ops.session.id
+                old = ops.initial_session_id
                 self.assertEqual(
                     history.load(old).messages.snapshot(),
-                    ops.message_snapshot(),
+                    ops.message_snapshot(ops.initial_session_id),
                 )
-                original = ops.message_snapshot()
-                detached = ops.message_snapshot()
+                original = ops.message_snapshot(ops.initial_session_id)
+                detached = ops.message_snapshot(ops.initial_session_id)
                 detached[0]["content"] = "external edit"
-                self.assertEqual(ops.message_snapshot(), original)
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), original)
                 peer = Operations(app)
-                before = (ops.session, ops.thinking, ops.enabled_tools)
+                before = (ops.session(ops.initial_session_id), ops.thinking(ops.initial_session_id), ops.enabled_tools(ops.initial_session_id))
                 path = history.directory / f"{old}.json"
                 old_file = path.read_bytes()
                 for change, args in (
@@ -716,48 +717,48 @@ asyncio.run(main())
                         ),
                     ):
                         with self.assertRaises(OSError):
-                            await change(*args)
+                            await change(*args, session_id=old)
                         self.assertEqual(
-                            (ops.session, ops.thinking, ops.enabled_tools), before
+                            (ops.session(ops.initial_session_id), ops.thinking(ops.initial_session_id), ops.enabled_tools(ops.initial_session_id)), before
                         )
                         self.assertEqual(path.read_bytes(), old_file)
-                fresh = await ops.new_session()
+                fresh = await ops.new_session(session_id=ops.initial_session_id)
                 self.assertNotEqual(fresh.id, old)
-                self.assertEqual(peer.session, fresh)
-                self.assertEqual(len(ops.message_snapshot()), 0)
+                self.assertEqual(peer.session(fresh.id), fresh)
+                self.assertEqual(len(ops.message_snapshot(fresh.id)), 0)
                 client = app._clients["deepseek"]
-                self.assertIn("已停用工具", await ops.set_model("deepseek", "plain"))
-                self.assertEqual(peer.model.id, "plain")
-                self.assertEqual(ops.thinking, "high")
-                self.assertEqual(ops.enabled_tools, ())
+                self.assertIn("已停用工具", await ops.set_model("deepseek", "plain", session_id=fresh.id))
+                self.assertEqual(peer.model(fresh.id).id, "plain")
+                self.assertEqual(ops.thinking(fresh.id), "high")
+                self.assertEqual(ops.enabled_tools(fresh.id), ())
                 with self.assertRaises(FileNotFoundError):
                     history.load(fresh.id)
                 with self.assertRaisesRegex(CapabilityError, "unsupported"):
-                    await ops.set_tools(("read_file",))
+                    await ops.set_tools(("read_file",), session_id=fresh.id)
                 self.assertEqual(
-                    (await ops.send("same provider", stream=False)).status,
+                    (await ops.send("same provider", stream=False, session_id=fresh.id)).status,
                     TurnStatus.COMPLETED,
                 )
                 self.assertIs(app._clients["deepseek"], client)
-                await ops.set_model("mimo", "b")
+                await ops.set_model("mimo", "b", session_id=fresh.id)
                 self.assertNotIn("mimo", app._clients)
-                self.assertIsNone(ops.thinking)
+                self.assertIsNone(ops.thinking(fresh.id))
                 self.assertEqual(
-                    (await ops.send("again", stream=False)).status, TurnStatus.COMPLETED
+                    (await ops.send("again", stream=False, session_id=fresh.id)).status, TurnStatus.COMPLETED
                 )
                 self.assertEqual(len(ops.list_sessions()), 2)
                 with self.assertRaises(FileNotFoundError):
                     ops.restore_session("missing")
-                self.assertEqual(ops.session.provider, "mimo")
+                self.assertEqual(ops.session(fresh.id).provider, "mimo")
                 ops.restore_session(old)
                 self.assertEqual(
-                    (ops.session.provider, ops.session.model_id), ("deepseek", "a")
+                    (ops.session(ops.initial_session_id).provider, ops.session(ops.initial_session_id).model_id), ("deepseek", "a")
                 )
-                self.assertEqual(ops.message_snapshot(), original)
-                self.assertEqual(ops.thinking, "high")
-                self.assertEqual(ops.enabled_tools, ("read_file",))
+                self.assertEqual(ops.message_snapshot(ops.initial_session_id), original)
+                self.assertEqual(ops.thinking(ops.initial_session_id), "high")
+                self.assertEqual(ops.enabled_tools(ops.initial_session_id), ("read_file",))
                 self.assertEqual(
-                    (await ops.send("restored", stream=False)).status,
+                    (await ops.send("restored", stream=False, session_id=ops.initial_session_id)).status,
                     TurnStatus.COMPLETED,
                 )
                 self.assertIs(app._clients["deepseek"], client)
@@ -783,9 +784,9 @@ asyncio.run(main())
                 await ops.close()
             self.assertTrue(all(transport.closed for transport in transports.values()))
             with self.assertRaisesRegex(RuntimeError, "已关闭"):
-                await ops.send("closed", stream=False)
+                await ops.send("closed", stream=False, session_id=ops.initial_session_id)
             with self.assertRaisesRegex(RuntimeError, "已关闭"):
-                await ops.set_thinking(None)
+                await ops.set_thinking(None, session_id=ops.initial_session_id)
             with patch("daphnis.history.Path.home", return_value=root):
                 self.assertEqual(
                     History().directory, root.resolve() / ".daphnis/sessions"
@@ -819,33 +820,33 @@ asyncio.run(main())
             expected = ("high", ("read_file",))
             ops = make_ops()
             try:
-                session_a = ops.session
-                await ops.set_thinking("high")
-                await ops.set_tools(("read_file",))
-                history.save(ops._app._runtime.session)
+                session_a = ops.session(ops.initial_session_id)
+                await ops.set_thinking("high", session_id=ops.initial_session_id)
+                await ops.set_tools(("read_file",), session_id=ops.initial_session_id)
+                history.save(ops._app._runtimes[ops.initial_session_id].session)
                 saved_a = history.load(session_a.id)
                 self.assertEqual((saved_a.thinking, saved_a.enabled_tools), expected)
 
-                session_b = await ops.new_session()
+                session_b = await ops.new_session(session_id=ops.initial_session_id)
                 self.assertNotEqual(session_a.id, session_b.id)
-                self.assertEqual((ops.thinking, ops.enabled_tools), expected)
-                self.assertIn("已恢复服务端默认", await ops.set_model("mimo", "b"))
-                self.assertIsNone(ops.thinking)
-                self.assertEqual(ops.enabled_tools, ("read_file",))
-                await ops.set_thinking("off")
-                await ops.set_tools(("list_directory",))
+                self.assertEqual((ops.thinking(session_b.id), ops.enabled_tools(session_b.id)), expected)
+                self.assertIn("已恢复服务端默认", await ops.set_model("mimo", "b", session_id=session_b.id))
+                self.assertIsNone(ops.thinking(session_b.id))
+                self.assertEqual(ops.enabled_tools(session_b.id), ("read_file",))
+                await ops.set_thinking("off", session_id=session_b.id)
+                await ops.set_tools(("list_directory",), session_id=session_b.id)
                 ops.restore_session(session_a.id)
-                self.assertEqual(ops.session, session_a)
-                self.assertEqual((ops.thinking, ops.enabled_tools), expected)
+                self.assertEqual(ops.session(ops.initial_session_id), session_a)
+                self.assertEqual((ops.thinking(ops.initial_session_id), ops.enabled_tools(ops.initial_session_id)), expected)
             finally:
                 await ops.close()
 
             restarted = make_ops()
             try:
                 restarted.restore_session(session_a.id)
-                self.assertEqual(restarted.session, session_a)
+                self.assertEqual(restarted.session(session_a.id), session_a)
                 self.assertEqual(
-                    (restarted.thinking, restarted.enabled_tools), expected
+                    (restarted.thinking(session_a.id), restarted.enabled_tools(session_a.id)), expected
                 )
 
                 for settings, error, detail in (
@@ -864,9 +865,9 @@ asyncio.run(main())
                         original = path.read_bytes()
                         with self.assertRaisesRegex(error, detail):
                             restarted.restore_session(invalid.id)
-                        self.assertEqual(restarted.session, session_a)
+                        self.assertEqual(restarted.session(session_a.id), session_a)
                         self.assertEqual(
-                            (restarted.thinking, restarted.enabled_tools), expected
+                            (restarted.thinking(session_a.id), restarted.enabled_tools(session_a.id)), expected
                         )
                         self.assertEqual(path.read_bytes(), original)
             finally:
@@ -904,8 +905,8 @@ asyncio.run(main())
                 )
                 ops = Operations(app)
                 try:
-                    await ops.set_thinking("high")
-                    result = await ops.send("think", stream=False)
+                    await ops.set_thinking("high", session_id=ops.initial_session_id)
+                    result = await ops.send("think", stream=False, session_id=ops.initial_session_id)
                 finally:
                     await ops.close()
                 if compatibility is None:
@@ -975,40 +976,39 @@ asyncio.run(main())
                 ops = Operations(app)
                 try:
                     if not interactive:
-                        result = await ops.send("edit", stream=False)
+                        result = await ops.send("edit", stream=False, session_id=ops.initial_session_id)
                         self.assertEqual(result.status, TurnStatus.COMPLETED)
                     else:
                         app.events.on("turn.finished", listener)
-                        task = asyncio.create_task(ops.send("edit", stream=False))
+                        task = asyncio.create_task(ops.send("edit", stream=False, session_id=ops.initial_session_id))
                         async with asyncio.timeout(2):
-                            while ops.pending_approval is None:
+                            while ops.pending_approval(ops.initial_session_id) is None:
                                 await asyncio.sleep(0)
-                        pending = ops.pending_approval
-                        self.assertTrue(ops.running)
+                        pending = ops.pending_approval(ops.initial_session_id)
+                        self.assertTrue(ops.running(ops.initial_session_id))
                         pending.details.clear()
-                        self.assertIn("targets", ops.pending_approval.details)
-                        self.assertFalse(ops.resolve_approval("stale", "allow_once"))
+                        self.assertIn("targets", ops.pending_approval(ops.initial_session_id).details)
+                        self.assertFalse(ops.resolve_approval("stale", "allow_once", session_id=ops.initial_session_id))
                         for change, args in (
-                            (ops.new_session, ()),
-                            (ops.restore_session, ("missing",)),
                             (ops.set_model, ("deepseek", "plain")),
                             (ops.set_thinking, ("high",)),
                             (ops.set_tools, ((),)),
                             (ops.set_approval_mode, ("full",)),
                         ):
                             with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
-                                value = change(*args)
+                                value = change(*args, session_id=ops.initial_session_id)
                                 if isawaitable(value):
                                     await value
                         with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
-                            await ops.send("concurrent", stream=False)
+                            await ops.send("concurrent", stream=False, session_id=ops.initial_session_id)
+                        runtime = app._load_runtime(ops.initial_session_id)
                         await ops.close()
                         with self.assertRaises(asyncio.CancelledError):
                             await task
-                        self.assertFalse(ops.running)
-                        self.assertIsNone(ops.pending_approval)
-                        self.assertFalse(ops.resolve_approval(pending.request_id, "allow_once"))
-                        messages = ops.message_snapshot()
+                        self.assertFalse(runtime.running)
+                        self.assertIsNone(runtime.pending_approval)
+                        self.assertFalse(ops.resolve_approval(pending.request_id, "allow_once", session_id=ops.initial_session_id))
+                        messages = app._history.load(ops.initial_session_id).messages.snapshot()
                         self.assertEqual(messages[0], {"role": "user", "content": "edit"})
                         self.assertEqual(messages[-1][TOOL_STATE], PENDING)
                         self.assertEqual(len(ops.list_sessions()), 1)
