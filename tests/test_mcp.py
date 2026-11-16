@@ -516,7 +516,7 @@ asyncio.run(main())
                 pid = int((root / "pid").read_text())
                 await ops.set_tools(("list_directory", add))
                 snapshot = app._tools.select([add]).bind(
-                    session=app._session, events=app.events, turn_id="old-turn"
+                    session=app._runtime.session, events=app.events, turn_id="old-turn"
                 )
                 await ops.disconnect_mcp("demo")
                 self.assertNotIn(add, ops.all_tools)

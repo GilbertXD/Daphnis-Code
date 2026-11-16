@@ -90,7 +90,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
                               history=history, connections={"mimo": {"base_url": "https://model.test/v1",
                                                                     "transport": httpx.MockTransport(handler)}})
             self.addAsyncCleanup(app.close)
-            state = app._session
+            state = app._runtime.session
             state.messages.add_user("Original task " * 150)
             state.messages.add_assistant("Original answer")
             state.messages.add_user("Most recent task")
@@ -400,7 +400,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             )
             self.addAsyncCleanup(app.close)
             ops = Operations(app)
-            state = app._session
+            state = app._runtime.session
             state.messages.add_user("Original task " * 150)
             state.messages.add(reply(None, finish="tool_calls", calls=[tool_call()])["choices"][0]["message"])
             state.messages.add_tool_result(tool_call_id="call-1", content="Original result " * 100)
@@ -433,9 +433,9 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(effective[2:4], original[4:])
             self.assertEqual(ops.message_snapshot()[:6], original)
 
-            app._session.messages.add_user("Another task " * 100)
-            app._session.messages.add_assistant("Another answer")
-            history.save(app._session)
+            app._runtime.session.messages.add_user("Another task " * 100)
+            app._runtime.session.messages.add_assistant("Another answer")
+            history.save(app._runtime.session)
             path = history.directory / f"{state.id}.json"
             summary_content = "Invalid summary"
             failures = []
@@ -446,7 +446,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(bodies) - request_count, 2)
             self.assertEqual(invalid_summary.exception.reason, "summary_json")
             self.assertEqual(failures[-1].data["reason"], "summary_json")
-            self.assertEqual(app._session.compaction, saved.compaction)
+            self.assertEqual(app._runtime.session.compaction, saved.compaction)
             self.assertEqual(history.load(state.id).compaction, saved.compaction)
 
             disk_before = path.read_bytes()
@@ -457,7 +457,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await ops.compact()
             self.assertEqual(path.read_bytes(), disk_before)
-            self.assertEqual(app._session.compaction, saved.compaction)
+            self.assertEqual(app._runtime.session.compaction, saved.compaction)
             updated = await ops.compact()
             self.assertGreater(updated.through, saved.compaction.through)
             self.assertEqual(history.load(state.id).compaction, updated)
@@ -757,9 +757,9 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             self.addAsyncCleanup(app.close)
             ops = Operations(app)
             await ops.set_tools(())
-            app._session.messages.add_user("original " * 600)
-            app._session.messages.add_assistant("answer")
-            history.save(app._session)
+            app._runtime.session.messages.add_user("original " * 600)
+            app._runtime.session.messages.add_assistant("answer")
+            history.save(app._runtime.session)
             before = history.load(ops.session.id)
             replace_file = history._replace
 
@@ -778,11 +778,11 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             ])
             self.assertIsNone(disk.compaction)
             self.assertEqual(disk.messages.snapshot(), ops.message_snapshot())
-            self.assertIsNone(app._session.compaction)
+            self.assertIsNone(app._runtime.session.compaction)
             self.assertEqual((await ops.send("continue again", stream=False)).status, TurnStatus.COMPLETED)
             restored = history.load(ops.session.id)
             self.assertEqual(restored.messages.snapshot(), ops.message_snapshot())
-            self.assertEqual(restored.compaction, app._session.compaction)
+            self.assertEqual(restored.compaction, app._runtime.session.compaction)
 
 
 class OverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):

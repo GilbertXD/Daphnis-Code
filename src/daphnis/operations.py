@@ -63,7 +63,7 @@ class Operations:
 
     @property
     def session(self) -> SessionSnapshot:
-        session = self._app._session
+        session = self._app._runtime.session
         workspace = Path(session.workspace)
         project_id = self._app._history.resolve_project_id(session.project_id, workspace)
         return SessionSnapshot(
@@ -73,7 +73,7 @@ class Operations:
 
     def message_snapshot(self) -> list[dict[str, Any]]:
         """Return detached copies of committed messages for display."""
-        return self._app._session.messages.snapshot()
+        return self._app._runtime.session.messages.snapshot()
 
     def subscribe(self, name: str, callback: Callback) -> Callable[[], None]:
         """Subscribe to detached event snapshots and return an unsubscribe function."""
@@ -85,7 +85,7 @@ class Operations:
 
     @property
     def thinking(self) -> str | None:
-        return self._app._session.thinking
+        return self._app._runtime.session.thinking
 
     @property
     def all_tools(self) -> tuple[str, ...]:
@@ -93,7 +93,7 @@ class Operations:
 
     @property
     def enabled_tools(self) -> tuple[str, ...]:
-        return self._app._session.enabled_tools
+        return self._app._runtime.session.enabled_tools
 
     @property
     def effective_tools(self) -> tuple[str, ...]:
@@ -102,34 +102,34 @@ class Operations:
 
     @property
     def running(self) -> bool:
-        return self._app._running
+        return self._app._runtime.running
 
     @property
     def approval_mode(self) -> ApprovalMode:
-        return self._app._approval_mode
+        return self._app._runtime.approval_mode
 
     def set_approval_mode(self, mode: ApprovalMode | str) -> None:
         app = self._app
         app._ensure_idle()
-        app._approval_mode = ApprovalMode(mode)
-        if app._approval_mode is ApprovalMode.ASK:
+        app._runtime.approval_mode = ApprovalMode(mode)
+        if app._runtime.approval_mode is ApprovalMode.ASK:
             app._trusted_tools.clear()
 
     @property
     def pending_approval(self) -> "ApprovalRequest | None":
-        return deepcopy(self._app._pending_approval)
+        return deepcopy(self._app._runtime.pending_approval)
 
     @property
     def session_usage(self) -> "UsageTotals":
-        return self._app._usage.session
+        return self._app._runtime.usage.session
 
     @property
     def turn_usage(self) -> "UsageTotals | None":
-        return self._app._usage.turn
+        return self._app._runtime.usage.turn
 
     @property
     def context_budget(self) -> "TokenBudget | None":
-        observed = self._app._last_budget
+        observed = self._app._runtime.last_budget
         session = self.session
         if observed is not None and observed[:3] == (session.id, session.provider, session.model_id):
             return observed[3]
@@ -137,11 +137,11 @@ class Operations:
 
     @property
     def compacting(self) -> bool:
-        return self._app._compacting
+        return self._app._runtime.compacting
 
     @property
     def compacted_through(self) -> int:
-        checkpoint = self._app._session.compaction
+        checkpoint = self._app._runtime.session.compaction
         return checkpoint.through if checkpoint else 0
 
     def configured(self, provider: str) -> bool:
@@ -164,7 +164,7 @@ class Operations:
         app = self._app
         app._ensure_idle()
         model = app._model_for(provider, model_id)
-        current = app._session
+        current = app._runtime.session
         thinking, enabled_tools = current.thinking, current.enabled_tools
         notices = [f"模型：{provider} / {model_id}"]
         if thinking is not None and thinking not in (model.thinking_modes or ()):
@@ -211,23 +211,23 @@ class Operations:
         app = self._app
         app._ensure_idle()
         self._validate_thinking(self.model, mode)
-        updated = replace(app._session, thinking=mode)
+        updated = replace(app._runtime.session, thinking=mode)
         await app._update_session(updated)
 
     def get_system_prompt(self) -> str:
-        return self._app._session.effective_system_prompt
+        return self._app._runtime.session.effective_system_prompt
 
     async def set_system_prompt(self, prompt: str) -> None:
         app = self._app
         app._ensure_idle()
         if not isinstance(prompt, str):
             raise TypeError("系统提示词必须是字符串。")
-        await app._update_session(replace(app._session, system_prompt=prompt))
+        await app._update_session(replace(app._runtime.session, system_prompt=prompt))
 
     async def reset_system_prompt(self) -> None:
         app = self._app
         app._ensure_idle()
-        await app._update_session(replace(app._session, system_prompt=None))
+        await app._update_session(replace(app._runtime.session, system_prompt=None))
 
     async def set_tools(
         self, names: Sequence[str], *, keep_unavailable: bool = False
@@ -245,7 +245,7 @@ class Operations:
                 if name not in available and name not in selected
             )
         self._validate_tools(self.model, selected, retained=self.enabled_tools)
-        updated = replace(app._session, enabled_tools=selected)
+        updated = replace(app._runtime.session, enabled_tools=selected)
         await app._update_session(updated)
 
     async def connect_mcp(
@@ -451,7 +451,7 @@ class Operations:
     async def create_project(self, name: str, workspace: Path | str | None = None) -> Project:
         app = self._app
         app._ensure_idle()
-        root = Path(app._session.workspace)
+        root = Path(app._runtime.session.workspace)
         if workspace is not None:
             if not str(workspace).strip():
                 raise ValueError("项目需要一个工作区目录。")
@@ -465,8 +465,8 @@ class Operations:
 
         async def remove() -> None:
             await asyncio.to_thread(app._history.remove_project, project_id)
-            if app._session.project_id == project_id:
-                app._session.project_id = None
+            if app._runtime.session.project_id == project_id:
+                app._runtime.session.project_id = None
 
         async with app._state_lock:
             await finish_io(remove())
@@ -481,7 +481,7 @@ class Operations:
         app = self._app
         app._ensure_idle()
         if project_id is None:
-            return await self._new_session(app._session.workspace, None)
+            return await self._new_session(app._runtime.session.workspace, None)
         project = self._project_for_workspace(project_id)
         return await self._new_session(project.workspace, project.id)
 
@@ -495,12 +495,12 @@ class Operations:
         app = self._app
         app._ensure_idle()
         async with app._state_lock:
-            if app._session._saved_revision is None:
-                await finish_io(app._save_session(app._session))
+            if app._runtime.session._saved_revision is None:
+                await finish_io(app._save_session(app._runtime.session))
 
     async def _new_session(self, workspace: Path | str, project_id: str | None) -> SessionSnapshot:
         app = self._app
-        current = app._session
+        current = app._runtime.session
         fresh = Session(
             workspace=workspace,
             provider=current.provider,
@@ -512,9 +512,9 @@ class Operations:
         async def switch() -> None:
             if app._has_usage_to_save():
                 await app._save_session(current)
-            app._session = fresh
-            app._approval_mode = ApprovalMode.AUTO
-            app._usage.select_session(fresh.id, fresh.usage)
+            app._runtime.session = fresh
+            app._runtime.approval_mode = ApprovalMode.AUTO
+            app._runtime.usage.select_session(fresh.id, fresh.usage)
 
         async with app._state_lock:
             await finish_io(switch())
@@ -539,9 +539,9 @@ class Operations:
                 name for name in restored.enabled_tools if name.startswith(TOOL_PREFIX)
             ),
         )
-        app._session = restored
+        app._runtime.session = restored
         app._use_saved_tool_preferences = True
-        app._usage.select_session(restored.id, restored.usage)
+        app._runtime.usage.select_session(restored.id, restored.usage)
 
     async def rename_session(self, session_id: str, title: str) -> None:
         app = self._app
@@ -549,8 +549,8 @@ class Operations:
         title = title.strip() if isinstance(title, str) else ""
         if not 0 < len(title) <= 120:
             raise ValueError("会话名称必须包含 1–120 个字符。")
-        if session_id == app._session.id:
-            await app._update_session(replace(app._session, title=title))
+        if session_id == app._runtime.session.id:
+            await app._update_session(replace(app._runtime.session, title=title))
         else:
             async with app._state_lock:
                 await app._history.rename(session_id, title)
@@ -562,8 +562,8 @@ class Operations:
         app._ensure_idle()
 
         async def move() -> None:
-            active = session_id == app._session.id
-            session = app._session if active else await asyncio.to_thread(app._history.load, session_id)
+            active = session_id == app._runtime.session.id
+            session = app._runtime.session if active else await asyncio.to_thread(app._history.load, session_id)
             workspace = session.workspace
             if project_id is not None:
                 try:
@@ -594,7 +594,7 @@ class Operations:
         """Delete under the history lease; replace an active session with a blank one."""
         app = self._app
         app._ensure_idle()
-        current = app._session
+        current = app._runtime.session
 
         async def delete_and_select() -> None:
             if session_id != current.id:
@@ -609,9 +609,9 @@ class Operations:
                 project_id=self.session.project_id,
             )
             await app._history.delete(current)
-            app._session = fresh
-            app._approval_mode = ApprovalMode.AUTO
-            app._usage.select_session(fresh.id, fresh.usage)
+            app._runtime.session = fresh
+            app._runtime.approval_mode = ApprovalMode.AUTO
+            app._runtime.usage.select_session(fresh.id, fresh.usage)
 
         async with app._state_lock:
             await finish_io(delete_and_select())
@@ -629,7 +629,7 @@ class Operations:
                 else {"id": item.id, "name": item.name, "type": "text", "mime_type": item.mime_type}
                 for item in batch.files
             ]
-            for index, batch in self._app._session.attachment_refs.items()
+            for index, batch in self._app._runtime.session.attachment_refs.items()
         }
 
     async def read_attachment_image(self, session_id: str, message_index: int, attachment_id: str) -> tuple[bytes, str]:
@@ -647,7 +647,7 @@ class Operations:
         kind: type[ImageAttachment] | type[DocumentAttachment],
     ) -> tuple[bytes, ImageAttachment | DocumentAttachment]:
         app = self._app
-        session = app._session
+        session = app._runtime.session
         if session.id != session_id or not valid_id(attachment_id) or type(message_index) is not int:
             raise FileNotFoundError("附件不可用。")
         batch = session.attachment_refs.get(message_index)
@@ -662,14 +662,14 @@ class Operations:
                 data = await asyncio.to_thread(store.read_document, session.id, item)
         except (OSError, ValueError):
             raise FileNotFoundError("附件不可用。") from None
-        if app._session.id != session_id:
+        if app._runtime.session.id != session_id:
             raise FileNotFoundError("附件不可用。")
         return data, item
 
     def attachment_submitted(
         self, submission_id: str, prompt: str, attachments: Sequence[AttachmentInput | str],
     ) -> bool:
-        session = self._app._session
+        session = self._app._runtime.session
 
         def identity(item: Attachment):
             if isinstance(item, DocumentAttachment):
@@ -704,13 +704,13 @@ class Operations:
 
     @property
     def prompt_groups(self) -> tuple[PromptGroup, ...]:
-        return self._app._session.prompt_groups
+        return self._app._runtime.session.prompt_groups
 
     def prompt_submitted(self, group_id: str, texts: tuple[str, ...]) -> bool:
         group = next((group for group in self.prompt_groups if group.id == group_id), None)
         if group is None:
             return False
-        if texts != tuple(self._app._session.messages.get(i)['content'] for i in range(group.start, group.end)):
+        if texts != tuple(self._app._runtime.session.messages.get(i)['content'] for i in range(group.start, group.end)):
             raise ValueError("该 MCP Prompt 运行标识已用于不同内容。")
         return True
 
@@ -719,7 +719,7 @@ class Operations:
 
     @property
     def recovery(self) -> RecoveryState | None:
-        return self._app._session.recovery
+        return self._app._runtime.session.recovery
 
     async def retry_failed_user(self, key: str, *, stream: bool = True) -> "TurnResult":
         return await self._app._run_turn(stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key)

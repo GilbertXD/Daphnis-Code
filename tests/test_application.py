@@ -114,7 +114,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             ops = Operations(app)
             try:
                 default = ops.get_system_prompt()
-                history.save(app._session)
+                history.save(app._runtime.session)
                 ops.restore_session(ops.session.id)
                 self.assertEqual(ops.get_system_prompt(), default)
                 await ops.set_system_prompt(custom)
@@ -254,7 +254,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             a = Operations(Application(**options, history=history))
             b = Operations(Application(**options, history=History(history.directory)))
             try:
-                history.save(a._app._session)
+                history.save(a._app._runtime.session)
                 await a.set_thinking("high")
                 b.restore_session(a.session.id)
                 await a.send("first writer", stream=False)
@@ -434,7 +434,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                         self.assertFalse(send.done())
                     self.assertFalse(send.done())
                     other = History(history.directory)
-                    peer = replace(ops._app._session)
+                    peer = replace(ops._app._runtime.session)
                     with self.assertRaisesRegex(RuntimeError, "Session is busy"):
                         other.save(peer)
                     release.set()
@@ -484,7 +484,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 }},
                 history=History(history.directory),
             ))
-            seed = replace(app._session)
+            seed = replace(app._runtime.session)
             history.save(seed)
             ops.restore_session(seed.id)
             pending = asyncio.Event()
@@ -743,7 +743,7 @@ asyncio.run(main())
                 session_a = ops.session
                 await ops.set_thinking("high")
                 await ops.set_tools(("read_file",))
-                history.save(ops._app._session)
+                history.save(ops._app._runtime.session)
                 saved_a = history.load(session_a.id)
                 self.assertEqual((saved_a.thinking, saved_a.enabled_tools), expected)
 

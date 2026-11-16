@@ -49,17 +49,16 @@ from .models.requests import require_document_input, require_image_input
 from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
+from .session_runtime import SessionRuntime
 from .title import build_title_source, fallback_title, normalize_title
 from .token_budget import TokenBudget
 from .tools import (
     ApprovalDecision,
-    ApprovalMode,
     ApprovalRequest,
     ToolExecutor,
     create_tools,
 )
 from .turn_state import RecoveryAction
-from .usage import UsageTracker
 
 logger = logging.getLogger(__name__)
 _TITLE_TIMEOUT = 5
@@ -126,10 +125,6 @@ class Application:
         )
         self._model_compaction_settings = dict(model_compaction_settings or {})
         self._output_limits = dict(output_limits or {})
-        self._task: asyncio.Task[TurnResult] | asyncio.Task[CompactionCheckpoint | None] | None = None
-        self._approval_mode = ApprovalMode.AUTO
-        self._approval: asyncio.Future[ApprovalDecision] | None = None
-        self._pending_approval: ApprovalRequest | None = None
         self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
         self._state_lock = asyncio.Lock()
@@ -137,34 +132,31 @@ class Application:
         self._tools = self._mcp_catalog()
         self._use_saved_tool_preferences = False
         model = self._model_for(provider, model_id)
-        self._session = Session(
+        session = Session(
             workspace=workspace,
             provider=provider,
             model_id=model_id,
             enabled_tools=self._all_tools if model.supports_tools is True else (),
         )
-        if not Path(self._session.workspace).is_dir():
+        if not Path(session.workspace).is_dir():
             raise ValueError("Workspace 必须是现有目录。")
         self.events = EventBus()
-        self._last_budget: tuple[str, str, str, TokenBudget] | None = None
-        self._compacting = False
+        self._runtime = SessionRuntime(session, self.events)
         for name in ("context.budget", "compaction.started", "compaction.finished"):
             self.events.on(name, self._observe_context)
-        self._usage = UsageTracker(self.events)
-        self._usage.select_session(self._session.id, self._session.usage)
         self._client(provider)
 
     def _observe_context(self, event: Event) -> None:
-        if event.session_id != self._session.id:
+        if event.session_id != self._runtime.session.id:
             return
         if event.name == "context.budget":
             data = event.data
-            self._last_budget = (
+            self._runtime.last_budget = (
                 event.session_id, data["provider"], data["model_id"],
                 TokenBudget(**{field.name: data[field.name] for field in fields(TokenBudget)}),
             )
         else:
-            self._compacting = event.name == "compaction.started"
+            self._runtime.compacting = event.name == "compaction.started"
 
     def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:
@@ -200,12 +192,8 @@ class Application:
     @property
     def _model(self) -> ModelInfo:
         return resolve_model(
-            self._session.provider, self._session.model_id, catalog=self._catalog
+            self._runtime.session.provider, self._runtime.session.model_id, catalog=self._catalog
         )
-
-    @property
-    def _running(self) -> bool:
-        return self._task is not None and not self._task.done()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -213,7 +201,7 @@ class Application:
 
     def _ensure_idle(self) -> None:
         self._ensure_open()
-        if self._running:
+        if self._runtime.running:
             raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
         if self._state_lock.locked():
             raise RuntimeError("请等待会话或 MCP 更新完成。")
@@ -232,7 +220,7 @@ class Application:
     async def _mcp_error(self, name: str, error: str) -> None:
         self._revoke_mcp_trust(name)
         await self.events.emit(
-            "mcp.error", session_id=self._session.id, turn_id="", server=name, error=error
+            "mcp.error", session_id=self._runtime.session.id, turn_id="", server=name, error=error
         )
 
     def _mcp_prompt_connection(self, server: str) -> MCPConnection:
@@ -308,8 +296,8 @@ class Application:
                         and self._model.supports_tools is True
                     ):
                         session = replace(
-                            self._session,
-                            enabled_tools=(*self._session.enabled_tools, *discovered),
+                            self._runtime.session,
+                            enabled_tools=(*self._runtime.session.enabled_tools, *discovered),
                         )
                         await finish_io(self._save_and_publish_session(session))
                 except (SessionBusyError, SessionConflictError, asyncio.CancelledError) as exc:
@@ -371,7 +359,7 @@ class Application:
             {name for name in previous if previous[name] != discovered.get(name)},
         )
         await self.events.emit(
-            "mcp.tools_changed", session_id=self._session.id, turn_id="", server=connection.name
+            "mcp.tools_changed", session_id=self._runtime.session.id, turn_id="", server=connection.name
         )
 
     async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
@@ -381,7 +369,7 @@ class Application:
         try:
             while not self._closed and connection in self._mcp_pending:
                 async with self._state_lock:
-                    active = self._task if self._running else None
+                    active = self._runtime.task if self._runtime.running else None
                     if active is None:
                         await self._refresh_pending_mcp()
                         return
@@ -405,11 +393,11 @@ class Application:
     async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
             return ApprovalDecision.DENY
-        if self._approval is not None:
+        if self._runtime.approval is not None:
             raise RuntimeError("已有待处理审批。")
         future = asyncio.get_running_loop().create_future()
-        self._approval = future
-        self._pending_approval = deepcopy(request)
+        self._runtime.approval = future
+        self._runtime.pending_approval = deepcopy(request)
         try:
             decision = await future
             if decision is ApprovalDecision.TRUST_SESSION:
@@ -427,18 +415,18 @@ class Application:
         finally:
             if not future.done():
                 future.cancel()
-            self._pending_approval = None
-            self._approval = None
+            self._runtime.pending_approval = None
+            self._runtime.approval = None
 
     def _resolve_approval(
         self, request_id: str, decision: ApprovalDecision
     ) -> bool:
-        pending = self._pending_approval
+        pending = self._runtime.pending_approval
         if self._closed or pending is None or pending.request_id != request_id:
             return False
-        if self._approval is None or self._approval.done():
+        if self._runtime.approval is None or self._runtime.approval.done():
             return False
-        self._approval.set_result(decision)
+        self._runtime.approval.set_result(decision)
         return True
 
     async def _run_turn(
@@ -448,7 +436,7 @@ class Application:
         attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
         self._ensure_idle()
-        session = self._session
+        session = self._runtime.session
         uploads = tuple(attachments)
         if any(isinstance(item, ImageAttachmentInput) for item in uploads):
             require_image_input(self._model)
@@ -470,7 +458,7 @@ class Application:
             async with self._state_lock:
                 await self._refresh_pending_mcp()
                 self._ensure_idle()
-                if self._session is not session:
+                if self._runtime.session is not session:
                     raise RuntimeError("会话已变化，请刷新后再操作。")
         thinking = session.thinking
         available = set(self._all_tools)
@@ -484,7 +472,7 @@ class Application:
             provider=provider,
             catalog=self._catalog,
             custom_compatibility=custom_compatibility,
-            tools=self._tools.select(enabled_tools, mode=self._approval_mode),
+            tools=self._tools.select(enabled_tools, mode=self._runtime.approval_mode),
             events=self.events,
             context=Context(system_prompt=session.effective_system_prompt),
             compaction_settings=self._model_compaction_settings.get(
@@ -507,7 +495,7 @@ class Application:
 
                 async def persist(candidate: Session) -> None:
                     nonlocal save_failed, title_source
-                    if self._session is not session:
+                    if self._runtime.session is not session:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
                         added = candidate.attachment_refs.keys() - session.attachment_refs.keys()
@@ -584,16 +572,16 @@ class Application:
                 return result
 
         task = asyncio.create_task(run())
-        self._task = task
+        self._runtime.task = task
         try:
             return await task
         finally:
-            if self._task is task:
-                self._task = None
+            if self._runtime.task is task:
+                self._runtime.task = None
 
     async def _compact_session(self) -> CompactionCheckpoint | None:
         self._ensure_idle()
-        session = self._session
+        session = self._runtime.session
         provider = session.provider
         agent = Agent(
             client=self._client(provider), provider=provider, catalog=self._catalog,
@@ -631,7 +619,7 @@ class Application:
 
                     async def commit() -> None:
                         await self._save_session(updated, lease=lease)
-                        self._session = updated
+                        self._runtime.session = updated
                         await self.events.emit(
                             "compaction.finished", **fields,
                             status="committed", through=checkpoint.through,
@@ -640,7 +628,7 @@ class Application:
                     await finish_io(commit())
                     return checkpoint
             except asyncio.CancelledError:
-                if self._session is session:
+                if self._runtime.session is session:
                     await self.events.emit("compaction.finished", **fields, status="cancelled")
                 raise
             except Exception as exc:
@@ -651,15 +639,15 @@ class Application:
                 raise
 
         task = asyncio.create_task(compact())
-        self._task = task
+        self._runtime.task = task
         try:
             return await task
         finally:
-            if self._task is task:
-                self._task = None
+            if self._runtime.task is task:
+                self._runtime.task = None
 
     async def _save_session(self, session: Session, *, lease: SessionLease | None = None) -> None:
-        session.usage = self._usage.session
+        session.usage = self._runtime.usage.session
         await self._history.save_async(session, lease=lease)
 
     async def _name_session(self, agent: Agent, session: Session, source: str, *, lease: SessionLease) -> None:
@@ -687,19 +675,19 @@ class Application:
     async def _save_and_publish_session(self, session: Session) -> None:
         if session._saved_revision is not None or len(session.messages) or self._has_usage_to_save():
             await self._save_session(session)
-        self._session = session
+        self._runtime.session = session
 
     async def _update_session(self, session: Session) -> None:
         async with self._state_lock:
             await finish_io(self._save_and_publish_session(session))
 
     def _has_usage_to_save(self) -> bool:
-        return self._usage.session != self._session.usage and (
-            bool(len(self._session.messages)) or self._usage.session.reported_requests > 0
+        return self._runtime.usage.session != self._runtime.session.usage and (
+            bool(len(self._runtime.session.messages)) or self._runtime.usage.session.reported_requests > 0
         )
 
     async def _cancel_turn(self) -> None:
-        task = self._task
+        task = self._runtime.task
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -732,5 +720,5 @@ class Application:
                         self._mcp.clear()
                         self._tools = self._mcp_catalog()
                 self._trusted_tools.clear()
-                self._usage.close()
+                self._runtime.usage.close()
                 self.events.clear()
