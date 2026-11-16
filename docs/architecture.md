@@ -4,19 +4,22 @@
 
 ```text
 操作
-  浏览器 → Web Server / Bridge → Operations → Application → Agent
+  浏览器标签页 → Web Server / Bridge → Operations(session_id) → Application
+                                                             ├→ SessionRuntime A → Agent（每轮创建）
+                                                             └→ SessionRuntime B → Agent（每轮创建）
 
 通知
-  Agent / ToolExecutor / Application → EventBus → UsageTracker
+  Agent / ToolExecutor / Application → EventBus → 各会话的用量和上下文状态
                                                └→ Operations.subscribe → Web Bridge
 ```
 
 | 模块 | 职责 |
 | --- | --- |
 | [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接已配置的 MCP 服务。 |
-| [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 通过公共 Operations 查询或执行操作，通过 `Operations.subscribe()` 观察事件，再投影成浏览器快照、流式文本和有界调试记录。Bridge 持有的是 Web 任务、游标和缓存，Core 状态以 Operations 为准。 |
-| [Operations](../src/daphnis/operations.py) | 提供面向客户端的命令、只读视图及订阅入口。在共享运行状态上校验操作，协调会话和配置变更。 |
-| [Application](../src/daphnis/app.py) | 持有当前 Session、History、按厂商缓存的客户端、工具目录、MCP 连接、审批和用量跟踪器。为每轮装配 Agent，管理任务、持久化、取消和资源清理。 |
+| [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 按会话维护 Web Run、流式文本、提交确认和有界调试记录，通过 Operations 查询当前状态。每条 WebSocket 独立选择要显示的会话。 |
+| [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime；MCP 连接和目录管理面向整个 Application。 |
+| [Application](../src/daphnis/app.py) | 按 ID 管理已加载的 Runtime。共享 History、EventBus、模型目录、ChatClient 和 DocumentAdapter 缓存、工具目录、MCP 连接与配置。负责装配 Agent、提交事务、取消和释放资源。 |
+| [SessionRuntime](../src/daphnis/session_runtime.py) | 保存一个 Session 的活动任务、审批请求与模式、用量跟踪器、上下文预算和压缩状态。空闲 Runtime 保留在内存中；Runtime 本身不落盘。 |
 | [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 负责模型和工具循环及消息提交。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
 | [Token Budget](../src/daphnis/token_budget.py)、[Compactor](../src/daphnis/compaction.py) | 估算模型请求输入与输出空间。Compactor 选择完整的工具交换边界，在请求副本中修剪输出，并将旧消息摘要为检查点。 |
 | [Session](../src/daphnis/session.py)、[History](../src/daphnis/history.py) | Session 持有已提交原始消息、摘要检查点、工作区、模型、思考档位、工具偏好和用量。History 负责本地 V2 JSON、会话列表、版本校验和写入互斥。 |
@@ -28,7 +31,7 @@
 
 ## 一轮任务的生命周期
 
-1. Application 检查运行状态，选定本轮模型、思考档位、审批模式和在线工具，然后取得会话租约。
+1. Application 检查目标 Runtime，选定本轮模型、思考档位、审批模式和在线工具。在第一次等待前登记该任务，然后取得目标会话的 History 租约。
 2. Agent 提交用户输入。收到模型的工具调用后，Agent 先校验响应和调用数量，再将 Assistant 消息与整组占位结果一次提交。每次工具开始执行和返回结果时，Agent 分别提交对应状态。最终回复也单独提交。
 3. Application 在会话租约内将快照、检查点与用量一起落盘。保存成功后，Agent 发布内存状态。取消或保存失败时，最近一次成功提交的状态仍可恢复。
 4. 最终 Assistant 回复经校验并成功持久化后，Turn 才返回 `COMPLETED`。流式正文与思考在这之前都是临时显示。取消与最终保存重合时，以落盘结果为准。请求额度耗尽后仍会处理最后一次响应。若尚无最终回复，返回 `PAUSED_LIMIT` 并保留恢复入口。失败或取消时，晚于最近一次消息保存的用量也可独立保存。
@@ -51,7 +54,7 @@ Working 由当前 History 和检查点投影生成。模型请求保留合法工
 
 预算以模型目录登记的窗口为准，按序列化消息、工具定义等估算输入 Token，并预留输出和估算余量。DeepSeek 的默认输出预留随思考档位变化。窗口未知时仍会报告输入估算。已知窗口接近阈值时，Agent 先在请求副本中修剪旧工具输出，再按需摘要旧历史。摘要优先保留当前用户消息和最近一次工具交换。最新工具输出本身过大时也可发送摘录，调用 ID 和结果配对仍完整。
 
-通过 `Operations.compact()` 手动压缩时，优先保留最近一轮。摘要作为低权限的历史数据发送，生成摘要的请求没有工具。明确的服务端上下文超限可以触发压缩，整个 Turn 最多重试一次，且要求请求确实缩短、流式输出尚未开始。摘要请求和重试计入本轮模型请求上限。
+通过 `Operations.compact(session_id)` 手动压缩时，优先保留最近一轮。摘要作为低权限的历史数据发送，生成摘要的请求没有工具。明确的服务端上下文超限可以触发压缩，整个 Turn 最多重试一次，且要求请求确实缩短、流式输出尚未开始。摘要请求和重试计入本轮模型请求上限。
 
 ### 本地历史与并发
 
@@ -61,7 +64,11 @@ Working 由当前 History 和检查点投影生成。模型请求保留合法工
 
 Agent 只在模型请求投影中加入附件。当前轮的附件按合计约 4,000 Token、已知可用空间的 5% 以及输出预留判断能否内联，超过时使用元数据和工具引用。后续轮次及历史摘要只自动带入旧附件的元数据，附件工具已实际读取的内容仍作为普通工具结果进入压缩。失败重试和中断继续读取已保存的快照、重新核算预算，不创建新副本。Web 历史只展示附件标签，对有关会话默认隐藏模型请求详情与附件工具正文。
 
-租约覆盖模型请求、工具调用、人工审批、手动压缩和保存。同会话的锁已被占用时会立即抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`，需重新加载后再继续。不同会话可以并行。保存和设置写入在线程中执行，取消会等待已开始的写入完成后再释放租约。锁只协调遵守同一机制的进程。
+每个会话同时只能执行一个 Turn、恢复任务或手动压缩。会话设置锁也只保护目标 Runtime。保存绑定启动任务时的会话，切换浏览器页面不会转移写入、用量或审批。关闭 Application 时，先取消并等待所有会话任务和已开始的写入，再关闭共享资源。
+
+History 租约覆盖模型请求、工具调用、人工审批、手动压缩和保存。同会话的租约已被其他进程占用时会抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`；在新的 Application 实例中加载该会话即可获取新快照。取消会等待已开始的写入完成。会话租约不协调不同会话对同一工作区文件的写入。
+
+MCP 目录与连接由会话共享。每轮根据已启用且在线的工具选取定义快照；执行时仍检查连接。连接或发现工具不修改任何会话的启用偏好。活动任务期间拒绝主动修改全局 MCP 配置。目录变化立即撤销相关的自动信任，等活动任务结束后更新目录；刷新失败时保留旧目录，重新验证前不会记住该连接的新信任决定。
 
 ## 事件订阅
 
@@ -79,10 +86,10 @@ Agent 只在模型请求投影中加入附件。当前轮的附件按合计约 4
 | `tool.approval_requested`、`tool.blocked` | 通知审批请求及策略拦截。审批事件包含独立的 `request_id`。 |
 | `tool.executing` | `RUNNING` 已保存，即将执行工具。 |
 | `tool.finished` | 真实结果或可报告的工具错误已保存。事件携带 `COMPLETED` 或 `ERROR`、结果正文和错误详情。 |
-| `mcp.error`、`mcp.tools_changed` | 通知连接异常或工具目录刷新，`turn_id` 为空字符串。 |
+| `mcp.error`、`mcp.tools_changed` | Application 级别的连接异常或目录刷新；`session_id`、`turn_id` 均为空字符串。 |
 
-事件用于观察，工具状态由 Agent 通过 Session 保存接口直接提交。异步订阅器可能以不同顺序完成。审批通过 `resolve_approval()` 回传，取消通过 `cancel()` 发起。客户端应以 `send()` 的结果或异常判断整次操作的结局。Web 的 `web.send_finished` 是 Bridge 在该操作结束后生成的传输记录，Core 的订阅事件列表见上表。
+事件用于观察，工具状态由 Agent 通过 Session 保存接口直接提交。异步订阅器可能以不同顺序完成。审批通过 `resolve_approval(request_id, decision, session_id=...)` 回传，取消通过 `cancel(session_id)` 发起。客户端应以 `send()` 的结果或异常判断操作结局。Web 的 `web.send_finished` 是 Bridge 在操作结束后生成的传输记录。
 
-Web 通过 `POST /api/command` 接收命令，通过 `/api/events` WebSocket 发送状态帧。Bridge 用会话 ID、状态版本和事件游标区分全量快照与增量记录。服务端调试记录按会话有界缓存，重连时可重新获取仍在缓存中的记录。持续连接的浏览器会在本地累积已收到的同会话事件，直到收到重置帧或切换会话。
+Web 通过 `POST /api/command` 接收带会话 ID 的命令。停止还要匹配 Run ID，审批还要匹配 Request ID。标签页通过 `/api/events` WebSocket 选择会话；初次连接和重连可在查询参数提供会话 ID，也可发送 `{"session_id": "..."}` 切换。Bridge 按会话记录版本和事件游标，共享目录变化可单独发送。切换或重连时重新获取所选会话的快照、活动 Run 和仍在缓存中的调试记录。
 
 Core 事件可能含模型请求正文、工具参数和结果。Web 在浏览器边界做[凭据脱敏](tools.md#web-边界)。本地历史保留消息和工具结果原文。
