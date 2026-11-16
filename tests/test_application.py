@@ -959,6 +959,7 @@ asyncio.run(main())
                         original = path.read_bytes()
                         with self.assertRaisesRegex(error, detail):
                             restarted.restore_session(invalid.id)
+                        self.assertNotIn(invalid.id, restarted._app._runtimes)
                         self.assertEqual(restarted.session(session_a.id), session_a)
                         self.assertEqual(
                             (restarted.thinking(session_a.id), restarted.enabled_tools(session_a.id)), expected

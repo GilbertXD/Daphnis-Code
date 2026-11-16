@@ -166,6 +166,7 @@ class Application:
             session = replace(session, enabled_tools=tuple(dict.fromkeys(
                 "retrieval" if name == "history_search" else name for name in session.enabled_tools
             )))
+        self._validate_session(session)
         return self._add_runtime(session)
 
     def _validate_session(self, session: Session) -> None:

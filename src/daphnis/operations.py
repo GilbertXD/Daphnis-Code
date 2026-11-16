@@ -481,7 +481,6 @@ class Operations:
         return self.session(fresh.id)
 
     def restore_session(self, session_id: str) -> SessionSnapshot:
-        self._app._validate_session(self._runtime(session_id).session)
         return self.session(session_id)
 
     async def rename_session(self, session_id: str, title: str) -> None:
