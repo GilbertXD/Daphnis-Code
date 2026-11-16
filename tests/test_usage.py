@@ -161,7 +161,7 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(ops.turn_usage)
                 self.assertEqual(ops.session_usage, UsageTotals())
                 ops.restore_session(old)
-                self.assertIsNone(ops.turn_usage)
+                self.assertEqual(ops.turn_usage, UsageTotals(requests=1))
                 self.assertEqual(ops.session_usage, totals)
                 self.assertEqual(app._history.load(old).usage, totals)
             finally:

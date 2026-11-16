@@ -24,7 +24,7 @@ class SessionRuntime:
     pending_approval: ApprovalRequest | None = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO
     usage: UsageTracker = field(init=False)
-    last_budget: tuple[str, str, str, "TokenBudget"] | None = None
+    last_budget: tuple[str, str, "TokenBudget"] | None = None
     compacting: bool = False
 
     def __post_init__(self, events: "EventBus") -> None:

@@ -41,6 +41,65 @@ SUMMARY = json.dumps({
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_compaction_and_other_session_cancellation_are_independent(self):
+        summarizing, sending, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def handler(request):
+            messages = json.loads(request.content)["messages"]
+            if "Summarize" in messages[0]["content"]:
+                summarizing.set()
+                await release.wait()
+                payload = reply(SUMMARY)
+                payload["usage"] = {"prompt_tokens": 10, "completion_tokens": 5}
+                return httpx.Response(200, json=payload)
+            sending.set()
+            await asyncio.Future()
+
+        with tempfile.TemporaryDirectory() as directory:
+            history = History(Path(directory) / "history")
+            app = Application(
+                workspace=directory, provider="compatible", model_id="model-a", history=history,
+                connections={"compatible": {
+                    "base_url": "https://model.test/v1", "transport": httpx.MockTransport(handler),
+                }},
+            )
+            ops = Operations(app)
+            a = app._runtime
+            a.session.messages.add_user("Original task " * 150)
+            a.session.messages.add_assistant("Original answer")
+            a.session.messages.add_user("Recent question")
+            a.session.messages.add_assistant("Recent answer")
+            history.save(a.session)
+            b = app._load_runtime((await ops.new_session()).id)
+            compaction = asyncio.create_task(app._compact_session(a))
+            turn = asyncio.create_task(app._run_turn(b, "independent", stream=False))
+            try:
+                async with asyncio.timeout(3):
+                    await summarizing.wait()
+                    await sending.wait()
+                    self.assertTrue(a.compacting)
+                    self.assertFalse(b.compacting)
+                    self.assertIsNotNone(b.last_budget)
+                    with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                        await app._run_turn(a, "blocked", stream=False)
+                    await app._cancel_turn(b)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await turn
+                    self.assertFalse(compaction.done())
+                    release.set()
+                    checkpoint = await compaction
+                saved_a = history.load(a.session.id)
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(saved_a.compaction, checkpoint)
+                self.assertEqual(saved_a.usage.total_tokens, 15)
+                saved_b = history.load(b.session.id)
+                self.assertIsNone(saved_b.compaction)
+                self.assertEqual(saved_b.usage.total_tokens, 0)
+                self.assertFalse(a.compacting)
+            finally:
+                await app.close()
+                await asyncio.gather(compaction, turn, return_exceptions=True)
+
     async def test_summary_batch_and_repair_budget_count_response_format(self):
         response_format = {"type": "json_object"}
         counter = TokenCounter(lambda text: 120 if text == json.dumps(

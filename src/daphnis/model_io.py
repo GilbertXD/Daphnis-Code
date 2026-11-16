@@ -4,9 +4,12 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from saturnus import APIError, ChatClient, ResponseError
+
+from .events import Event
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +106,11 @@ class ObservedChatClient(ChatClient):
     def __init__(self, *, events, provider, **options):
         super().__init__(**options)
         self._events = events
-        self._request_event = None
+        self._request_event: ContextVar[Event | None] = ContextVar("model_request", default=None)
 
         def identify(event):
             if event.data["provider"] == provider:
-                self._request_event = event
+                self._request_event.set(event)
 
         events.on("model.started", identify)
 
@@ -149,7 +152,7 @@ class ObservedChatClient(ChatClient):
             logger.debug("Model HTTP body unavailable for observation")
 
     async def create_with_response(self, **options):
-        event = self._request_event
+        event = self._request_event.get()
         try:
             result = await super().create_with_response(**options)
         except (APIError, ResponseError) as exc:
@@ -160,7 +163,7 @@ class ObservedChatClient(ChatClient):
 
     @asynccontextmanager
     async def stream_with_response(self, **options):
-        event = self._request_event
+        event = self._request_event.get()
         observed = False
         try:
             async with super().stream_with_response(**options) as result:

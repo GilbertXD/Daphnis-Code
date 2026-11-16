@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from saturnus import ChatClient
+from saturnus import ChatClient, ValidationError
 
 from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
@@ -38,8 +38,10 @@ from .mcp_store import MCPStore
 from .model_io import ObservedChatClient
 from .models import (
     MODELS,
+    CapabilityError,
     ModelInfo,
     provider_compatibility,
+    require_tools,
     resolve_model,
 )
 from .models.documents import DocumentAdapter
@@ -141,22 +143,57 @@ class Application:
         if not Path(session.workspace).is_dir():
             raise ValueError("Workspace 必须是现有目录。")
         self.events = EventBus()
-        self._runtime = SessionRuntime(session, self.events)
+        self._runtimes: dict[str, SessionRuntime] = {}
+        self._runtime = self._add_runtime(session)
         for name in ("context.budget", "compaction.started", "compaction.finished"):
             self.events.on(name, self._observe_context)
         self._client(provider)
 
+    def _add_runtime(self, session: Session) -> SessionRuntime:
+        if session.id in self._runtimes:
+            raise ValueError("会话已加载。")
+        runtime = SessionRuntime(session, self.events)
+        self._runtimes[session.id] = runtime
+        return runtime
+
+    def _load_runtime(self, session_id: str) -> SessionRuntime:
+        self._ensure_open()
+        # Loading and inserting happen on the event loop without an intervening await.
+        if runtime := self._runtimes.get(session_id):
+            return runtime
+        session = self._history.load(session_id)
+        if not Path(session.workspace).is_dir():
+            raise ValueError("该会话原工作区已不存在。")
+        if "history_search" in session.enabled_tools:
+            session = replace(session, enabled_tools=tuple(dict.fromkeys(
+                "retrieval" if name == "history_search" else name for name in session.enabled_tools
+            )))
+        model = self._model_for(session.provider, session.model_id)
+        self._validate_thinking(model, session.thinking)
+        self._validate_tools(
+            model,
+            session.enabled_tools,
+            retained=tuple(name for name in session.enabled_tools if name.startswith(TOOL_PREFIX)),
+        )
+        return self._add_runtime(session)
+
+    def _drop_runtime(self, session_id: str) -> None:
+        if runtime := self._runtimes.pop(session_id, None):
+            runtime.usage.close()
+        self._trusted_tools.difference_update({key for key in self._trusted_tools if key[0] == session_id})
+
     def _observe_context(self, event: Event) -> None:
-        if event.session_id != self._runtime.session.id:
+        runtime = self._runtimes.get(event.session_id)
+        if runtime is None:
             return
         if event.name == "context.budget":
             data = event.data
-            self._runtime.last_budget = (
-                event.session_id, data["provider"], data["model_id"],
+            runtime.last_budget = (
+                data["provider"], data["model_id"],
                 TokenBudget(**{field.name: data[field.name] for field in fields(TokenBudget)}),
             )
         else:
-            self._runtime.compacting = event.name == "compaction.started"
+            runtime.compacting = event.name == "compaction.started"
 
     def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:
@@ -182,6 +219,30 @@ class Application:
         provider_compatibility(provider)
         return resolve_model(provider, model_id, catalog=self._catalog)
 
+    @staticmethod
+    def _validate_thinking(model: ModelInfo, mode: str | None) -> None:
+        if mode is not None and mode not in (model.thinking_modes or ()):
+            raise CapabilityError(f"该模型不支持思考档位 {mode!r}，或能力尚未确认。")
+
+    def _validate_tools(
+        self,
+        model: ModelInfo,
+        names: tuple[str, ...],
+        *,
+        retained: tuple[str, ...] = (),
+    ) -> None:
+        available = set(self._all_tools)
+        for name in names:
+            if not isinstance(name, str) or (
+                name not in available and name not in retained
+            ):
+                raise ValidationError(
+                    f"Tool {name!r} is not registered or currently available."
+                )
+        self._tools.select([name for name in names if name in available])
+        if names:
+            require_tools(model)
+
     def _document_adapter(self, provider: str) -> DocumentAdapter | None:
         if provider not in self._document_adapters:
             self._document_adapters[provider] = provider_documents(
@@ -191,17 +252,21 @@ class Application:
 
     @property
     def _model(self) -> ModelInfo:
-        return resolve_model(
-            self._runtime.session.provider, self._runtime.session.model_id, catalog=self._catalog
-        )
+        return self._session_model(self._runtime.session)
+
+    def _session_model(self, session: Session) -> ModelInfo:
+        return resolve_model(session.provider, session.model_id, catalog=self._catalog)
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("Application 已关闭。")
 
-    def _ensure_idle(self) -> None:
+    def _ensure_idle(self, runtime: SessionRuntime | None = None) -> None:
         self._ensure_open()
-        if self._runtime.running:
+        if runtime is not None and self._runtimes.get(runtime.session.id) is not runtime:
+            raise FileNotFoundError("会话已关闭。")
+        runtimes = self._runtimes.values() if runtime is None else (runtime,)
+        if any(item.running for item in runtimes):
             raise RuntimeError("请先等待或取消当前 Turn，再执行该操作。")
         if self._state_lock.locked():
             raise RuntimeError("请等待会话或 MCP 更新完成。")
@@ -299,7 +364,7 @@ class Application:
                             self._runtime.session,
                             enabled_tools=(*self._runtime.session.enabled_tools, *discovered),
                         )
-                        await finish_io(self._save_and_publish_session(session))
+                        await finish_io(self._save_and_publish_session(self._runtime, session))
                 except (SessionBusyError, SessionConflictError, asyncio.CancelledError) as exc:
                     connection.tools = previous_tools
                     await finish_io(connection.aclose())
@@ -369,12 +434,12 @@ class Application:
         try:
             while not self._closed and connection in self._mcp_pending:
                 async with self._state_lock:
-                    active = self._runtime.task if self._runtime.running else None
-                    if active is None:
+                    active = [runtime.task for runtime in self._runtimes.values() if runtime.running]
+                    if not active:
                         await self._refresh_pending_mcp()
                         return
                 # Wait without adopting cancellation or failure from the Turn.
-                await asyncio.wait((active,))
+                await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
         finally:
             self._mcp_pending.discard(connection)
 
@@ -393,11 +458,14 @@ class Application:
     async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
             return ApprovalDecision.DENY
-        if self._runtime.approval is not None:
+        runtime = self._runtimes.get(request.session_id)
+        if self._closed or runtime is None:
+            return ApprovalDecision.DENY
+        if runtime.approval is not None:
             raise RuntimeError("已有待处理审批。")
         future = asyncio.get_running_loop().create_future()
-        self._runtime.approval = future
-        self._runtime.pending_approval = deepcopy(request)
+        runtime.approval = future
+        runtime.pending_approval = deepcopy(request)
         try:
             decision = await future
             if decision is ApprovalDecision.TRUST_SESSION:
@@ -415,34 +483,38 @@ class Application:
         finally:
             if not future.done():
                 future.cancel()
-            self._runtime.pending_approval = None
-            self._runtime.approval = None
+            runtime.pending_approval = None
+            runtime.approval = None
 
     def _resolve_approval(
-        self, request_id: str, decision: ApprovalDecision
+        self, session_id: str, request_id: str, decision: ApprovalDecision
     ) -> bool:
-        pending = self._runtime.pending_approval
-        if self._closed or pending is None or pending.request_id != request_id:
+        runtime = self._runtimes.get(session_id)
+        if self._closed or runtime is None:
             return False
-        if self._runtime.approval is None or self._runtime.approval.done():
+        pending = runtime.pending_approval
+        if pending is None or (pending.session_id, pending.request_id) != (session_id, request_id):
             return False
-        self._runtime.approval.set_result(decision)
+        if runtime.approval is None or runtime.approval.done():
+            return False
+        runtime.approval.set_result(decision)
         return True
 
     async def _run_turn(
-        self, prompt: str | None = None, *, stream: bool = True,
+        self, runtime: SessionRuntime, prompt: str | None = None, *, stream: bool = True,
         recovery_action: RecoveryAction | None = None, recovery_key: str | None = None,
         prompt_input: PromptInput | None = None,
         attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> TurnResult:
-        self._ensure_idle()
-        session = self._runtime.session
+        self._ensure_idle(runtime)
+        session = runtime.session
+        model = self._session_model(session)
         uploads = tuple(attachments)
         if any(isinstance(item, ImageAttachmentInput) for item in uploads):
-            require_image_input(self._model)
+            require_image_input(model)
         batch = prepare_attachments(uploads, submission_id) if uploads else None
         if batch and batch.documents:
-            require_document_input(self._model)
+            require_document_input(model)
         if prompt_input and (uploads or submission_id is not None):
             raise ValueError("MCP Prompt 必须作为独立任务运行。")
         if prompt_input:
@@ -454,12 +526,6 @@ class Application:
                 raise ValueError("MCP 资源包含未确认的敏感内容。")
         if batch and isinstance(prompt, str) and not prompt.strip():
             prompt = attachment_only_prompt(batch.files)
-        if self._mcp_pending:
-            async with self._state_lock:
-                await self._refresh_pending_mcp()
-                self._ensure_idle()
-                if self._runtime.session is not session:
-                    raise RuntimeError("会话已变化，请刷新后再操作。")
         thinking = session.thinking
         available = set(self._all_tools)
         enabled_tools = [name for name in session.enabled_tools if name in available]
@@ -472,7 +538,7 @@ class Application:
             provider=provider,
             catalog=self._catalog,
             custom_compatibility=custom_compatibility,
-            tools=self._tools.select(enabled_tools, mode=self._runtime.approval_mode),
+            tools=self._tools.select(enabled_tools, mode=runtime.approval_mode),
             events=self.events,
             context=Context(system_prompt=session.effective_system_prompt),
             compaction_settings=self._model_compaction_settings.get(
@@ -495,7 +561,7 @@ class Application:
 
                 async def persist(candidate: Session) -> None:
                     nonlocal save_failed, title_source
-                    if self._runtime.session is not session:
+                    if runtime.session is not session:
                         raise RuntimeError("Session changed while its Turn was running.")
                     try:
                         added = candidate.attachment_refs.keys() - session.attachment_refs.keys()
@@ -523,7 +589,7 @@ class Application:
                             candidate.title = fallback_title(source)
                             if candidate.title:
                                 title_source = source
-                        await self._save_session(candidate, lease=lease)
+                        await self._save_session(runtime, candidate, lease=lease)
                     except Exception:
                         save_failed = True
                         raise
@@ -546,42 +612,43 @@ class Application:
                         ) if batch else (),
                         attachment_store=self._history.attachments,
                         document_adapter=(
-                            self._document_adapter(provider) if self._model.supports_document and (
+                            self._document_adapter(provider) if model.supports_document and (
                                 (batch and batch.documents) or any(ref.documents for ref in session.attachment_refs.values())
                             ) else None
                         ),
                     )
                     if result.status is TurnStatus.COMPLETED and title_source is not None:
-                        await self._name_session(agent, session, title_source, lease=lease)
+                        await self._name_session(runtime, agent, session, title_source, lease=lease)
                 except asyncio.CancelledError:
                     # Reported usage can extend beyond the last saved message boundary.
                     try:
-                        if not save_failed and self._has_usage_to_save():
-                            await self._save_session(session, lease=lease)
+                        if not save_failed and self._has_usage_to_save(runtime):
+                            await self._save_session(runtime, session, lease=lease)
                     except Exception:
                         logger.exception("本轮已取消，已报告的用量未能保存。")
                     if result is None:
                         raise
                     # Stopping title generation does not undo the completed reply.
                     return result
-                if not save_failed and self._has_usage_to_save():
+                if not save_failed and self._has_usage_to_save(runtime):
                     try:
-                        await self._save_session(session, lease=lease)
+                        await self._save_session(runtime, session, lease=lease)
                     except Exception as exc:
                         raise SessionSaveError(result, exc) from exc
                 return result
 
+        # No await between the idle check and publication of the new task.
         task = asyncio.create_task(run())
-        self._runtime.task = task
+        runtime.task = task
         try:
             return await task
         finally:
-            if self._runtime.task is task:
-                self._runtime.task = None
+            if runtime.task is task:
+                runtime.task = None
 
-    async def _compact_session(self) -> CompactionCheckpoint | None:
-        self._ensure_idle()
-        session = self._runtime.session
+    async def _compact_session(self, runtime: SessionRuntime) -> CompactionCheckpoint | None:
+        self._ensure_idle(runtime)
+        session = runtime.session
         provider = session.provider
         agent = Agent(
             client=self._client(provider), provider=provider, catalog=self._catalog,
@@ -604,22 +671,22 @@ class Application:
                             session=session, operation_id=fields["turn_id"],
                         )
                     except (Exception, asyncio.CancelledError):
-                        if self._has_usage_to_save():
+                        if self._has_usage_to_save(runtime):
                             try:
-                                await self._save_session(session, lease=lease)
+                                await self._save_session(runtime, session, lease=lease)
                             except Exception:
                                 logger.exception("压缩用量未能保存。")
                         raise
                     if checkpoint is None:
-                        if self._has_usage_to_save():
-                            await self._save_session(session, lease=lease)
+                        if self._has_usage_to_save(runtime):
+                            await self._save_session(runtime, session, lease=lease)
                         await self.events.emit("compaction.finished", **fields, status="skipped")
                         return None
                     updated = replace(session, compaction=checkpoint)
 
                     async def commit() -> None:
-                        await self._save_session(updated, lease=lease)
-                        self._runtime.session = updated
+                        await self._save_session(runtime, updated, lease=lease)
+                        runtime.session = updated
                         await self.events.emit(
                             "compaction.finished", **fields,
                             status="committed", through=checkpoint.through,
@@ -628,7 +695,7 @@ class Application:
                     await finish_io(commit())
                     return checkpoint
             except asyncio.CancelledError:
-                if self._runtime.session is session:
+                if runtime.session is session:
                     await self.events.emit("compaction.finished", **fields, status="cancelled")
                 raise
             except Exception as exc:
@@ -639,18 +706,18 @@ class Application:
                 raise
 
         task = asyncio.create_task(compact())
-        self._runtime.task = task
+        runtime.task = task
         try:
             return await task
         finally:
-            if self._runtime.task is task:
-                self._runtime.task = None
+            if runtime.task is task:
+                runtime.task = None
 
-    async def _save_session(self, session: Session, *, lease: SessionLease | None = None) -> None:
-        session.usage = self._runtime.usage.session
+    async def _save_session(self, runtime: SessionRuntime, session: Session, *, lease: SessionLease | None = None) -> None:
+        session.usage = runtime.usage.session
         await self._history.save_async(session, lease=lease)
 
-    async def _name_session(self, agent: Agent, session: Session, source: str, *, lease: SessionLease) -> None:
+    async def _name_session(self, runtime: SessionRuntime, agent: Agent, session: Session, source: str, *, lease: SessionLease) -> None:
         title = session.title
         try:
             async with asyncio.timeout(_TITLE_TIMEOUT):
@@ -662,7 +729,7 @@ class Application:
         if title != session.title:
             async def save_title() -> None:
                 updated = replace(session, title=title)
-                await self._save_session(updated, lease=lease)
+                await self._save_session(runtime, updated, lease=lease)
                 session.title = updated.title
                 session.usage = updated.usage
                 session._saved_revision = updated._saved_revision
@@ -672,28 +739,28 @@ class Application:
             except Exception as exc:  # noqa: BLE001 - Keep the persisted fallback title.
                 logger.debug("会话标题保存失败：%s", type(exc).__name__)
 
-    async def _save_and_publish_session(self, session: Session) -> None:
-        if session._saved_revision is not None or len(session.messages) or self._has_usage_to_save():
-            await self._save_session(session)
-        self._runtime.session = session
+    async def _save_and_publish_session(self, runtime: SessionRuntime, session: Session) -> None:
+        if session._saved_revision is not None or len(session.messages) or self._has_usage_to_save(runtime):
+            await self._save_session(runtime, session)
+        runtime.session = session
 
-    async def _update_session(self, session: Session) -> None:
+    async def _update_session(self, runtime: SessionRuntime, session: Session) -> None:
         async with self._state_lock:
-            await finish_io(self._save_and_publish_session(session))
+            await finish_io(self._save_and_publish_session(runtime, session))
 
-    def _has_usage_to_save(self) -> bool:
-        return self._runtime.usage.session != self._runtime.session.usage and (
-            bool(len(self._runtime.session.messages)) or self._runtime.usage.session.reported_requests > 0
+    def _has_usage_to_save(self, runtime: SessionRuntime) -> bool:
+        return runtime.usage.session != runtime.session.usage and (
+            bool(len(runtime.session.messages)) or runtime.usage.session.reported_requests > 0
         )
 
-    async def _cancel_turn(self) -> None:
-        task = self._runtime.task
+    async def _cancel_turn(self, runtime: SessionRuntime) -> None:
+        task = runtime.task
         if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            if not task.cancelling():
+                task.cancel()
+            await asyncio.wait((task,))
+            if not task.cancelled():
+                task.result()
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -709,9 +776,15 @@ class Application:
                 if adapter is not None:
                     stack.push_async_callback(adapter.aclose)
             try:
-                await self._cancel_turn()
+                results = await asyncio.gather(
+                    *(self._cancel_turn(runtime) for runtime in self._runtimes.values()),
+                    return_exceptions=True,
+                )
                 self.events.clear()
                 await self.events.drain(timeout=_EVENT_DRAIN_TIMEOUT)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
             finally:
                 async with self._state_lock:
                     for connection in self._mcp.values():
@@ -720,5 +793,7 @@ class Application:
                         self._mcp.clear()
                         self._tools = self._mcp_catalog()
                 self._trusted_tools.clear()
-                self._runtime.usage.close()
+                for runtime in self._runtimes.values():
+                    runtime.usage.close()
+                self._runtimes.clear()
                 self.events.clear()

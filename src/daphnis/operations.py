@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from saturnus import ValidationError
-
 from .attachments import (
     Attachment,
     AttachmentInput,
@@ -24,10 +22,10 @@ from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
 from .events import Callback
 from .history import SessionLease, finish_io
-from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
+from .mcp import MCPConnection, MCPStatus, validate_prompt_request
 from .mcp.resources import expand_resource_template
 from .mcp_store import MCPServerConfig
-from .models import CapabilityError, ModelInfo, list_models, require_tools
+from .models import ModelInfo, list_models
 from .project import Project
 from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
@@ -131,8 +129,8 @@ class Operations:
     def context_budget(self) -> "TokenBudget | None":
         observed = self._app._runtime.last_budget
         session = self.session
-        if observed is not None and observed[:3] == (session.id, session.provider, session.model_id):
-            return observed[3]
+        if observed is not None and observed[:2] == (session.provider, session.model_id):
+            return observed[2]
         return None
 
     @property
@@ -180,39 +178,15 @@ class Operations:
             thinking=thinking,
             enabled_tools=enabled_tools,
         )
-        await app._update_session(updated)
+        await app._update_session(app._runtime, updated)
         return "\n".join(notices)
-
-    @staticmethod
-    def _validate_thinking(model: ModelInfo, mode: str | None) -> None:
-        if mode is not None and mode not in (model.thinking_modes or ()):
-            raise CapabilityError(f"该模型不支持思考档位 {mode!r}，或能力尚未确认。")
-
-    def _validate_tools(
-        self,
-        model: ModelInfo,
-        names: tuple[str, ...],
-        *,
-        retained: tuple[str, ...] = (),
-    ) -> None:
-        available = set(self.all_tools)
-        for name in names:
-            if not isinstance(name, str) or (
-                name not in available and name not in retained
-            ):
-                raise ValidationError(
-                    f"Tool {name!r} is not registered or currently available."
-                )
-        self._app._tools.select([name for name in names if name in available])
-        if names:
-            require_tools(model)
 
     async def set_thinking(self, mode: str | None) -> None:
         app = self._app
         app._ensure_idle()
-        self._validate_thinking(self.model, mode)
+        app._validate_thinking(self.model, mode)
         updated = replace(app._runtime.session, thinking=mode)
-        await app._update_session(updated)
+        await app._update_session(app._runtime, updated)
 
     def get_system_prompt(self) -> str:
         return self._app._runtime.session.effective_system_prompt
@@ -222,12 +196,12 @@ class Operations:
         app._ensure_idle()
         if not isinstance(prompt, str):
             raise TypeError("系统提示词必须是字符串。")
-        await app._update_session(replace(app._runtime.session, system_prompt=prompt))
+        await app._update_session(app._runtime, replace(app._runtime.session, system_prompt=prompt))
 
     async def reset_system_prompt(self) -> None:
         app = self._app
         app._ensure_idle()
-        await app._update_session(replace(app._runtime.session, system_prompt=None))
+        await app._update_session(app._runtime, replace(app._runtime.session, system_prompt=None))
 
     async def set_tools(
         self, names: Sequence[str], *, keep_unavailable: bool = False
@@ -244,9 +218,9 @@ class Operations:
                 for name in self.enabled_tools
                 if name not in available and name not in selected
             )
-        self._validate_tools(self.model, selected, retained=self.enabled_tools)
+        app._validate_tools(self.model, selected, retained=self.enabled_tools)
         updated = replace(app._runtime.session, enabled_tools=selected)
-        await app._update_session(updated)
+        await app._update_session(app._runtime, updated)
 
     async def connect_mcp(
         self,
@@ -496,7 +470,7 @@ class Operations:
         app._ensure_idle()
         async with app._state_lock:
             if app._runtime.session._saved_revision is None:
-                await finish_io(app._save_session(app._runtime.session))
+                await finish_io(app._save_session(app._runtime, app._runtime.session))
 
     async def _new_session(self, workspace: Path | str, project_id: str | None) -> SessionSnapshot:
         app = self._app
@@ -510,11 +484,9 @@ class Operations:
             project_id=project_id,
         )
         async def switch() -> None:
-            if app._has_usage_to_save():
-                await app._save_session(current)
-            app._runtime.session = fresh
-            app._runtime.approval_mode = ApprovalMode.AUTO
-            app._runtime.usage.select_session(fresh.id, fresh.usage)
+            if app._has_usage_to_save(app._runtime):
+                await app._save_session(app._runtime, current)
+            app._runtime = app._add_runtime(fresh)
 
         async with app._state_lock:
             await finish_io(switch())
@@ -523,25 +495,8 @@ class Operations:
     def restore_session(self, session_id: str) -> None:
         app = self._app
         app._ensure_idle()
-        restored = app._history.load(session_id)
-        if not Path(restored.workspace).is_dir():
-            raise ValueError("该会话原工作区已不存在。")
-        if "history_search" in restored.enabled_tools:
-            restored = replace(restored, enabled_tools=tuple(dict.fromkeys(
-                "retrieval" if name == "history_search" else name for name in restored.enabled_tools
-            )))
-        model = app._model_for(restored.provider, restored.model_id)
-        self._validate_thinking(model, restored.thinking)
-        self._validate_tools(
-            model,
-            restored.enabled_tools,
-            retained=tuple(
-                name for name in restored.enabled_tools if name.startswith(TOOL_PREFIX)
-            ),
-        )
-        app._runtime.session = restored
+        app._runtime = app._load_runtime(session_id)
         app._use_saved_tool_preferences = True
-        app._runtime.usage.select_session(restored.id, restored.usage)
 
     async def rename_session(self, session_id: str, title: str) -> None:
         app = self._app
@@ -549,8 +504,8 @@ class Operations:
         title = title.strip() if isinstance(title, str) else ""
         if not 0 < len(title) <= 120:
             raise ValueError("会话名称必须包含 1–120 个字符。")
-        if session_id == app._runtime.session.id:
-            await app._update_session(replace(app._runtime.session, title=title))
+        if runtime := app._runtimes.get(session_id):
+            await app._update_session(runtime, replace(runtime.session, title=title))
         else:
             async with app._state_lock:
                 await app._history.rename(session_id, title)
@@ -562,8 +517,8 @@ class Operations:
         app._ensure_idle()
 
         async def move() -> None:
-            active = session_id == app._runtime.session.id
-            session = app._runtime.session if active else await asyncio.to_thread(app._history.load, session_id)
+            runtime = app._runtimes.get(session_id)
+            session = runtime.session if runtime else await asyncio.to_thread(app._history.load, session_id)
             workspace = session.workspace
             if project_id is not None:
                 try:
@@ -580,8 +535,8 @@ class Operations:
             if workspace_changed and recovery is not None and recovery.kind is RecoveryKind.INTERRUPTED_TURN:
                 raise ValueError("请先继续或终止未完成的工具任务，再更换工作目录。")
             updated = replace(session, project_id=project_id, workspace=workspace)
-            if active:
-                await app._save_and_publish_session(updated)
+            if runtime:
+                await app._save_and_publish_session(runtime, updated)
             else:
                 await app._history.save_async(updated)
             if workspace_changed:
@@ -598,7 +553,9 @@ class Operations:
 
         async def delete_and_select() -> None:
             if session_id != current.id:
-                await app._history.delete(app._history.load(session_id))
+                runtime = app._runtimes.get(session_id)
+                await app._history.delete(runtime.session if runtime else app._history.load(session_id))
+                app._drop_runtime(session_id)
                 return
             fresh = Session(
                 workspace=current.workspace,
@@ -609,9 +566,8 @@ class Operations:
                 project_id=self.session.project_id,
             )
             await app._history.delete(current)
-            app._runtime.session = fresh
-            app._runtime.approval_mode = ApprovalMode.AUTO
-            app._runtime.usage.select_session(fresh.id, fresh.usage)
+            app._drop_runtime(session_id)
+            app._runtime = app._add_runtime(fresh)
 
         async with app._state_lock:
             await finish_io(delete_and_select())
@@ -700,7 +656,7 @@ class Operations:
         self, prompt: str, *, stream: bool = True,
         attachments: Sequence[AttachmentInput] = (), submission_id: str | None = None,
     ) -> "TurnResult":
-        return await self._app._run_turn(prompt, stream=stream, attachments=attachments, submission_id=submission_id)
+        return await self._app._run_turn(self._app._runtime, prompt, stream=stream, attachments=attachments, submission_id=submission_id)
 
     @property
     def prompt_groups(self) -> tuple[PromptGroup, ...]:
@@ -715,32 +671,32 @@ class Operations:
         return True
 
     async def run_mcp_prompt(self, prompt_input: PromptInput, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(stream=stream, prompt_input=prompt_input)
+        return await self._app._run_turn(self._app._runtime, stream=stream, prompt_input=prompt_input)
 
     @property
     def recovery(self) -> RecoveryState | None:
         return self._app._runtime.session.recovery
 
     async def retry_failed_user(self, key: str, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key)
+        return await self._app._run_turn(self._app._runtime, stream=stream, recovery_action=RecoveryAction.RETRY, recovery_key=key)
 
     async def continue_interrupted_turn(self, key: str, *, stream: bool = True) -> "TurnResult":
-        return await self._app._run_turn(stream=stream, recovery_action=RecoveryAction.CONTINUE, recovery_key=key)
+        return await self._app._run_turn(self._app._runtime, stream=stream, recovery_action=RecoveryAction.CONTINUE, recovery_key=key)
 
     async def terminate_interrupted_turn(self, key: str) -> "TurnResult":
-        return await self._app._run_turn(recovery_action=RecoveryAction.TERMINATE, recovery_key=key)
+        return await self._app._run_turn(self._app._runtime, recovery_action=RecoveryAction.TERMINATE, recovery_key=key)
 
     async def compact(self) -> CompactionCheckpoint | None:
-        return await self._app._compact_session()
+        return await self._app._compact_session(self._app._runtime)
 
     async def cancel(self) -> None:
         self._app._ensure_open()
-        await self._app._cancel_turn()
+        await self._app._cancel_turn(self._app._runtime)
 
     def resolve_approval(
         self, request_id: str, decision: ApprovalDecision | str
     ) -> bool:
-        return self._app._resolve_approval(request_id, ApprovalDecision(decision))
+        return self._app._resolve_approval(self.session.id, request_id, ApprovalDecision(decision))
 
     async def close(self) -> None:
         await self._app.close()

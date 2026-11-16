@@ -20,7 +20,9 @@ from daphnis.compaction_settings import CompactionSettings
 from daphnis.config import environment_connections
 from daphnis.history import SessionBusyError, SessionLease
 from daphnis.models import CapabilityError, ModelInfo
-from daphnis.tool_state import PENDING, TOOL_STATE
+from daphnis.tool_state import PENDING, RUNNING, TOOL_STATE
+from daphnis.tools import ApprovalDecision
+from daphnis.tools.files import prepare_write
 
 CATALOG = (
     ModelInfo(
@@ -43,6 +45,83 @@ def response(message, finish="stop"):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_turns_keep_approval_tools_and_usage_in_their_own_session(self):
+        tool_started = asyncio.Event()
+
+        def prepare(arguments, workspace):
+            operation = prepare_write(arguments, workspace)
+
+            async def wait_for_cancel():
+                tool_started.set()
+                await asyncio.Future()
+
+            return replace(operation, run=wait_for_cancel)
+
+        def handler(request):
+            messages = json.loads(request.content)["messages"]
+            if messages[0]["content"] == TITLE_PROMPT:
+                message, finish, tokens = {"role": "assistant", "content": "Title"}, "stop", 3
+            elif messages[-1]["role"] == "tool":
+                message, finish, tokens = {"role": "assistant", "content": "B done"}, "stop", 7
+            else:
+                prompt = messages[-1]["content"]
+                message = {"role": "assistant", "tool_calls": [{
+                    "id": "same-call", "type": "function", "function": {
+                        "name": "write_file", "arguments": json.dumps({"path": f"{prompt}.txt", "content": prompt}),
+                    },
+                }]}
+                finish, tokens = "tool_calls", 10 if prompt == "A" else 20
+            payload = response(message, finish).json()
+            payload["usage"] = {"prompt_tokens": tokens, "completion_tokens": 1}
+            return httpx.Response(200, json=payload)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            history = History(root / "sessions")
+            app = Application(
+                workspace=root, provider="deepseek", model_id="a", catalog=CATALOG,
+                history=history, interactive=True,
+                connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+            )
+            ops = Operations(app)
+            a = app._runtime
+            b = app._load_runtime((await ops.new_session()).id)
+            self.assertIs(app._load_runtime(a.session.id), a)
+            approvals = asyncio.Queue()
+            app.events.on("tool.approval_requested", approvals.put_nowait)
+            with patch.dict("daphnis.tools.registry._PREPARERS", {"write_file": prepare}):
+                first = asyncio.create_task(app._run_turn(a, "A", stream=False))
+                second = asyncio.create_task(app._run_turn(b, "B", stream=False))
+                try:
+                    async with asyncio.timeout(3):
+                        requests = {event.session_id: event.data["request_id"] for event in (
+                            await approvals.get(), await approvals.get(),
+                        )}
+                        self.assertFalse(app._resolve_approval(a.session.id, requests[b.session.id], ApprovalDecision.ALLOW_ONCE))
+                        self.assertTrue(app._resolve_approval(a.session.id, requests[a.session.id], ApprovalDecision.ALLOW_ONCE))
+                        await tool_started.wait()
+                        with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                            await app._run_turn(a, "duplicate", stream=False)
+                        self.assertTrue(app._resolve_approval(b.session.id, requests[b.session.id], ApprovalDecision.DENY))
+                        self.assertEqual((await second).status, TurnStatus.COMPLETED)
+                        self.assertFalse(first.done())
+                        await app._cancel_turn(a)
+                        with self.assertRaises(asyncio.CancelledError):
+                            await first
+                    saved_a, saved_b = history.load(a.session.id), history.load(b.session.id)
+                    self.assertEqual(saved_a.messages.get(0)["content"], "A")
+                    self.assertEqual(saved_a.messages.get(-1)[TOOL_STATE], RUNNING)
+                    self.assertEqual(saved_a.usage.total_tokens, 11)
+                    self.assertEqual(saved_b.messages.get(0)["content"], "B")
+                    self.assertEqual(json.loads(saved_b.messages.get(-2)["content"])["error"]["code"], "permission_denied")
+                    self.assertEqual(saved_b.messages.get(-1)["content"], "B done")
+                    self.assertEqual(saved_b.usage.total_tokens, 33)
+                    self.assertIsNone(a.pending_approval)
+                    self.assertIsNone(b.pending_approval)
+                finally:
+                    await app.close()
+                    await asyncio.gather(first, second, return_exceptions=True)
+
     async def test_switching_models_recomputes_compaction_budget_and_output_limit(self):
         bodies = []
 
@@ -484,7 +563,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 }},
                 history=History(history.directory),
             ))
-            seed = replace(app._runtime.session)
+            seed = app._runtime.session
             history.save(seed)
             ops.restore_session(seed.id)
             pending = asyncio.Event()
