@@ -1,14 +1,21 @@
 """Bounded text reads, directory listing, and approved file writes."""
 
+import asyncio
+import ctypes
 import errno
 import os
 import re
 import stat
+import sys
+import unicodedata
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ..history import finish_io
 from ..text import decode_text, line_range
 from .approval import (
     ApprovalMode,
@@ -22,6 +29,9 @@ from .approval import (
     verify_directory,
 )
 
+if os.name == "posix":
+    import fcntl
+
 MAX_FILE_BYTES = 1_048_576
 MAX_PATCH_BYTES = 1_048_576
 _CREDENTIAL_NAMES = frozenset({
@@ -33,6 +43,73 @@ _CREDENTIAL_PATHS = frozenset({
     (".aws", "credentials"), (".aws", "config"), (".docker", "config.json"),
     (".kube", "config"), ("gh", "hosts.yml"),
 })
+
+
+def _lock_directory() -> Path:
+    # A fixed local namespace lets independent processes agree without creating
+    # files in the workspace or requiring write access to directories we read.
+    return Path("/tmp").resolve() / f".daphnis-file-locks-{os.geteuid()}"
+
+
+def _lock_path(path: Path) -> Path:
+    # Case and Unicode aliases can name the same entry on some filesystems.
+    return Path(unicodedata.normalize("NFC", str(path).casefold()))
+
+
+def _check_lock_entry(info: os.stat_result, *, directory: bool) -> None:
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else (
+        stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+    )
+    if not valid_type or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise ToolError("permission_denied", "Unsafe file tool lock storage.")
+
+
+@asynccontextmanager
+async def _file_locks(paths: tuple[Path, ...], *, shared: bool = False):
+    if os.name != "posix":
+        raise ToolError("unsupported_platform", "Hardened file tools require POSIX.")
+    directory = _lock_directory()
+    lock_paths = {_lock_path(path) for path in paths}
+    private_path = _lock_path(directory)
+    if any(path.is_relative_to(private_path) for path in lock_paths):
+        raise ToolError("sensitive_path", "File tool lock storage is private.")
+    directory.mkdir(mode=0o700, exist_ok=True)
+    root = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    locks = []
+    try:
+        _check_lock_entry(os.fstat(root), directory=True)
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        for key in sorted(sha256(os.fsencode(path)).hexdigest() for path in lock_paths):
+            fd = os.open(key, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=root)
+            locks.append(fd)
+            _check_lock_entry(os.fstat(fd), directory=False)
+            while True:
+                try:
+                    fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(0.01)
+        yield
+    finally:
+        for fd in reversed(locks):
+            os.close(fd)
+        os.close(root)
+
+
+def _current_target(target: Target) -> Target:
+    current = Target.capture(target.requested, target.path.parent)
+    if current.path != target.path:
+        raise ToolError("target_changed", f"Target path changed: {target.requested}")
+    return current
+
+
+class _PathOperation(Operation):
+    """Authorize a path whose current version will be captured under its lock."""
+
+    def verify(self) -> None:
+        for target in self.targets:
+            _current_target(target)
 
 
 def is_credential_path(path: Path) -> bool:
@@ -59,7 +136,8 @@ def require_readable_path(target: Target, *, mode: ApprovalMode = ApprovalMode.A
 def read_bytes(target: Target, limit: int, *, mode: ApprovalMode = ApprovalMode.AUTO) -> tuple[bytes, bool]:
     require_readable_path(target, mode=mode)
     with target.open() as fd:
-        if os.fstat(fd).st_nlink > 1:
+        before = os.fstat(fd)
+        if before.st_nlink > 1:
             raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
         data = bytearray()
         while len(data) <= limit:
@@ -67,6 +145,9 @@ def read_bytes(target: Target, limit: int, *, mode: ApprovalMode = ApprovalMode.
             if not chunk:
                 break
             data.extend(chunk)
+        if signature(os.fstat(fd)) != signature(before):
+            raise ToolError("target_changed", "File changed while reading.")
+        target.verify()
         return bytes(data[:limit]), len(data) > limit
 
 
@@ -75,9 +156,17 @@ def prepare_read(
 ) -> Operation:
     target = Target.capture(arguments["path"], workspace)
     require_readable_path(target, mode=mode)
+    decision = path_decision(workspace, (target,))
+    pin_version = mode is ApprovalMode.ASK or (
+        mode is not ApprovalMode.FULL and decision is Decision.ASK
+    )
+    parent = Target.capture(target.path.parent, workspace)
 
-    async def run():
-        data, truncated = read_bytes(target, arguments.get("max_bytes", 65536), mode=mode)
+    def read():
+        if parent.identity is not None:
+            verify_directory(parent.path, parent.identity)
+        current = target if pin_version else _current_target(target)
+        data, truncated = read_bytes(current, arguments.get("max_bytes", 65536), mode=mode)
         lines = decode_text(data, truncated).splitlines(keepends=True)
         start = arguments.get("start_line", 1)
         end = arguments.get("end_line")
@@ -94,8 +183,13 @@ def prepare_read(
             "scanned_bytes": len(data),
         }
 
-    return Operation(
-        path_decision(workspace, (target,)),
+    async def run():
+        async with _file_locks((target.path,), shared=True):
+            return await finish_io(asyncio.to_thread(read))
+
+    operation = Operation if pin_version else _PathOperation
+    return operation(
+        decision,
         "Read a UTF-8 text file.",
         (target,),
         {"path": str(target.path), **arguments},
@@ -292,22 +386,24 @@ def _apply_text(original: str, patch: FilePatch) -> bytes:
     return encoded
 
 
-def _verify_displaced(stage: int, target: Target, original: bytes) -> None:
-    try:
-        fd = os.open("original", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=stage)
-    except OSError as exc:
-        raise ToolError("target_changed", "Patch target changed during commit.") from exc
-    with os.fdopen(fd, "rb") as stream:
-        before = signature(os.fstat(fd))
-        expected = target.identity
-        # Renaming changes ctime. Compare the other metadata and the actual bytes.
-        if (
-            expected is None
-            or before[:5] != expected[:5]
-            or stream.read(len(original) + 1) != original
-            or signature(os.fstat(fd)) != before
-        ):
-            raise ToolError("target_changed", "Patch target changed during commit.")
+def _publish_new(stage: int, parent: int, name: str) -> None:
+    # Use no-replace rename where available so even a killed creator leaves
+    # no second link. The shared lock hides the fallback link until cleanup.
+    system_call = {"darwin": ("renameatx_np", 4), "linux": ("renameat2", 1)}.get(sys.platform)
+    if system_call is not None:
+        symbol, flags = system_call
+        rename = getattr(ctypes.CDLL(None, use_errno=True), symbol, None)
+        if rename is not None:
+            rename.argtypes = (
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+            )
+            rename.restype = ctypes.c_int
+            if rename(stage, b"updated", parent, os.fsencode(name), flags) == 0:
+                return
+            error = ctypes.get_errno()
+            if error not in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL):
+                raise OSError(error, os.strerror(error), name)
+    os.link("updated", name, src_dir_fd=stage, dst_dir_fd=parent, follow_symlinks=False)
 
 
 def _write(
@@ -324,14 +420,27 @@ def _write(
             if parent.identity is not None and parent.identity[:3] != opened[:3]:
                 raise ToolError("target_changed", f"Parent directory was replaced: {parent.path}")
 
+        def verify_original() -> None:
+            if original is None:
+                target.verify()
+            else:
+                current, truncated = read_bytes(target, len(original))
+                if truncated or current != original:
+                    raise ToolError("target_changed", "Target content changed before commit.")
+
         verify_parent()
+        if action == "delete":
+            verify_original()
+            os.unlink(name, dir_fd=fd)
+            applied.append(str(target.path))
+            verify_parent()
+            return
+
         staging = f".daphnis-{uuid4().hex}.tmp"
         os.mkdir(staging, mode=0o700, dir_fd=fd)
-        stage = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-        displaced = installed = keep_original = False
         try:
-            if action != "delete":
-                verify_parent()
+            stage = os.open(staging, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
                 output = os.open("updated", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                                  0o666, dir_fd=stage)
                 with os.fdopen(output, "wb") as stream:
@@ -340,56 +449,26 @@ def _write(
                     if target.identity is not None:
                         os.fchmod(stream.fileno(), stat.S_IMODE(target.identity[2]))
                     os.fsync(stream.fileno())
-            target.verify()
-            verify_parent()
-            if original is not None:
-                # Hold the displaced inode until validation. A late writer's
-                # version can be restored or recovered even if the name races.
-                os.rename(name, "original", src_dir_fd=fd, dst_dir_fd=stage)
-                displaced = True
-                _verify_displaced(stage, target, original)
+
                 verify_parent()
-            if action != "delete":
-                os.link(
-                    "updated", name, src_dir_fd=stage, dst_dir_fd=fd, follow_symlinks=False
-                )
-                installed = True
+                verify_original()
+                if action == "create":
+                    _publish_new(stage, fd, name)
+                else:
+                    # The check and replacement are serialized for cooperating
+                    # tools. External writers can still act between the two.
+                    os.replace("updated", name, src_dir_fd=stage, dst_dir_fd=fd)
                 applied.append(str(target.path))
-            if original is not None:
-                _verify_displaced(stage, target, original)
-            verify_parent()
-            if action == "delete":
-                applied.append(str(target.path))
-        except (OSError, ToolError) as exc:
-            if displaced and not installed:
-                try:
-                    verify_parent()
-                    os.link("original", name, src_dir_fd=stage, dst_dir_fd=fd,
-                            follow_symlinks=False)
-                except (OSError, ToolError):
-                    keep_original = True
-                    applied.append(str(target.path))
-            elif displaced:
-                keep_original = True
-            if keep_original:
-                raise ToolError(
-                    "target_changed",
-                    "Patch conflict; displaced file retained in the original directory.",
-                    recovery_file=str(parent.path / staging / "original"),
-                ) from exc
-            raise
-        finally:
-            try:
-                for entry in ("updated", "original"):
-                    if entry != "original" or not keep_original:
-                        try:
-                            os.unlink(entry, dir_fd=stage)
-                        except FileNotFoundError:
-                            continue
+                verify_parent()
             finally:
-                os.close(stage)
-            if not keep_original:
-                os.rmdir(staging, dir_fd=fd)
+                try:
+                    os.unlink("updated", dir_fd=stage)
+                except FileNotFoundError:
+                    pass
+                finally:
+                    os.close(stage)
+        finally:
+            os.rmdir(staging, dir_fd=fd)
 
 
 def _workspace_file(value: str, workspace: Path) -> tuple[Target, Target, Target]:
@@ -428,9 +507,11 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
 
     details = {"path": str(path), "bytes_written": len(content)}
 
-    async def run():
+    def create():
         applied: list[str] = []
         try:
+            if _current_target(target).identity is not None:
+                raise FileExistsError(path)
             _write(target, "create", None, content, workspace=workspace_target,
                    parent=parent, created=None, applied=applied)
         except FileExistsError as exc:
@@ -443,6 +524,10 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
                 str(exc), partial=True, **details,
             )
         return {"ok": True, **details}
+
+    async def run():
+        async with _file_locks((target.path,)):
+            return await finish_io(asyncio.to_thread(create))
 
     return Operation(
         Decision.ASK,
@@ -464,7 +549,7 @@ def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
         raise ToolError("invalid_file", "replace_text requires a regular file, without symlinks.")
     old, new = arguments["old_text"], arguments["new_text"]
 
-    async def run():
+    def replace():
         original, truncated = read_bytes(target, MAX_FILE_BYTES)
         if truncated:
             raise ToolError("file_too_large", "Original file exceeds the 1 MiB limit.")
@@ -490,6 +575,10 @@ def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
                 **(exc.details if isinstance(exc, ToolError) else {}),
             )
         return {"ok": True, "path": str(target.path), "bytes_written": len(updated)}
+
+    async def run():
+        async with _file_locks((target.path,)):
+            return await finish_io(asyncio.to_thread(replace))
 
     return Operation(
         Decision.ASK,
@@ -517,7 +606,7 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
         if patch.action != "create" and target.identity is None:
             raise ToolError("file_not_found", f"Target does not exist: {target.path}")
 
-    async def run():
+    def apply():
         # Read/validate every hunk only after authorization and before any writes.
         updates = []
         for target, patch in zip(targets, patches, strict=True):
@@ -556,6 +645,10 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
             "created_directories": created,
             "partial": False,
         }
+
+    async def run():
+        async with _file_locks(tuple(target.path for target in targets)):
+            return await finish_io(asyncio.to_thread(apply))
 
     return Operation(
         Decision.ASK,

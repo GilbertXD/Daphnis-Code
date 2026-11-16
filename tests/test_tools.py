@@ -16,7 +16,7 @@ from saturnus import ChatClient, ToolCallValidationError
 from daphnis import Agent, EventBus, History, Operations, Session, TurnStatus
 from daphnis.app import Application
 from daphnis.models import ModelInfo
-from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools
+from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools, files
 from daphnis.tools.files import MAX_FILE_BYTES
 
 
@@ -315,13 +315,13 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             parent.unlink()
             parent.mkdir()
 
-            real_link = os.link
+            publish_new = files._publish_new
 
             def create_before_publish(*args, **kwargs):
                 target.write_bytes(b"concurrent file")
-                return real_link(*args, **kwargs)
+                return publish_new(*args, **kwargs)
 
-            with patch("daphnis.tools.files.os.link", side_effect=create_before_publish):
+            with patch.object(files, "_publish_new", side_effect=create_before_publish):
                 result = await tools.execute(request)
             self.assertEqual(result.value["error"]["code"], "file_exists")
             self.assertEqual(target.read_bytes(), b"concurrent file")
@@ -485,16 +485,16 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.value["error"]["code"], "target_changed")
             self.assertEqual(a.read_text(), "someone else's change\n")
             a.write_text("a\n")
-            real_rename = os.rename
+            real_replace = os.replace
             calls = []
 
             def fail_second(*args, **kwargs):
                 calls.append(args)
                 if len(calls) == 2:
                     raise OSError("injected disk failure")
-                return real_rename(*args, **kwargs)
+                return real_replace(*args, **kwargs)
 
-            with patch("daphnis.tools.files.os.rename", side_effect=fail_second):
+            with patch.object(files.os, "replace", side_effect=fail_second):
                 result = await tools.execute(
                     call("apply_patch", patch=valid + diff("b.txt", "b\n", "B\n"))
                 )
@@ -504,13 +504,13 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(a.read_text(), "A\n")
             self.assertEqual(b.read_text(), "b\n")
             self.assertEqual(list(workspace.glob(".daphnis-*.tmp")), [])
-            real_link = os.link
+            publish_new = files._publish_new
 
             def concurrent_creation(*args, **kwargs):
                 (workspace / "new.txt").write_text("created by someone else\n")
-                return real_link(*args, **kwargs)
+                return publish_new(*args, **kwargs)
 
-            with patch("daphnis.tools.files.os.link", side_effect=concurrent_creation):
+            with patch.object(files, "_publish_new", side_effect=concurrent_creation):
                 result = await tools.execute(
                     call(
                         "apply_patch",
@@ -547,20 +547,17 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
 
             target = workspace / "data.txt"
             target.write_text("old\n")
-            real_replace, real_rename = os.replace, os.rename
+            read = files.read_bytes
+            reads = 0
 
-            def replace_after_edit(src, dst, **kwargs):
-                target.write_text("concurrent\n")
-                return real_replace(src, dst, **kwargs)
+            def edit_before_final_validation(*args, **kwargs):
+                nonlocal reads
+                reads += 1
+                if reads == 2:
+                    target.write_text("concurrent\n")
+                return read(*args, **kwargs)
 
-            def rename_after_edit(src, dst, **kwargs):
-                target.write_text("concurrent\n")
-                return real_rename(src, dst, **kwargs)
-
-            with (
-                patch("daphnis.tools.files.os.replace", side_effect=replace_after_edit),
-                patch("daphnis.tools.files.os.rename", side_effect=rename_after_edit),
-            ):
+            with patch.object(files, "read_bytes", side_effect=edit_before_final_validation):
                 changed = await tools.execute(call(
                     "apply_patch", patch=diff("data.txt", "old\n", "ours\n")
                 ))
