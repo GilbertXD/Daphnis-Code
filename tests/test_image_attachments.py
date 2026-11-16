@@ -405,15 +405,14 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         resumed = self.runtime(handler)
         resumed.restore_session(sid)
         bridge = Bridge(resumed, Redactor(()))
-        bridge.session_id = sid
         for name in ("model.request", "model.delta", "model.finished"):
             resumed.subscribe(name, events.append)
-        resumed.subscribe("model.delta", lambda _: frames.append(bridge.frame()))
-        bridge.start("Describe the previous image")
-        await bridge.task
+        resumed.subscribe("model.delta", lambda _: frames.append(bridge.frame(sid)))
+        bridge.start(sid, "Describe the previous image")
+        await bridge.runs[sid].task
         self.assertEqual(observed_urls, [[image_url(self.red)], [image_url(self.red)]])
         self.assertEqual(len(resumed.message_snapshot(sid)), 4)
-        visible = json.dumps([self.saved(sid), bridge.frame(), *frames, *(event.data for event in events)])
+        visible = json.dumps([self.saved(sid), bridge.frame(sid), *frames, *(event.data for event in events)])
         self.assertIn("Still visible.", visible)
         self.assertNotIn("base64", visible)
         self.assertNotIn(payload, visible)

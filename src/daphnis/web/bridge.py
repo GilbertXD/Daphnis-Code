@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import OrderedDict, deque
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from functools import partial
 from uuid import uuid4
 
@@ -68,30 +68,54 @@ class Journal:
         return [record for _, record in self.entries if record["id"] > cursor]
 
 
+@dataclass
+class WebRun:
+    data: dict
+    task: asyncio.Task[dict] = field(init=False, repr=False)
+    live: dict = field(default_factory=dict)
+    accepted: asyncio.Future | None = None
+    upload: tuple | None = None
+    prompt_input: PromptInput | None = None
+
+
 class Bridge:
     def __init__(self, ops: Operations, redactor: Redactor):
         self.ops = ops
-        self.session_id = ops.initial_session_id
+        self.default_session_id = ops.initial_session_id
         self.redactor = redactor
         self.changed = asyncio.Event()
         self.revision = 0
+        self.shared_revision = 0
+        self.updates: dict[str, int] = {}
+        self.state_revisions: dict[str, int] = {}
         self.cursor = 0
         self.journals = OrderedDict()
-        self.task = None
-        self.run = None
-        self.upload = None
-        self.prompt_run = None
+        self.runs: dict[str, WebRun] = {}
         self.prompt_previews = OrderedDict()
         self.resource_drafts = OrderedDict()
-        self.live = {}
-        self.lock = asyncio.Lock()
         self._subscriptions = [ops.subscribe(name, self._forward) for name in _EVENT_NAMES]
 
-    def _notify(self, *, state=False):
-        if state:
-            self.revision += 1
+    def notify(self, session_id=None, *, state=False, shared=False):
+        self.revision += 1
+        if session_id is not None:
+            self.updates[session_id] = self.revision
+            if state:
+                self.state_revisions[session_id] = self.revision
+        if shared:
+            self.shared_revision = self.revision
         self.changed.set()
         self.changed = asyncio.Event()
+
+    def version(self, session_id):
+        return max(self.updates.get(session_id, 0), self.shared_revision)
+
+    def busy(self, session_id):
+        return session_id in self.runs or self.ops.busy(session_id)
+
+    def forget(self, session_id):
+        self.journals.pop(session_id, None)
+        self.updates.pop(session_id, None)
+        self.state_revisions.pop(session_id, None)
 
     def _record(self, name, session_id, turn_id, data):
         journal = self.journals.get(session_id)
@@ -100,7 +124,10 @@ class Bridge:
             self.journals[session_id] = journal
         self.journals.move_to_end(session_id)
         if len(self.journals) > _MAX_SESSIONS:
-            self.journals.popitem(last=False)
+            for old in self.journals:
+                if old != session_id and old not in self.runs:
+                    del self.journals[old]
+                    break
         self.cursor += 1
         data = self.redactor.json(data)
         if len(json.dumps(data, ensure_ascii=False).encode()) > _MAX_EVENT_BYTES:
@@ -113,34 +140,32 @@ class Bridge:
         })
 
     def _forward(self, event):
-        data = event.data
-        if not event.session_id:
-            self._notify(state=True)
+        data, session = event.data, event.session_id
+        if not session:
+            self.notify(shared=True)
             return
-        if event.name == "attachments.committed":
-            if self.upload and self.run and self.run["session_id"] == event.session_id:
-                submission_id, _, _, accepted = self.upload
-                if submission_id == data["submission_id"] and not accepted.done():
-                    accepted.set_result(None)
-            self._notify(state=True)
-            return
-        if event.name == "prompt.committed":
-            if self.prompt_run and self.run and self.run["session_id"] == event.session_id:
-                prompt_input, accepted = self.prompt_run
-                if prompt_input.id == data["group_id"] and not accepted.done():
-                    accepted.set_result(None)
-            self._notify(state=True)
+        run = self.runs.get(session)
+        if event.name in {"attachments.committed", "prompt.committed"}:
+            if (
+                run and run.accepted and not run.accepted.done()
+                and (
+                    run.upload is not None and run.upload[0] == data.get("submission_id")
+                    or run.prompt_input is not None and run.prompt_input.id == data.get("group_id")
+                )
+            ):
+                run.accepted.set_result(None)
+            self.notify(session, state=True, shared=True)
             return
         if event.name == "model.finished" and data.get("attachment_sensitive"):
             data = {key: value for key, value in data.items() if key != "response"}
         if event.name == "model.delta":
-            if self.run is None or event.turn_id != self.run["turn_id"]:
+            if run is None or event.turn_id != run.data["turn_id"]:
                 return
             number = data["request_number"]
-            item = self.live.setdefault(number, {"content": "", "reasoning": "", "count": 0})
+            item = run.live.setdefault(number, {"content": "", "reasoning": "", "count": 0})
             if not item["count"]:
                 self._record(
-                    event.name, event.session_id, event.turn_id,
+                    event.name, session, event.turn_id,
                     {"request_number": number, "coalesced": True},
                 )
             item["count"] += 1
@@ -155,32 +180,29 @@ class Bridge:
                     if isinstance(value, str) and len(item[key]) < _MAX_LIVE_CHARS:
                         item[key] += value[:_MAX_LIVE_CHARS - len(item[key])]
         else:
-            if event.name == "turn.started" and self.run and self.run["session_id"] == event.session_id:
-                self.run["turn_id"] = event.turn_id
-                data = {**data, "base_count": self.run["base_count"]}
+            if event.name == "turn.started" and run and run.data.get("kind") != "compaction":
+                run.data["turn_id"] = event.turn_id
+                data = {**data, "base_count": run.data["base_count"]}
             if (
                 event.name == "compaction.started" and data.get("trigger") == "manual"
-                and self.run and self.run.get("kind") == "compaction"
-                and self.run["session_id"] == event.session_id
+                and run and run.data.get("kind") == "compaction"
             ):
-                self.run["turn_id"] = event.turn_id
-            if event.name == "model.finished" and self.run and event.turn_id == self.run["turn_id"]:
-                item = self.live.get(data["request_number"])
+                run.data["turn_id"] = event.turn_id
+            if event.name == "model.finished" and run and event.turn_id == run.data["turn_id"]:
+                item = run.live.get(data["request_number"])
                 if item is not None:
                     data = {**data, "chunks": item["count"]}
             if event.name == "turn.finished":
-                data = {**data, "committed_count": len(self.ops.message_snapshot(event.session_id))}
-            self._record(event.name, event.session_id, event.turn_id, data)
-        first_request = (
+                data = {**data, "committed_count": len(self.ops.message_snapshot(session))}
+            self._record(event.name, session, event.turn_id, data)
+        committed_input = (
             event.name == "model.started" and data["request_number"] == 1
             and data.get("purpose") != "title"
-            and self.run is not None
         )
-        self._notify(state=first_request or event.name in {"mcp.error", "mcp.tools_changed"})
+        self.notify(session, state=committed_input, shared=committed_input)
 
-    def state(self):
+    def _shared_state(self, session):
         ops = self.ops
-        session = self.session_id
         history_error = None
         try:
             history = ops.scan_sessions()
@@ -200,28 +222,18 @@ class Bridge:
             servers = ()
             mcp_error = "无法读取已保存的 MCP 配置，请检查 mcp.json。"
         statuses = {status.name: status for status in ops.mcp_status()}
+        sessions = [asdict(item) for item in history.sessions]
+        saved = {item.id for item in history.sessions}
+        sessions.extend(asdict(ops.session(item)) for item in self.runs if item not in saved)
         state = self.redactor.json({
             "session": asdict(ops.session(session)),
-            "sessions": [asdict(session) for session in history.sessions],
+            "sessions": sessions,
             "projects": [asdict(project) for project in projects],
             "projects_error": projects_error,
             "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
-            "messages": _browser_messages(ops.message_snapshot(session)),
-            "attachment_refs": ops.attachment_snapshot(session),
-            "prompt_groups": [asdict(group) for group in ops.prompt_groups(session)],
-            "recovery": asdict(recovery) if (recovery := ops.recovery(session)) else None,
-            "model": _model_view(ops.model(session)),
-            "models": [
-                {**_model_view(model), "configured": ops.configured(provider)}
-                for provider, models in ops.list_models(session).items() for model in models
-            ],
-            "thinking": ops.thinking(session),
-            "system_prompt": ops.get_system_prompt(session),
             "all_tools": ops.all_tools,
-            "enabled_tools": ops.enabled_tools(session),
             "effective_tools": ops.effective_tools(session),
-            "approval_mode": ops.approval_mode(session),
         })
         state["mcp_error"] = mcp_error
         state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers()
@@ -241,9 +253,30 @@ class Bridge:
             })
         return state
 
-    def frame(self, previous_session="", revision=-1, cursor=0):
+    def state(self, session):
         ops = self.ops
-        session = self.session_id
+        return {
+            **self._shared_state(session),
+            **self.redactor.json({
+                "messages": _browser_messages(ops.message_snapshot(session)),
+                "attachment_refs": ops.attachment_snapshot(session),
+                "prompt_groups": [asdict(group) for group in ops.prompt_groups(session)],
+                "recovery": asdict(recovery) if (recovery := ops.recovery(session)) else None,
+                "model": _model_view(ops.model(session)),
+                "models": [
+                    {**_model_view(model), "configured": ops.configured(provider)}
+                    for provider, models in ops.list_models(session).items() for model in models
+                ],
+                "thinking": ops.thinking(session),
+                "system_prompt": ops.get_system_prompt(session),
+                "enabled_tools": ops.enabled_tools(session),
+                "approval_mode": ops.approval_mode(session),
+            }),
+        }
+
+    def frame(self, session, previous_session="", revision=-1, cursor=0):
+        ops = self.ops
+        run = self.runs.get(session)
         journal = self.journals.get(session)
         reset = previous_session != session or (journal is not None and cursor < journal.floor)
         approval = ops.pending_approval(session)
@@ -251,12 +284,12 @@ class Bridge:
         budget = ops.context_budget(session)
         frame = {
             "session_id": session,
-            "revision": self.revision,
+            "revision": self.version(session),
             "cursor": self.cursor,
             "reset": reset,
             "events": journal.after(0 if reset else cursor) if journal else [],
             "status": self.redactor.json({
-                "running": ops.running(session) or self.run is not None,
+                "running": ops.running(session) or run is not None,
                 "approval": asdict(approval) if approval else None,
                 "session_usage": asdict(ops.session_usage(session)),
                 "turn_usage": asdict(usage) if usage else None,
@@ -265,21 +298,23 @@ class Bridge:
                     "hard_limit": budget.hard_limit,
                     "threshold_blocked_by_reserve": budget.threshold_blocked_by_reserve,
                 } if budget else None,
-                "compacting": ops.compacting(session) or (self.run is not None and self.run.get("kind") == "compaction"),
+                "compacting": ops.compacting(session) or (run is not None and run.data.get("kind") == "compaction"),
                 "compacted_through": ops.compacted_through(session),
             }),
-            "run": self.redactor.json(self.run),
+            "run": self.redactor.json(run.data) if run else None,
             "live": {
                 number: {
                     "content": self.redactor.text(item["content"], partial=True),
                     "reasoning": self.redactor.text(item["reasoning"], partial=True),
                     "count": item["count"],
                 }
-                for number, item in self.live.items()
+                for number, item in (run.live.items() if run else ())
             },
         }
-        if reset or revision != self.revision:
-            frame["state"] = self.state()
+        if reset or self.state_revisions.get(session, 0) > revision:
+            frame["state"] = self.state(session)
+        elif self.shared_revision > revision:
+            frame["shared"] = self._shared_state(session)
         return frame
 
     def cache_resource_draft(self, session, resource):
@@ -302,84 +337,84 @@ class Bridge:
             self.prompt_previews.popitem(last=False)
         return preview_id
 
-    def start(self, prompt, *, operation=None, attachments=(), submission_id=None, prompt_input: PromptInput | None = None):
-        session_id = self.session_id
-        self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
-                    "base_count": len(self.ops.message_snapshot(session_id))}
-        accepted = None
+    def start(self, session_id, prompt, *, operation=None, attachments=(), submission_id=None,
+              prompt_input: PromptInput | None = None):
+        run = WebRun({
+            "id": uuid4().hex, "session_id": session_id, "turn_id": "", "prompt": prompt,
+            "base_count": len(self.ops.message_snapshot(session_id)),
+        })
         if attachments:
-            self.run["prompt"] = prompt if prompt.strip() else attachment_only_prompt(attachments)
-            self.run["attachments"] = [item.name for item in attachments]
-            accepted = asyncio.get_running_loop().create_future()
-            self.upload = (submission_id, prompt, attachments, accepted)
+            run.data["prompt"] = prompt if prompt.strip() else attachment_only_prompt(attachments)
+            run.data["attachments"] = [item.name for item in attachments]
+            run.upload = (submission_id, prompt, attachments)
         elif prompt_input is not None:
-            accepted = asyncio.get_running_loop().create_future()
-            self.prompt_run = (prompt_input, accepted)
+            run.prompt_input = prompt_input
             operation = partial(self.ops.run_mcp_prompt, prompt_input, session_id=session_id)
-        self.live.clear()
-        self.task = asyncio.create_task(self._send(prompt, session_id, operation, attachments, submission_id, accepted))
-        self._notify()
-        return accepted
+        if run.upload is not None or run.prompt_input is not None:
+            run.accepted = asyncio.get_running_loop().create_future()
+        if operation is None:
+            operation = partial(
+                self.ops.send, prompt, session_id=session_id, stream=True,
+                attachments=attachments, submission_id=submission_id,
+            )
+        self._start_run(session_id, run, self._send(operation))
+        return run.accepted
 
-    async def _send(self, prompt, session_id, operation, attachments, submission_id, accepted):
-        result = {"status": "FAILED", "error": "本轮未完成。"}
+    def _start_run(self, session_id, run, operation):
+        self.runs[session_id] = run
+        run.task = asyncio.create_task(operation)
+        run.task.add_done_callback(partial(self._finished, session_id, run))
+        self.notify(session_id, shared=True)
+
+    async def _send(self, operation):
         try:
-            if operation is not None:
-                turn = await operation()
-            elif attachments:
-                turn = await self.ops.send(prompt, session_id=session_id, stream=True, attachments=attachments, submission_id=submission_id)
-            else:
-                turn = await self.ops.send(prompt, session_id=session_id, stream=True)
-            result = {
+            turn = await operation()
+            return {
                 "status": turn.status,
                 "error": turn.error,
                 "notice": turn.notice,
                 "external_side_effects_possible": turn.external_side_effects_possible,
             }
-        except asyncio.CancelledError:
-            result = {"status": "CANCELLED", "error": "本轮已停止。已执行的工具操作不会自动撤销。"}
         except Exception as exc:  # noqa: BLE001 - Return failures across the detached send boundary.
-            result = {"status": "FAILED", "error": str(exc)}
-        finally:
-            if accepted is not None and not accepted.done():
-                accepted.set_result(self.redactor.text(result["error"] or "任务未能保存。"))
-            self._record("web.send_finished", session_id, self.run["turn_id"], result)
-            self.upload = None
-            self.prompt_run = None
-            self.run = None
-            self.live.clear()
-            self._notify(state=True)
+            return {"status": "FAILED", "error": str(exc)}
 
-    def start_compaction(self):
-        session_id = self.session_id
-        self.run = {"id": uuid4().hex, "session_id": session_id, "turn_id": "", "kind": "compaction"}
-        self.task = asyncio.create_task(self._compact(session_id))
-        self._notify(state=True)
+    def start_compaction(self, session_id):
+        run = WebRun({"id": uuid4().hex, "session_id": session_id, "turn_id": "", "kind": "compaction"})
+        self._start_run(session_id, run, self._compact(session_id))
 
     async def _compact(self, session_id):
         try:
             checkpoint = await self.ops.compact(session_id)
-            result = {"status": "skipped"} if checkpoint is None else {"status": "committed", "through": checkpoint.through}
-        except asyncio.CancelledError:
-            result = {"status": "cancelled"}
+            return {"status": "skipped"} if checkpoint is None else {"status": "committed", "through": checkpoint.through}
         except Exception as exc:  # noqa: BLE001 - Report failures across the detached operation boundary.
-            result = {"status": "failed", "error": type(exc).__name__}
-        finally:
-            # Once Operations has started, its terminal event reflects the persisted state,
-            # including a checkpoint committed while a late cancellation was waiting.
-            if not self.run["turn_id"]:
-                self._record("compaction.finished", session_id, self.run["id"], {"trigger": "manual", **result})
-            self.run = None
-            self._notify(state=True)
+            return {"status": "failed", "error": type(exc).__name__}
 
-    async def cancel(self):
-        # A send can still be entering Operations (e.g. applying pending MCP updates).
-        task = self.task
-        while not task.done() and not self.ops.running(self.session_id):
-            await asyncio.wait((task,), timeout=0.02)
-        if not task.done():
-            await self.ops.cancel(self.session_id)
-        await task
+    def _finished(self, session_id, run, task):
+        turn_id = run.data["turn_id"]
+        if run.data.get("kind") == "compaction":
+            # A started compaction already emits the outcome of its transaction.
+            if not turn_id:
+                result = {"status": "cancelled"} if task.cancelled() else task.result()
+                self._record("compaction.finished", session_id, run.data["id"], {"trigger": "manual", **result})
+        else:
+            result = (
+                {"status": "CANCELLED", "error": "本轮已停止。已执行的工具操作不会自动撤销。"}
+                if task.cancelled() else task.result()
+            )
+            if run.accepted is not None and not run.accepted.done():
+                run.accepted.set_result(self.redactor.text(result["error"] or "任务未能保存。"))
+            self._record("web.send_finished", session_id, turn_id, result)
+        del self.runs[session_id]
+        self.notify(session_id, state=True, shared=True)
+
+    async def cancel(self, session_id, run_id):
+        run = self.runs.get(session_id)
+        if run is None or run.data["id"] != run_id:
+            return False
+        if not run.task.done() and not run.task.cancelling():
+            run.task.cancel()
+        await asyncio.wait((run.task,))
+        return True
 
     async def close(self):
         for unsubscribe in self._subscriptions:
@@ -387,5 +422,4 @@ class Bridge:
         try:
             await self.ops.close()
         finally:
-            if self.task is not None:
-                await self.task
+            await asyncio.gather(*(run.task for run in self.runs.values()), return_exceptions=True)

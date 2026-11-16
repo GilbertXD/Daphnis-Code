@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+
+const selectionKey = 'daphnis.selectedSession'
 
 export type Model = {
   id: string
@@ -239,12 +241,19 @@ type State = {
   approval_mode: ApprovalMode
 }
 
+type SharedState = Pick<State,
+  'session' | 'sessions' | 'projects' | 'projects_error' | 'mcp_servers' | 'mcp_error' | 'mcp_prompt_servers'
+  | 'mcp_resource_servers' | 'history_issues' | 'history_error' | 'all_tools' | 'effective_tools'
+>
+
 type Frame = {
   session_id: string
+  selected_for?: string
   revision: number
   cursor: number
   reset: boolean
   state?: State
+  shared?: SharedState
   status: Status
   run: ({ id: string; turn_id: string; session_id: string } & (
     { kind: 'compaction' } | { kind?: 'turn'; prompt: string | null; base_count: number; attachments?: string[] }
@@ -253,12 +262,12 @@ type Frame = {
   events: AgentEvent[]
 }
 
-export type View = Omit<Frame, 'state'> & { state: State }
+export type View = Omit<Frame, 'state' | 'shared' | 'selected_for'> & { state: State }
 export type Command = (
   action: string,
   fields?: Record<string, unknown> | FormData,
 ) => Promise<{
-  notice: string | null; revision: number; registry_page?: RegistryPage; registry_server?: RegistryServer
+  notice: string | null; revision: number; session_id?: string; registry_page?: RegistryPage; registry_server?: RegistryServer
   mcp_prompts?: MCPPrompt[]; mcp_prompt_result?: MCPPromptResult
   mcp_resource_catalog?: ResourceCatalog; mcp_resource_preview?: ResourceDraft[]
 }>
@@ -267,9 +276,16 @@ export function useConnection(token: string) {
   const [view, setView] = useState<View | null>(null)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState('')
+  const selected = useRef(sessionStorage.getItem(selectionKey) ?? '')
+  const socket = useRef<WebSocket | null>(null)
+
+  function rememberSelection(sessionId: string) {
+    selected.current = sessionId
+    sessionStorage.setItem(selectionKey, sessionId)
+  }
+
   useEffect(() => {
     let disposed = false
-    let socket: WebSocket | undefined
     let retry: number | undefined
     let delay = 300
     setView(null)
@@ -279,9 +295,14 @@ export function useConnection(token: string) {
     function connect() {
       const url = new URL('/api/events', location.href)
       url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const initialSelection = selected.current
+      if (initialSelection) url.searchParams.set('session_id', initialSelection)
       const ws = new WebSocket(url)
-      socket = ws
-      ws.onopen = () => ws.send(token)
+      socket.current = ws
+      ws.onopen = () => {
+        ws.send(token)
+        if (selected.current !== initialSelection) ws.send(JSON.stringify({ session_id: selected.current }))
+      }
       ws.onmessage = ({ data }) => {
         if (disposed) return
         const frame = JSON.parse(data) as Frame & { error?: string }
@@ -289,11 +310,14 @@ export function useConnection(token: string) {
           setError(frame.error)
           return
         }
+        if (frame.session_id !== selected.current && frame.selected_for !== selected.current) return
+        if (frame.session_id !== selected.current) rememberSelection(frame.session_id)
         delay = 300
         setError('')
         setConnected(true)
         setView((previous) => {
-          const state = frame.state ?? previous?.state
+          const previousState = previous?.session_id === frame.session_id ? previous.state : undefined
+          const state = frame.state ?? (previousState && { ...previousState, ...frame.shared })
           if (!state) return null
           const reset = frame.reset || previous?.session_id !== frame.session_id
           const events = reset
@@ -320,12 +344,13 @@ export function useConnection(token: string) {
     return () => {
       disposed = true
       window.clearTimeout(retry)
-      socket?.close()
+      socket.current?.close()
+      socket.current = null
     }
   }, [token])
 
   const command: Command = async (action, fields = {}) => {
-    if (!connected || !view) throw new Error('连接中断，请等待重新连接。')
+    if (!connected || !view || view.session_id !== selected.current) throw new Error('连接中断，请等待重新连接。')
     const multipart = fields instanceof FormData
     if (multipart) fields.set('session_id', view.session_id)
     let response: Response
@@ -344,6 +369,13 @@ export function useConnection(token: string) {
     const result = await response.json()
     if (!response.ok) throw new Error(result.error || '操作失败。')
     if (action === 'send_attachments' && response.status !== 202) throw new Error('附件提交结果未知。请重试。')
+    if (result.session_id && result.session_id !== selected.current) {
+      rememberSelection(result.session_id)
+      setConnected(false)
+      if (socket.current?.readyState === WebSocket.OPEN) {
+        socket.current.send(JSON.stringify({ session_id: result.session_id }))
+      }
+    }
     return result
   }
   const loadAttachment = useCallback(async (

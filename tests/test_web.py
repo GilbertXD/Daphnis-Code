@@ -11,6 +11,7 @@ from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import httpx
 from PIL import Image
@@ -71,6 +72,8 @@ class WebTests(unittest.TestCase):
         self.requests = []
         self.title_requests = []
         self.titles_at_reply = []
+        self.selected_session = ""
+        self.parallel_gates = {}
         self.overflowed = False
         self.resource_failed = False
         self.summary_mode = ""
@@ -95,7 +98,8 @@ class WebTests(unittest.TestCase):
                     })
                 return httpx.Response(503, json={"error": {"message": "Title unavailable"}})
             self.requests.append(body)
-            self.titles_at_reply.append(self.history.load(self.bridge.session_id).title)
+            if len(self.bridge.runs) == 1:
+                self.titles_at_reply.append(self.history.load(next(iter(self.bridge.runs))).title)
             last = body["messages"][-1]
             if "Summarize the conversation" in body["messages"][0]["content"]:
                 if self.summary_mode == "hold":
@@ -117,6 +121,25 @@ class WebTests(unittest.TestCase):
                 self.overflowed = True
                 return httpx.Response(400, json={"error": {"code": "context_window_exceeded"}})
             content = last.get("content")
+            if content in ("parallel A", "parallel B"):
+                side = content[-1]
+                gate = self.parallel_gates[side] = asyncio.Event()
+                call = chunk({"tool_calls": [{
+                    "index": 0, "id": "parallel-call", "type": "function", "function": {
+                        "name": "apply_patch", "arguments": json.dumps({
+                            "patch": f"--- /dev/null\n+++ b/{side}.txt\n@@ -0,0 +1 @@\n+{side}\n",
+                        }),
+                    },
+                }]}, "tool_calls")
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedReply(
+                    chunk({"role": "assistant", "content": f"{side} streaming"}), gate, call + b"data: [DONE]\n\n",
+                ))
+            if last["role"] == "tool" and body["messages"][1]["content"] in ("parallel A", "parallel B"):
+                side = body["messages"][1]["content"][-1]
+                data = chunk({"role": "assistant", "content": f"{side} complete"}, "stop", {
+                    "prompt_tokens": 6 if side == "A" else 16, "completion_tokens": 1,
+                })
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data + b"data: [DONE]\n\n")
             if content == "pause" or (isinstance(content, list) and content[0]["text"].startswith("pause-images")):
                 self.resume = asyncio.Event()
                 return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedReply(
@@ -188,17 +211,26 @@ class WebTests(unittest.TestCase):
             "action": action, "session_id": session_id, **args,
         })
         self.assertEqual(response.status_code, expected, response.text)
-        return response.json()
+        data = response.json()
+        if "session_id" in data:
+            self.selected_session = data["session_id"]
+        return data
 
-    def snapshot(self):
-        with self.client.websocket_connect(ORIGIN.replace("http:", "ws:") + "/api/events", headers={"Origin": ORIGIN}) as socket:
+    def socket(self, session_id=""):
+        url = ORIGIN.replace("http:", "ws:") + "/api/events"
+        if session_id:
+            url += "?" + urlencode({"session_id": session_id})
+        return self.client.websocket_connect(url, headers={"Origin": ORIGIN})
+
+    def snapshot(self, session_id=None):
+        with self.socket(self.selected_session if session_id is None else session_id) as socket:
             socket.send_text(ACCESS)
             return socket.receive_json()
 
-    def wait_for(self, condition):
+    def wait_for(self, condition, session_id=None):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            frame = self.snapshot()
+            frame = self.snapshot(session_id)
             if condition(frame):
                 return frame
             time.sleep(0.01)
@@ -326,7 +358,7 @@ class WebTests(unittest.TestCase):
         self.assertTrue(self.summary_stopped.is_set())
 
         frame, _ = self.manual_compaction_outcome("cancelled")
-        self.assertFalse(self.bridge.ops.running(self.bridge.session_id))
+        self.assertFalse(self.bridge.ops.running(sid))
         self.assertEqual(frame["state"]["messages"], before)
         self.assertIsNone(self.history.load(sid).compaction)
         self.command("send", sid, 202, prompt="Continue without a checkpoint")
@@ -351,7 +383,7 @@ class WebTests(unittest.TestCase):
 
         async def cancel():
             cancelling.set()
-            await self.bridge.cancel()
+            await self.bridge.cancel(sid, self.bridge.runs[sid].data["id"])
 
         with patch.object(self.history, "save_async", side_effect=hold_save):
             self.command("compact", sid, 202)
@@ -443,7 +475,6 @@ class WebTests(unittest.TestCase):
         self.assertEqual(frame["state"]["approval_mode"], "auto")
         self.assertEqual({row["id"] for row in frame["state"]["sessions"]}, {first})
         self.assertEqual(frame["state"]["history_issues"], [])
-        self.command("send", first, 409, prompt="stale")
         self.command("rename", second, id=first, title="Inactive")
         self.command("restore", second, id=first)
         self.assertEqual(self.snapshot()["state"]["session"]["title"], "Inactive")
@@ -718,7 +749,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(next_frame["events"], [])
         self.command("restore", next_frame["session_id"], id=session_id)
         self.assertEqual(self.snapshot()["events"], events)
-        self.command("confirm_full", next_frame["session_id"], 409)
+        self.command("confirm_full", next_frame["session_id"])
+        self.assertEqual(self.snapshot()["state"]["approval_mode"], "auto")
         self.command("confirm_full", session_id)
         (self.workspace / "new.txt").unlink()
         self.command("send", session_id, 202, prompt="test patch")
@@ -726,6 +758,68 @@ class WebTests(unittest.TestCase):
         self.assertEqual((self.workspace / "new.txt").read_text(), "approved\n")
         self.assertIsNone(done["status"]["approval"])
         self.assertEqual(sum(e["name"] == "tool.approval_requested" for e in done["events"]), 1)
+
+    def test_parallel_sessions_keep_streams_and_approvals_in_the_selected_tab(self):
+        a = self.snapshot()["session_id"]
+        self.command("model", a, provider="mimo", model_id="mimo-v2.6-flash")
+        self.command("send", a, 202, prompt="parallel A")
+        active_a = self.wait_for(lambda frame: bool(frame["live"]), a)
+        run_a = active_a["run"]["id"]
+        self.assertEqual(active_a["live"]["1"]["content"], "A streaming")
+
+        with self.socket(a) as tab_a, self.socket(a) as tab_b:
+            for tab in (tab_a, tab_b):
+                tab.send_text(ACCESS)
+                self.assertEqual(tab.receive_json()["session_id"], a)
+            b = self.command("new", a)["session_id"]
+            tab_b.send_json({"session_id": b})
+            second = tab_b.receive_json()
+            self.assertEqual(second["session_id"], b)
+            self.assertEqual(second["state"]["messages"], [])
+            self.command("model", b, provider="deepseek", model_id="deepseek-flash")
+            self.command("send", b, 202, prompt="parallel B")
+            background = tab_a.receive_json()
+            self.assertEqual(background["session_id"], a)
+            self.assertEqual(background["run"]["id"], run_a)
+            self.assertNotIn("state", background)
+            self.assertFalse(background["events"])
+
+            active_b = self.wait_for(lambda frame: bool(frame["live"]), b)
+            self.assertEqual(active_b["live"]["1"]["content"], "B streaming")
+            self.assertEqual(active_b["state"]["model"]["provider"], "deepseek")
+            self.assertEqual(self.snapshot(a)["live"]["1"]["content"], "A streaming")
+            self.command("cancel", b, 409, run_id=run_a)
+            for gate in self.parallel_gates.values():
+                self.client.portal.call(gate.set)
+
+            approvals = {
+                sid: self.wait_for(lambda frame: frame["status"]["approval"], sid)["status"]["approval"]
+                for sid in (a, b)
+            }
+            self.assertEqual(approvals[a]["tool_call_id"], approvals[b]["tool_call_id"])
+            self.command("approve", b, 409, request_id=approvals[a]["request_id"], decision="allow_once")
+            self.command("approve", b, request_id=approvals[b]["request_id"], decision="allow_once")
+            done_b = self.wait_for(lambda frame: not frame["status"]["running"], b)
+            self.assertEqual(done_b["state"]["messages"][-1]["content"], "B complete")
+            self.assertEqual(done_b["status"]["session_usage"]["total_tokens"], 17)
+            self.assertEqual(self.snapshot(a)["status"]["approval"], approvals[a])
+
+            self.command("restore", b, id=a)
+            tab_b.send_json({"session_id": a})
+            while (restored := tab_b.receive_json()).get("selected_for") != a:
+                self.assertEqual(restored["session_id"], b)
+            self.assertEqual(restored["run"]["id"], run_a)
+            self.assertEqual(restored["status"]["approval"], approvals[a])
+            self.command("approve", a, request_id=approvals[a]["request_id"], decision="allow_once")
+
+        done_a = self.wait_for(lambda frame: not frame["status"]["running"], a)
+        self.assertEqual(done_a["state"]["messages"][-1]["content"], "A complete")
+        self.assertEqual(done_a["status"]["session_usage"]["total_tokens"], 7)
+        for sid, side in ((a, "A"), (b, "B")):
+            saved = self.history.load(sid)
+            self.assertEqual(saved.messages.get(0)["content"], f"parallel {side}")
+            self.assertEqual(saved.messages.get(-1)["content"], f"{side} complete")
+            self.assertEqual((self.workspace / f"{side}.txt").read_text(), f"{side}\n")
 
     def test_mcp_management_updates_tools_and_preserves_approval(self):
         sid = self.snapshot()["session_id"]
@@ -821,7 +915,7 @@ class WebTests(unittest.TestCase):
         old_preview = self.command("mcp_get_prompt", sid, server="demo", name="dialogue",
                                     arguments={})["mcp_prompt_result"]["preview_id"]
         self.command("new", sid)
-        self.command("mcp_list_prompts", sid, 409, server="demo")
+        self.assertTrue(self.command("mcp_list_prompts", sid, server="demo")["mcp_prompts"])
         self.command("mcp_run_prompt", self.snapshot()["session_id"], 409, preview_id=old_preview, texts=texts)
 
     def test_embedded_text_resource_keeps_role_and_uses_snapshot_on_retry(self):
@@ -1056,7 +1150,8 @@ class WebTests(unittest.TestCase):
 
         self.command("new", session)
         other = self.snapshot()["session_id"]
-        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 404)
+        self.assertEqual(self.client.get(path, params={**query, "session_id": other}, headers=same_origin).status_code, 404)
+        self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 200)
         self.command("restore", other, id=session)
         self.assertEqual(self.client.get(path, params=query, headers=same_origin).status_code, 200)
         snapshot = self.history.attachments.directory / session / (items[0].id + ".png")
@@ -1186,8 +1281,9 @@ class WebTests(unittest.TestCase):
         for entry in (text, image):
             self.assertEqual(self.client.get(endpoint, params={**query, "attachment_id": entry["id"]},
                                              headers=self.headers).status_code, 404)
-        self.command("new", session)
-        self.assertEqual(self.client.get(endpoint, params=query, headers=self.headers).status_code, 404)
+        other = self.command("new", session)["session_id"]
+        self.assertEqual(self.client.get(endpoint, params={**query, "session_id": other}, headers=self.headers).status_code, 404)
+        self.assertEqual(self.client.get(endpoint, params=query, headers=self.headers).status_code, 200)
 
     def test_budget_pause_and_continue_use_saved_history(self):
         self.bridge.ops._app._request_limits.update(max_primary_requests=5, max_total_requests=1)

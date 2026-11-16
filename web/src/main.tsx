@@ -415,11 +415,15 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
   const [dragging, setDragging] = useState(false)
   const dragDepth = useRef(0)
   const fileInput = useRef<HTMLInputElement>(null)
-  const [busy, setBusy] = useState(false)
-  const [acknowledgedRevision, setAcknowledgedRevision] = useState(0)
-  const inFlight = useRef(false)
-  const [notice, setNotice] = useState('')
+  const [pendingCommands, setPendingCommands] = useState<Set<string>>(() => new Set())
+  const [acknowledged, setAcknowledged] = useState<Record<string, number>>({})
+  const inFlight = useRef(new Set<string>())
+  const [notices, setNotices] = useState<Record<string, string>>({})
   const { state, status, session_id: id } = view
+  const busy = pendingCommands.has(id)
+  const navigationDisabled = !connected || pendingCommands.has('')
+  const notice = notices[id] ?? ''
+  const setNotice = (text: string) => setNotices((current) => ({ ...current, [id]: text }))
   useEffect(() => {
     setModal((current) => current && 'sessionId' in current && current.sessionId !== id ? null : current)
     dragDepth.current = 0
@@ -443,7 +447,7 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       previewUrls.current.delete(url)
     }
   }, [draftFiles])
-  const disabled = busy || !connected || status.running || view.revision < acknowledgedRevision
+  const disabled = busy || navigationDisabled || status.running || view.revision < (acknowledged[id] ?? 0)
   const recovery = state.recovery
   const interrupted = recovery?.kind === 'INTERRUPTED_TURN'
   const compacting = view.run?.kind === 'compaction'
@@ -475,21 +479,26 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
   )
 
   async function perform(action: string, fields?: Record<string, unknown> | FormData) {
-    if (inFlight.current) return false
-    inFlight.current = true
-    setBusy(true)
+    const navigation = ['restore', 'project_open', 'new'].includes(action)
+      || (action === 'delete' && fields && !(fields instanceof FormData) && fields.id === id)
+    const scope = navigation ? '' : id
+    if (inFlight.current.has(scope)) return false
+    inFlight.current.add(scope)
+    setPendingCommands(new Set(inFlight.current))
     setNotice('')
     try {
       const response = await command(action, fields)
-      setAcknowledgedRevision(response.revision)
+      if (!response.session_id) {
+        setAcknowledged((current) => ({ ...current, [id]: response.revision }))
+      }
       setNotice(response.notice ?? '')
       return true
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '操作失败。')
       return false
     } finally {
-      inFlight.current = false
-      setBusy(false)
+      inFlight.current.delete(scope)
+      setPendingCommands(new Set(inFlight.current))
     }
   }
 
@@ -597,7 +606,7 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
         <span aria-hidden="true" />{connected ? status.compacting ? '压缩上下文' : status.running ? '运行中' : '已连接' : '重新连接中'}
       </span>
     </header>
-    <Sidebar projects={state.projects} sessions={sessions} selected={id} disabled={disabled} visible={sidebar}
+    <Sidebar projects={state.projects} sessions={sessions} selected={id} disabled={navigationDisabled} visible={sidebar}
       projectsError={state.projects_error} historyError={state.history_error}
       historyIssueCount={state.history_issues.length}
       onCreateProject={() => {
@@ -809,7 +818,7 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       </form>
     </Dialog>}
     {sessionToMove && <MoveSessionDialog session={sessionToMove} projects={state.projects}
-      close={() => setModal(null)} disabled={disabled} notice={notice}
+      close={() => setModal(null)} disabled={busy || navigationDisabled || (sessionToMove.id === id && status.running)} notice={notice}
       move={(projectId, workspace) => perform('move', { id: sessionToMove.id, project_id: projectId, workspace })} />}
     {(modal?.action === 'rename' || modal?.action === 'delete') && <Dialog title={modal.action === 'rename' ? '重命名会话' : '删除会话'}
       close={() => setModal(null)}>
@@ -835,7 +844,8 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
           : <p>永久删除「{sessionTitle(modal.session)}」及其已保存的消息？</p>}
         {notice && <p role="status">{notice}</p>}
         <div className="actions"><button type="button" onClick={() => setModal(null)}>取消</button>
-          <button className="primary" disabled={disabled} type="submit">{modal.action === 'rename' ? '保存' : '删除'}</button></div>
+          <button className="primary" disabled={busy || navigationDisabled || (modal.session.id === id && status.running)}
+            type="submit">{modal.action === 'rename' ? '保存' : '删除'}</button></div>
       </form>
     </Dialog>}
   </div>

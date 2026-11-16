@@ -103,6 +103,10 @@ class Operations:
     def running(self, session_id: str) -> bool:
         return self._runtime(session_id).running
 
+    def busy(self, session_id: str) -> bool:
+        runtime = self._runtime(session_id)
+        return runtime.running or runtime.state_lock.locked()
+
     def approval_mode(self, session_id: str) -> ApprovalMode:
         return self._runtime(session_id).approval_mode
 
