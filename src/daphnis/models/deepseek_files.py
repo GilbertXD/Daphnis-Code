@@ -13,6 +13,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 import httpx
 
@@ -59,6 +60,7 @@ class DeepSeekFiles:
             headers["Authorization"] = f"Bearer {key}"
         self._scope = _digest([str(self._endpoint), sorted((key.lower(), value) for key, value in headers.items())])
         self._cache_path = cache_directory / "deepseek-files.sqlite3"
+        self._upload_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._http = httpx.AsyncClient(
             headers=headers, transport=connection.get("transport"),
             timeout=httpx.Timeout(150.0, connect=15.0, write=125.0),
@@ -165,6 +167,17 @@ class DeepSeekFiles:
         else:
             purpose = "rich_layout_recognition" if item.reading_mode == "visual" else "text_recognition"
         key = _digest([self._scope, item.sha256, item.mime_type, purpose])
+        # A second Session can reuse the first upload once the provider has replied.
+        lock = self._upload_locks.get(key)
+        if lock is None:
+            lock = self._upload_locks[key] = asyncio.Lock()
+        async with lock:
+            return await self._lookup_or_upload(key, item, read, purpose, extension)
+
+    async def _lookup_or_upload(
+        self, key: str, item: DocumentAttachment, read: Callable[[DocumentAttachment], bytes],
+        purpose: str, extension: str,
+    ) -> str:
         entry = self._lookup(key)
         if self._ready(entry):
             return entry["file_id"]

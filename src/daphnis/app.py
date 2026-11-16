@@ -128,7 +128,7 @@ class Application:
         self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
         self._mcp_update: asyncio.Future[None] | None = None
-        self._mcp_pending: set[MCPConnection] = set()
+        self._mcp_unverified: set[MCPConnection] = set()
         self._tools = self._mcp_catalog()
         model = self._model_for(provider, model_id)
         session = Session(
@@ -145,12 +145,14 @@ class Application:
         self.initial_session_id = session.id
         for name in ("context.budget", "compaction.started", "compaction.finished"):
             self.events.on(name, self._observe_context)
+        for name in ("turn.started", "model.started", "model.usage"):
+            self.events.on(name, self._observe_usage)
         self._client(provider)
 
     def _add_runtime(self, session: Session) -> SessionRuntime:
         if session.id in self._runtimes:
             raise ValueError("会话已加载。")
-        runtime = SessionRuntime(session, self.events)
+        runtime = SessionRuntime(session)
         self._runtimes[session.id] = runtime
         return runtime
 
@@ -178,8 +180,7 @@ class Application:
         )
 
     def _drop_runtime(self, session_id: str) -> None:
-        if runtime := self._runtimes.pop(session_id, None):
-            runtime.usage.close()
+        self._runtimes.pop(session_id, None)
         self._revoke_session_trust(session_id)
 
     def _revoke_session_trust(self, session_id: str) -> None:
@@ -197,6 +198,10 @@ class Application:
             )
         else:
             runtime.compacting = event.name == "compaction.started"
+
+    def _observe_usage(self, event: Event) -> None:
+        if runtime := self._runtimes.get(event.session_id):
+            runtime.usage.observe(event)
 
     def _connection(self, provider: str) -> dict[str, Any]:
         if provider not in self._connections:
@@ -303,6 +308,8 @@ class Application:
 
     async def _mcp_error(self, name: str, error: str) -> None:
         self._revoke_mcp_trust(name)
+        if (connection := self._mcp.get(name)) and not connection.available:
+            self._mcp_unverified.discard(connection)
         await self.events.emit(
             "mcp.error", session_id="", turn_id="", server=name, error=error
         )
@@ -359,6 +366,7 @@ class Application:
             raise ValueError(f"MCP Server {connection.name!r} 已连接。")
         self._revoke_mcp_trust(connection.name)
         if previous:
+            self._mcp_unverified.discard(previous)
             await previous.aclose()
         self._mcp[connection.name] = connection
         discovered = await connection.start(self._mcp_error, self._mcp_tools_changed)
@@ -386,6 +394,7 @@ class Application:
         with self._changing_mcp():
             connection = self._mcp[name]
             self._revoke_mcp_trust(name)
+            self._mcp_unverified.discard(connection)
             await connection.aclose()
             self._tools = self._mcp_catalog()
 
@@ -407,14 +416,17 @@ class Application:
             self._tools = self._mcp_catalog()
         except (Exception, asyncio.CancelledError) as exc:
             connection.tools = previous
+            self._revoke_mcp_trust(connection.name)
+            if connection.available:
+                self._mcp_unverified.add(connection)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            self._revoke_mcp_trust(connection.name)
             raise RuntimeError("MCP 工具刷新失败，已保留上次目录。") from None
         self._revoke_mcp_trust(
             connection.name,
             {name for name in previous if previous[name] != discovered.get(name)},
         )
+        self._mcp_unverified.discard(connection)
         await self.events.emit(
             "mcp.tools_changed", session_id="", turn_id="", server=connection.name
         )
@@ -422,24 +434,21 @@ class Application:
     async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
         # Active Turns keep their definitions; revoke automatic trust immediately.
         self._revoke_mcp_trust(connection.name)
-        self._mcp_pending.add(connection)
-        try:
-            while not self._closed and self._mcp.get(connection.name) is connection and connection.available:
-                if self._mcp_update is not None:
-                    await asyncio.wait((self._mcp_update,))
-                    continue
-                if active := self._active_tasks():
-                    await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-                    continue
-                with self._changing_mcp():
-                    try:
-                        await self._refresh_mcp_catalog(connection)
-                    except RuntimeError as exc:
-                        if not self._closed:
-                            await self._mcp_error(connection.name, str(exc))
-                return
-        finally:
-            self._mcp_pending.discard(connection)
+        self._mcp_unverified.add(connection)
+        while not self._closed and self._mcp.get(connection.name) is connection and connection.available:
+            if self._mcp_update is not None:
+                await asyncio.wait((self._mcp_update,))
+                continue
+            if active := self._active_tasks():
+                await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                continue
+            with self._changing_mcp():
+                try:
+                    await self._refresh_mcp_catalog(connection)
+                except RuntimeError as exc:
+                    if not self._closed:
+                        await self._mcp_error(connection.name, str(exc))
+            return
 
     async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
@@ -462,7 +471,7 @@ class Application:
                 if server is None or (
                     connection is not None
                     and connection.available
-                    and connection not in self._mcp_pending
+                    and connection not in self._mcp_unverified
                 ):
                     self._trusted_tools.add((request.session_id, request.tool_name))
             return decision
@@ -783,9 +792,8 @@ class Application:
                 for connection in self._mcp.values():
                     stack.push_async_callback(connection.aclose)
                 self._mcp.clear()
+                self._mcp_unverified.clear()
                 self._tools = self._mcp_catalog()
-                for runtime in runtimes:
-                    runtime.usage.close()
                 self._runtimes.clear()
                 self._trusted_tools.clear()
                 self.events.clear()

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Any
 
-from .events import Event, EventBus
+from .events import Event
 
 
 @dataclass(frozen=True)
@@ -64,32 +64,16 @@ def _reported_usage(value: Any) -> UsageTotals | None:
 
 
 class UsageTracker:
-    """A synchronous listener: each request replaces its latest usage snapshot."""
+    """Usage for one Session; each request replaces its latest snapshot."""
 
-    def __init__(self, events: EventBus) -> None:
-        self.session_id: str | None = None
+    def __init__(self, session_id: str, totals: UsageTotals) -> None:
+        self.session_id = session_id
         self.turn_id: str | None = None
         self.turn: UsageTotals | None = None
-        self.session = UsageTotals()
-        self._base = UsageTotals()
-        self._requests: dict[tuple[bool, int], UsageTotals | None] = {}
-        self._subscriptions = [
-            events.on(name, self._on_event)
-            for name in (
-                "turn.started",
-                "model.started",
-                "model.usage",
-            )
-        ]
-
-    def select_session(self, session_id: str, totals: UsageTotals) -> None:
-        self.session_id = session_id
         self.session = self._base = totals
-        self.turn_id = None
-        self.turn = None
-        self._requests.clear()
+        self._requests: dict[tuple[bool, int], UsageTotals | None] = {}
 
-    def _on_event(self, event: Event) -> None:
+    def observe(self, event: Event) -> None:
         if event.session_id != self.session_id:
             return
         if event.name == "turn.started":
@@ -121,8 +105,3 @@ class UsageTracker:
         if not maintenance:
             self.turn = totals
         self.session = self._base.plus(totals).plus(title_totals)
-
-    def close(self) -> None:
-        for unsubscribe in self._subscriptions:
-            unsubscribe()
-        self._subscriptions.clear()

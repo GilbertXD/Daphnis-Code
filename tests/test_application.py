@@ -16,6 +16,7 @@ from saturnus import Compatibility, ValidationError
 from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
+from daphnis.attachments import TextAttachmentInput
 from daphnis.compaction_settings import CompactionSettings
 from daphnis.config import environment_connections
 from daphnis.history import SessionBusyError, SessionLease
@@ -23,6 +24,7 @@ from daphnis.models import CapabilityError, ModelInfo
 from daphnis.tool_state import PENDING, RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
 from daphnis.tools.files import prepare_write
+from daphnis.turn_state import TERMINATED, TURN_STATE, RecoveryKind
 
 CATALOG = (
     ModelInfo(
@@ -45,6 +47,98 @@ def response(message, finish="stop"):
 
 
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shutdown_and_restart_keep_each_interrupted_turn_recoverable(self):
+        def handler(request):
+            messages = json.loads(request.content)["messages"]
+            if messages[-1]["role"] == "tool":
+                message, finish, tokens = {"role": "assistant", "content": "Resumed A"}, "stop", 5
+            else:
+                side = messages[-1]["content"].splitlines()[0][-1]
+                message = {"role": "assistant", "tool_calls": [{
+                    "id": "interrupted", "type": "function", "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({"path": f"{side}.txt", "content": f"saved {side}"}),
+                    },
+                }]}
+                finish, tokens = "tool_calls", 10 if side == "A" else 20
+            payload = response(message, finish).json()
+            payload["usage"] = {"prompt_tokens": tokens, "completion_tokens": 1}
+            return httpx.Response(200, json=payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = History(root / "sessions")
+
+            def application():
+                return Application(
+                    workspace=root, provider="deepseek", model_id="a", catalog=CATALOG,
+                    history=history, interactive=True,
+                    connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
+                )
+
+            app = application()
+            ops = Operations(app)
+            a = ops.initial_session_id
+            b = (await ops.new_session(session_id=a)).id
+            runtimes = [app._load_runtime(sid) for sid in (a, b)]
+            approvals = asyncio.Queue()
+            ops.subscribe("tool.approval_requested", approvals.put_nowait)
+            turns = [asyncio.create_task(ops.send(
+                f"recover {side}", stream=False, session_id=sid, submission_id="a" * 32,
+                attachments=[TextAttachmentInput("notes.txt", f"Snapshot {side}")],
+            )) for side, sid in (("A", a), ("B", b))]
+            try:
+                async with asyncio.timeout(3):
+                    requests = {event.session_id: event.data["request_id"] for event in (
+                        await approvals.get(), await approvals.get(),
+                    )}
+                futures = [runtime.approval for runtime in runtimes]
+            finally:
+                await ops.close()
+                cancelled = await asyncio.gather(*turns, return_exceptions=True)
+            self.assertTrue(all(isinstance(result, asyncio.CancelledError) for result in cancelled))
+            self.assertTrue(all(future.cancelled() for future in futures))
+            self.assertTrue(all(runtime.task is None and runtime.pending_approval is None for runtime in runtimes))
+            self.assertFalse(app._runtimes)
+            self.assertFalse(app.events._listeners)
+
+            app = application()
+            ops = Operations(app)
+            approvals = asyncio.Queue()
+            ops.subscribe("tool.approval_requested", approvals.put_nowait)
+            continuation = None
+            try:
+                for side, sid, tokens in (("A", a, 11), ("B", b, 21)):
+                    ops.restore_session(sid)
+                    self.assertEqual(ops.recovery(sid).kind, RecoveryKind.INTERRUPTED_TURN)
+                    self.assertEqual(ops.session_usage(sid).total_tokens, tokens)
+                    self.assertIsNone(ops.pending_approval(sid))
+                    item = history.load(sid).attachment_refs[0].files[0]
+                    self.assertEqual(history.attachments.read(sid, item), f"Snapshot {side}")
+                continuation = asyncio.create_task(ops.continue_interrupted_turn(
+                    ops.recovery(a).key, session_id=a, stream=False,
+                ))
+                async with asyncio.timeout(3):
+                    current = await approvals.get()
+                    self.assertEqual(current.session_id, a)
+                    self.assertFalse(ops.resolve_approval(requests[a], "allow_once", session_id=a))
+                    await ops.terminate_interrupted_turn(ops.recovery(b).key, session_id=b)
+                    self.assertFalse(continuation.done())
+                    self.assertTrue(ops.resolve_approval(current.data["request_id"], "allow_once", session_id=a))
+                    self.assertEqual((await continuation).status, TurnStatus.COMPLETED)
+                self.assertEqual(history.load(a).messages.get(-1)["content"], "Resumed A")
+                self.assertEqual(history.load(a).usage.total_tokens, 17)
+                stopped = history.load(b)
+                self.assertEqual(stopped.messages.get(0)[TURN_STATE], TERMINATED)
+                self.assertEqual(json.loads(stopped.messages.get(-1)["content"])["error"]["code"], "execution_skipped")
+                self.assertEqual(stopped.usage.total_tokens, 21)
+                self.assertEqual((root / "A.txt").read_text(), "saved A")
+                self.assertFalse((root / "B.txt").exists())
+            finally:
+                await ops.close()
+                if continuation is not None:
+                    await asyncio.gather(continuation, return_exceptions=True)
+
     async def test_concurrent_turns_keep_approval_tools_and_usage_in_their_own_session(self):
         tool_started = asyncio.Event()
 

@@ -149,6 +149,37 @@ class DocumentAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.service.uploads), 1)
         self.assertEqual(duplicate, self.service.saved[0]["id"])
 
+    async def test_shared_adapter_reuses_an_upload_still_waiting_for_the_provider(self):
+        received, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def handler(request):
+            if request.method == "POST":
+                received.set()
+                await release.wait()
+            return await self.service(request)
+
+        adapter = self.adapter(transport=httpx.MockTransport(handler))
+        upload = document()
+
+        async def prepare_second():
+            second_started.set()
+            return await self.prepare(adapter, upload)
+
+        first = asyncio.create_task(self.prepare(adapter, upload))
+        second = None
+        try:
+            async with asyncio.timeout(3):
+                await received.wait()
+                second = asyncio.create_task(prepare_second())
+                await second_started.wait()
+                release.set()
+                a, b = await asyncio.gather(first, second)
+            self.assertEqual(a, b)
+            self.assertEqual(len(self.service.uploads), 1)
+        finally:
+            release.set()
+            await asyncio.gather(*(t for t in (first, second) if t is not None), return_exceptions=True)
+
 
 class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

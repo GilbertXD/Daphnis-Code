@@ -32,6 +32,7 @@ from ..attachments import (
     TextResourceInput,
     valid_id,
 )
+from ..history import finish_io
 from ..mcp.resources import resource_template, text_resource
 from ..mcp_registry import RegistryDiscovery, RegistryError
 from ..prompt_groups import MAX_PROMPT_MESSAGES, PROMPT_ROLES, PromptInput
@@ -368,12 +369,16 @@ async def _execute(bridge, action, session, args, discovery):
             await ops.move_session(args["id"], args["project_id"], expected_workspace=args["workspace"])
         case "delete":
             target = args["id"]
-            fresh = await ops.delete_session(target, replacement=target in {session, bridge.default_session_id})
-            bridge.forget(target)
-            if target == bridge.default_session_id and fresh is not None:
-                bridge.default_session_id = fresh.id
-            if target == session and fresh is not None:
-                return None, fresh.id
+
+            async def delete():
+                fresh = await ops.delete_session(target, replacement=target in {session, bridge.default_session_id})
+                bridge.forget(target)
+                if target == bridge.default_session_id and fresh is not None:
+                    bridge.default_session_id = fresh.id
+                bridge.notify(shared=True)
+                return fresh.id if fresh is not None and target == session else None
+
+            return None, await finish_io(delete())
         case "model":
             return await ops.set_model(args["provider"], args["model_id"], session_id=session), None
         case "thinking":
@@ -589,13 +594,11 @@ def create_app(open_bridge, *, token: str, port: int, assets: Path):
                     return JSONResponse({"registry_page": await discovery.search(args["query"], args["cursor"])})
                 return JSONResponse({"registry_server": await discovery.detail(args["registry_name"], args["version"])})
             notice, selected = await _execute(bridge, action, session, args, discovery)
-            if action == "delete":
-                bridge.notify(shared=True)
-            elif action in _SESSION_EDITS:
+            if action in _SESSION_EDITS - {"delete"}:
                 bridge.notify(args["id"], state=True, shared=True)
             elif action in _SHARED_EDITS:
                 bridge.notify(session, state=True, shared=True)
-            elif action not in _SESSION_SWITCHES:
+            elif action not in _SESSION_SWITCHES | {"delete"}:
                 bridge.notify(session, state=action in _SESSION_SETTINGS)
             payload = {"notice": bridge.redactor.json(notice), "revision": bridge.version(session)}
             if selected is not None:

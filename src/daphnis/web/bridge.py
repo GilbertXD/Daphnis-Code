@@ -147,7 +147,7 @@ class Bridge:
         run = self.runs.get(session)
         if event.name in {"attachments.committed", "prompt.committed"}:
             if (
-                run and run.accepted and not run.accepted.done()
+                run and event.turn_id == run.data["turn_id"] and run.accepted and not run.accepted.done()
                 and (
                     run.upload is not None and run.upload[0] == data.get("submission_id")
                     or run.prompt_input is not None and run.prompt_input.id == data.get("group_id")
@@ -357,12 +357,14 @@ class Bridge:
                 self.ops.send, prompt, session_id=session_id, stream=True,
                 attachments=attachments, submission_id=submission_id,
             )
-        self._start_run(session_id, run, self._send(operation))
+        self._start_run(session_id, run, partial(self._send, operation))
         return run.accepted
 
     def _start_run(self, session_id, run, operation):
+        if self.busy(session_id):
+            raise RuntimeError("请先等待或停止目标会话的当前操作。")
         self.runs[session_id] = run
-        run.task = asyncio.create_task(operation)
+        run.task = asyncio.create_task(operation())
         run.task.add_done_callback(partial(self._finished, session_id, run))
         self.notify(session_id, shared=True)
 
@@ -380,7 +382,7 @@ class Bridge:
 
     def start_compaction(self, session_id):
         run = WebRun({"id": uuid4().hex, "session_id": session_id, "turn_id": "", "kind": "compaction"})
-        self._start_run(session_id, run, self._compact(session_id))
+        self._start_run(session_id, run, partial(self._compact, session_id))
 
     async def _compact(self, session_id):
         try:

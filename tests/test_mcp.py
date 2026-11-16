@@ -626,6 +626,15 @@ asyncio.run(main())
                     (await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED
                 )
                 self.assertEqual(outcomes[-1]["structured_content"], {"sum": 5})
+                (root / "invalid").touch()
+                with self.assertRaisesRegex(RuntimeError, "保留上次目录"):
+                    await ops.refresh_mcp("demo")
+                calls[:] = [tool_call(add, "unverified", a=1, b=3)]
+                send = asyncio.create_task(ops.send("unverified", stream=False, session_id=session_id))
+                await approve("unverified", ApprovalDecision.TRUST_SESSION)
+                self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
+                self.assertNotIn((session_id, add), app._trusted_tools)
+                (root / "invalid").unlink()
                 (root / "changed").touch()
                 await ops.refresh_mcp("demo")
                 (root / "changed").unlink()
@@ -896,7 +905,7 @@ asyncio.run(main())
                 send = asyncio.create_task(ops.send("add", stream=False, session_id=ops.initial_session_id))
                 async with asyncio.timeout(5):
                     await changed.wait()
-                    while not app._mcp_pending:
+                    while not app._mcp_unverified:
                         await asyncio.sleep(0.01)
                 self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
                 with self.assertRaisesRegex(RuntimeError, "当前 Turn"):

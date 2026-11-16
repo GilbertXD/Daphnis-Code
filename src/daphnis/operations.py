@@ -348,6 +348,7 @@ class Operations:
         previous = app._mcp.get(name)
         if previous is not None:
             app._revoke_mcp_trust(name)
+            app._mcp_unverified.discard(previous)
             await previous.aclose()
             app._tools = app._mcp_catalog()
         if connection is None:

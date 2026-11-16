@@ -425,6 +425,12 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
   const notice = notices[id] ?? ''
   const setNotice = (text: string) => setNotices((current) => ({ ...current, [id]: text }))
   useEffect(() => {
+    if (view.reset) {
+      // A new connection can come from a restarted server with fresh revisions.
+      setAcknowledged((current) => current[id] > view.revision ? { ...current, [id]: view.revision } : current)
+    }
+  }, [id, view.reset, view.revision])
+  useEffect(() => {
     setModal((current) => current && 'sessionId' in current && current.sessionId !== id ? null : current)
     dragDepth.current = 0
     setDragging(false)

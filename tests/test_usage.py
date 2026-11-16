@@ -55,8 +55,11 @@ def application(root, handler):
 class UsageTests(unittest.IsolatedAsyncioTestCase):
     async def test_snapshots_replace_and_missing_counts_remain_unknown(self):
         events = EventBus()
-        tracker = UsageTracker(events)
-        tracker.select_session("one", UsageTotals())
+        tracker = UsageTracker("one", UsageTotals())
+        independent = UsageTracker("two", UsageTotals(unrecorded=True))
+        for name in ("turn.started", "model.started", "model.usage"):
+            events.on(name, tracker.observe)
+            events.on(name, independent.observe)
         fields = {"session_id": "one", "turn_id": "turn"}
         await events.emit("turn.started", **fields)
         await events.emit("model.started", **fields, request_number=1)
@@ -69,13 +72,8 @@ class UsageTests(unittest.IsolatedAsyncioTestCase):
             "model.usage", **fields, request_number=2, usage=counts(True, 5)
         )
         self.assertEqual(tracker.session, UsageTotals(10, 5, 15, 2, 1))
-        tracker.select_session("two", UsageTotals(unrecorded=True))
-        await events.emit(
-            "model.usage", **fields, request_number=1, usage=counts(999, 999)
-        )
-        self.assertIsNone(tracker.turn)
-        self.assertEqual(tracker.session, UsageTotals(unrecorded=True))
-        tracker.close()
+        self.assertIsNone(independent.turn)
+        self.assertEqual(independent.session, UsageTotals(unrecorded=True))
 
     async def test_tool_loop_stream_and_nonstream_totals_survive_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
