@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import httpx
 from PIL import Image
-from saturnus import APIError
 
 from daphnis import CompactionSettings, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
@@ -22,6 +21,7 @@ from daphnis.attachments import (
     TextAttachmentInput,
     prepare_attachments,
 )
+from daphnis.errors import APIError
 from daphnis.history import History
 from daphnis.models import MODELS
 from daphnis.session import Session

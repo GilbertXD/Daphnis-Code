@@ -1,33 +1,12 @@
-"""Helpers for request compatibility, context overflow, and attachment privacy."""
+"""Helpers for context overflow and attachment privacy."""
 
 import re
 from typing import Any
 
-from saturnus import APIError, ResponseError
-from saturnus import Compatibility as SaturnusCompatibility
-
-from .models.compatibility import Compatibility
+from .errors import APIError, ResponseError
 
 _HIDDEN_CONTENT = "[内容已隐藏]"
 _IMAGE_DATA_URL = re.compile(r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+", re.IGNORECASE)
-
-
-class _ChatClientCompatibility(SaturnusCompatibility):
-    """Satisfy ChatClient's type check and delegate mapping to Daphnis."""
-
-    def __init__(self, rules: Compatibility) -> None:
-        self._rules = rules
-
-    def apply(self, body: dict[str, Any]) -> dict[str, Any]:
-        return self._rules.apply(body)
-
-
-def chat_client_compatibility(
-    compatibility: Compatibility | SaturnusCompatibility,
-) -> SaturnusCompatibility:
-    if isinstance(compatibility, Compatibility):
-        return _ChatClientCompatibility(compatibility)
-    return compatibility
 
 
 def hide_attachment_echo(value: Any, private_values: tuple[str, ...]) -> Any:

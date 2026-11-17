@@ -11,11 +11,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from saturnus import ChatClient
 
 from daphnis import Agent, EventBus, History, Operations, Session, TurnStatus
 from daphnis.app import Application
 from daphnis.errors import ToolCallValidationError
+from daphnis.llm.client import ChatClient
 from daphnis.models import ModelInfo
 from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools, files
 from daphnis.tools.files import MAX_FILE_BYTES

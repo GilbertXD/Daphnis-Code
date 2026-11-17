@@ -11,8 +11,6 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from saturnus import APIError, ChatClient, ResponseError, SaturnusError
-
 from ._json import validate_json
 from .attachments import (
     ATTACHMENT_TOOLS,
@@ -42,13 +40,17 @@ from .context import (
     projected_image_bytes,
 )
 from .errors import (
+    APIError,
+    CommunicationError,
     DaphnisError,
+    ResponseError,
     ToolCallValidationError,
     ToolExecutionError,
     ValidationError,
 )
 from .events import EventBus
 from .history import finish_io
+from .llm.client import ChatClient
 from .messages import Messages, validate_message
 from .model_io import (
     ContextOverflowError,
@@ -722,7 +724,7 @@ class Agent:
                         CompactionError,
                         ContextOverflowError,
                         DaphnisError,
-                        SaturnusError,
+                        CommunicationError,
                         ValueError,
                     ) as exc:
                         error = type(exc).__name__

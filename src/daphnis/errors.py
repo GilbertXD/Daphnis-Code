@@ -1,4 +1,6 @@
-"""Errors for locally managed messages, compatibility rules, and tool calls."""
+"""Errors for local validation, tool execution, and model communication."""
+
+import httpx
 
 
 class DaphnisError(Exception):
@@ -41,3 +43,34 @@ class ToolExecutionError(DaphnisError):
         super().__init__(message)
         self.tool_call_id = tool_call_id
         self.tool_name = tool_name
+
+
+class CommunicationError(Exception):
+    """Base exception for model HTTP and response protocol errors."""
+
+
+class APIError(CommunicationError):
+    """The server returned an unsuccessful HTTP status."""
+
+    def __init__(self, message: str, *, response: httpx.Response) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+class ResponseError(CommunicationError):
+    """The server response does not satisfy the expected protocol."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: httpx.Response,
+        event_data: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.response = response
+        self.event_data = event_data
+
+
+class TransportError(CommunicationError):
+    """The HTTP request or response read could not be completed."""

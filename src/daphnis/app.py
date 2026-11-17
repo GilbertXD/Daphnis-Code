@@ -10,8 +10,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from saturnus import ChatClient
-
 from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
     AttachmentBatch,
@@ -32,9 +30,9 @@ from .history import (
     SessionLease,
     finish_io,
 )
+from .llm.client import ChatClient
 from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError, MCPResourceError
 from .mcp_store import MCPStore
-from .model_io import chat_client_compatibility
 from .models import (
     MODELS,
     CapabilityError,
@@ -213,10 +211,9 @@ class Application:
     def _client(self, provider: str) -> ChatClient:
         if provider not in self._clients:
             options = {"timeout": 60.0, **self._connection(provider)}
-            compatibility = provider_compatibility(
+            options["compatibility"] = provider_compatibility(
                 provider, override=options.get("compatibility")
             )
-            options["compatibility"] = chat_client_compatibility(compatibility)
             self._clients[provider] = ChatClient(**options)
         return self._clients[provider]
 

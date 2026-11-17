@@ -3,11 +3,10 @@ import unittest
 from copy import deepcopy
 
 import httpx
-from saturnus import ChatClient
 
 from daphnis import Agent
 from daphnis.errors import ValidationError
-from daphnis.model_io import chat_client_compatibility
+from daphnis.llm.client import ChatClient
 from daphnis.models import (
     CapabilityError,
     ModelInfo,
@@ -111,9 +110,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                 async with ChatClient(
                     base_url=f"https://{provider}.test/v1",
                     api_key="test-key",
-                    compatibility=chat_client_compatibility(
-                        provider_compatibility(provider)
-                    ),
+                    compatibility=provider_compatibility(provider),
                     transport=httpx.MockTransport(handler),
                 ) as client:
                     response = await client.create(
@@ -241,9 +238,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
         async with ChatClient(
             base_url="https://custom.test/v1",
             transport=httpx.MockTransport(handler),
-            compatibility=chat_client_compatibility(
-                provider_compatibility("compatible", override=override)
-            ),
+            compatibility=provider_compatibility("compatible", override=override),
         ) as client:
             await client.create(
                 model=model.id,
@@ -288,9 +283,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
 
         async with ChatClient(
             base_url="https://model.test",
-            compatibility=chat_client_compatibility(
-                provider_compatibility(model.provider)
-            ),
+            compatibility=provider_compatibility(model.provider),
             transport=httpx.MockTransport(
                 lambda request: self.fail("unexpected request")
             ),
@@ -336,9 +329,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             model = get_model("mimo", "mimo-v2.6-flash")
             async with ChatClient(
                 base_url="https://mimo.test/v1",
-                compatibility=chat_client_compatibility(
-                    provider_compatibility(model.provider)
-                ),
+                compatibility=provider_compatibility(model.provider),
                 transport=httpx.MockTransport(handler),
             ) as client:
                 received = []
