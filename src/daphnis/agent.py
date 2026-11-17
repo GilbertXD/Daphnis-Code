@@ -51,6 +51,7 @@ from .context import (
     materialize_images,
     projected_image_bytes,
 )
+from .errors import DaphnisError
 from .events import EventBus
 from .history import finish_io
 from .messages import Messages
@@ -705,7 +706,13 @@ class Agent:
                             fields, can_retry=can_retry, input_target=input_target, prompt_groups=prompt_groups,
                             image_pressure=image_pressure,
                         )
-                    except (CompactionError, ContextOverflowError, SaturnusError, ValueError) as exc:
+                    except (
+                        CompactionError,
+                        ContextOverflowError,
+                        DaphnisError,
+                        SaturnusError,
+                        ValueError,
+                    ) as exc:
                         error = type(exc).__name__
                         if isinstance(exc, CompactionError):
                             failure_reason = exc.reason

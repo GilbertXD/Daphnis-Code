@@ -20,6 +20,7 @@ from daphnis import (
 )
 from daphnis.compaction import CompactionCheckpoint
 from daphnis.messages import Messages
+from daphnis.model_io import chat_client_compatibility
 from daphnis.models import ModelInfo, provider_compatibility
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.turn_state import (
@@ -43,7 +44,7 @@ CATALOG = tuple(
 def make_client(handler):
     return ChatClient(
         base_url="https://model.test/v1",
-        compatibility=provider_compatibility("compatible"),
+        compatibility=chat_client_compatibility(provider_compatibility("compatible")),
         transport=httpx.MockTransport(handler),
     )
 

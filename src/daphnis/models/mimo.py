@@ -1,6 +1,6 @@
 """MiMo Chat Completions request mappings."""
 
-from saturnus import Compatibility
+from .compatibility import Compatibility
 
 COMPATIBILITY = Compatibility(
     field_mappings={

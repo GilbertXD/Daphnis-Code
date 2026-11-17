@@ -1,10 +1,13 @@
 import json
 import unittest
+from copy import deepcopy
 
 import httpx
-from saturnus import ChatClient, Compatibility, ValidationError
+from saturnus import ChatClient
 
 from daphnis import Agent
+from daphnis.errors import ValidationError
+from daphnis.model_io import chat_client_compatibility
 from daphnis.models import (
     CapabilityError,
     ModelInfo,
@@ -13,9 +16,20 @@ from daphnis.models import (
     provider_compatibility,
     resolve_model,
 )
+from daphnis.models.compatibility import Compatibility
 from daphnis.models.requests import require_image_input
 
 MESSAGES = [{"role": "user", "content": "hello"}]
+IMAGE_URL = "https://images.test/sample.png"
+IMAGE_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": IMAGE_URL, "detail": "auto"}},
+        ],
+    }
+]
 TOOLS = [
     {
         "type": "function",
@@ -85,6 +99,8 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
         for provider, model_id, mode, output_field, thinking_fields in cases:
             with self.subTest(provider=provider, mode=mode):
                 model = resolve_model(provider, model_id)
+                expected_messages = IMAGE_MESSAGES if model.supports_image else MESSAGES
+                messages = deepcopy(expected_messages)
                 extra_body = {"vendor_option": {"keep": True}}
                 options = prepare_request_options(
                     model=model,
@@ -95,16 +111,19 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                 async with ChatClient(
                     base_url=f"https://{provider}.test/v1",
                     api_key="test-key",
-                    compatibility=provider_compatibility(provider),
+                    compatibility=chat_client_compatibility(
+                        provider_compatibility(provider)
+                    ),
                     transport=httpx.MockTransport(handler),
                 ) as client:
                     response = await client.create(
                         model=model.id,
-                        messages=MESSAGES,
+                        messages=messages,
                         extra_body=options,
                         extra_headers={"x-request": "test"},
                     )
                 self.assertEqual(response, RESPONSE)
+                self.assertEqual(messages, expected_messages)
                 self.assertEqual(extra_body, {"vendor_option": {"keep": True}})
                 request = requests.pop()
                 body = json.loads(request.content)
@@ -116,7 +135,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                     body,
                     {
                         "model": model_id,
-                        "messages": MESSAGES,
+                        "messages": expected_messages,
                         output_field: 512,
                         **extra_body,
                         **thinking_fields,
@@ -186,22 +205,49 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["reasoning_effort"], "high")
             self.assertEqual(body["max_completion_tokens"], 128)
             self.assertEqual(body["tools"], TOOLS)
+            self.assertEqual(
+                body["messages"],
+                [
+                    {
+                        "role": "user",
+                        "vendor_name": "viewer",
+                        "content": [
+                            {"type": "text", "text": "hello"},
+                            {
+                                "type": "input_image",
+                                "image": IMAGE_URL,
+                                "image_url": {"detail": "auto"},
+                            },
+                        ],
+                    }
+                ],
+            )
             return httpx.Response(200, json=RESPONSE)
 
         override = Compatibility(
             field_mappings={
                 "thinking_mode": "reasoning_effort",
                 "output_limit": "max_completion_tokens",
-            }
+            },
+            message_field_mappings={"user": {"name": "vendor_name"}},
+            content_part_mappings={
+                "image_url": {
+                    "type": "input_image",
+                    "fields": {"image_url.url": "image"},
+                },
+            },
         )
+        messages = [{**deepcopy(IMAGE_MESSAGES[0]), "name": "viewer"}]
         async with ChatClient(
             base_url="https://custom.test/v1",
             transport=httpx.MockTransport(handler),
-            compatibility=provider_compatibility("compatible", override=override),
+            compatibility=chat_client_compatibility(
+                provider_compatibility("compatible", override=override)
+            ),
         ) as client:
             await client.create(
                 model=model.id,
-                messages=MESSAGES,
+                messages=messages,
                 extra_body=prepare_request_options(
                     model=model,
                     thinking_mode="high",
@@ -210,6 +256,7 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
                     custom_compatibility=True,
                 ),
             )
+        self.assertEqual(messages, [{**IMAGE_MESSAGES[0], "name": "viewer"}])
 
     async def test_managed_fields_and_invalid_output_limits_are_rejected(self):
         model = get_model("deepseek", "deepseek-flash")
@@ -241,7 +288,9 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
 
         async with ChatClient(
             base_url="https://model.test",
-            compatibility=provider_compatibility(model.provider),
+            compatibility=chat_client_compatibility(
+                provider_compatibility(model.provider)
+            ),
             transport=httpx.MockTransport(
                 lambda request: self.fail("unexpected request")
             ),
@@ -287,7 +336,9 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             model = get_model("mimo", "mimo-v2.6-flash")
             async with ChatClient(
                 base_url="https://mimo.test/v1",
-                compatibility=provider_compatibility(model.provider),
+                compatibility=chat_client_compatibility(
+                    provider_compatibility(model.provider)
+                ),
                 transport=httpx.MockTransport(handler),
             ) as client:
                 received = []

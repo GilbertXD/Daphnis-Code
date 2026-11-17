@@ -4,9 +4,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from saturnus import Compatibility
-
 from . import compatible, deepseek, mimo
+from .compatibility import Compatibility
 from .documents import DocumentAdapter
 
 _ADAPTERS = {

@@ -11,7 +11,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from saturnus import Compatibility
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
@@ -22,6 +21,7 @@ from daphnis.config import environment_connections
 from daphnis.errors import ValidationError
 from daphnis.history import SessionBusyError, SessionLease
 from daphnis.models import CapabilityError, ModelInfo
+from daphnis.models.compatibility import Compatibility
 from daphnis.tool_state import PENDING, RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
 from daphnis.tools.files import prepare_write

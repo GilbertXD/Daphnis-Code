@@ -1,7 +1,6 @@
 """DeepSeek Chat Completions request mappings."""
 
-from saturnus import Compatibility
-
+from .compatibility import Compatibility
 from .deepseek_files import DeepSeekFiles
 
 COMPATIBILITY = Compatibility(

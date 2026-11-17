@@ -8,8 +8,10 @@ from contextvars import ContextVar
 from typing import Any
 
 from saturnus import APIError, ChatClient, ResponseError
+from saturnus import Compatibility as SaturnusCompatibility
 
 from .events import Event
+from .models.compatibility import Compatibility
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,24 @@ _PREVIEW_ROLES = ("system", "developer", "user", "assistant", "tool", "function"
 _HIDDEN_CONTENT = "[内容已隐藏]"
 _ATTACHMENT_PREVIEW_NOTICE = "部分内容因附件安全策略而隐藏。"
 _IMAGE_DATA_URL = re.compile(r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+", re.IGNORECASE)
+
+
+class _ChatClientCompatibility(SaturnusCompatibility):
+    """Satisfy ChatClient's type check and delegate mapping to Daphnis."""
+
+    def __init__(self, rules: Compatibility) -> None:
+        self._rules = rules
+
+    def apply(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._rules.apply(body)
+
+
+def chat_client_compatibility(
+    compatibility: Compatibility | SaturnusCompatibility,
+) -> SaturnusCompatibility:
+    if isinstance(compatibility, Compatibility):
+        return _ChatClientCompatibility(compatibility)
+    return compatibility
 
 
 def hide_attachment_echo(value: Any, private_values: tuple[str, ...]) -> Any:

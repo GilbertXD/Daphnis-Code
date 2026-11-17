@@ -34,7 +34,7 @@ from .history import (
 )
 from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError, MCPResourceError
 from .mcp_store import MCPStore
-from .model_io import ObservedChatClient
+from .model_io import ObservedChatClient, chat_client_compatibility
 from .models import (
     MODELS,
     CapabilityError,
@@ -213,9 +213,10 @@ class Application:
     def _client(self, provider: str) -> ChatClient:
         if provider not in self._clients:
             options = {"timeout": 60.0, **self._connection(provider)}
-            options["compatibility"] = provider_compatibility(
+            compatibility = provider_compatibility(
                 provider, override=options.get("compatibility")
             )
+            options["compatibility"] = chat_client_compatibility(compatibility)
             if self._observe_model_io:
                 self._clients[provider] = ObservedChatClient(
                     events=self.events, provider=provider, **options

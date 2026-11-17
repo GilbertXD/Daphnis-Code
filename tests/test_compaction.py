@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from saturnus import ChatClient
 from test_agent_core import (
     CATALOG,
     make_client,
@@ -27,8 +28,11 @@ from daphnis.compaction import (
     safe_boundaries,
 )
 from daphnis.compaction_settings import CompactionSettings
+from daphnis.errors import ValidationError
 from daphnis.messages import Messages
+from daphnis.model_io import chat_client_compatibility
 from daphnis.models import ModelInfo
+from daphnis.models.compatibility import Compatibility
 from daphnis.redaction import Redactor
 from daphnis.token_budget import TokenCounter, request_budget
 from daphnis.tools import create_tools
@@ -636,6 +640,39 @@ class AutomaticCompactionTests(unittest.IsolatedAsyncioTestCase):
             settings.threshold_value,
         )
         self.assertEqual(requests[-1]["max_tokens"], 30)
+
+    async def test_mapping_validation_failure_keeps_primary_request(self):
+        state = session()
+        state.messages.add_user("past data " * 160)
+        state.messages.add_assistant("old answer")
+        finished = []
+
+        def validate(body):
+            if "Summarize" in body["messages"][0]["content"]:
+                raise ValidationError("Summary request rejected.")
+
+        def handler(request):
+            body = json.loads(request.content)
+            self.assertNotIn("Summarize", body["messages"][0]["content"])
+            return httpx.Response(200, json=reply())
+
+        settings = CompactionSettings(threshold_mode="tokens", threshold_value=420)
+        model = ModelInfo("model-a", "compatible", context_window=2000)
+        async with ChatClient(
+            base_url="https://model.test",
+            compatibility=chat_client_compatibility(Compatibility(validator=validate)),
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            agent = Agent(
+                client=client, provider="compatible", catalog=(model,),
+                compaction_settings=settings,
+            )
+            agent.events.on("compaction.finished", finished.append)
+            result = await agent.run(session=state, prompt="continue")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+        self.assertEqual(finished[0].data["error"], "ValidationError")
+        self.assertIsNone(state.compaction)
 
     async def test_disabled_auto_summary_still_trims_for_safety_and_allows_manual_summary(self):
         state = session()
