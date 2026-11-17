@@ -1,4 +1,4 @@
-"""Select and authorize tools before delegating execution to Saturnus."""
+"""Select and authorize tools before execution."""
 
 import asyncio
 import json
@@ -9,8 +9,6 @@ from dataclasses import asdict, dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any
-
-from saturnus import ToolRegistry, ToolResult
 
 from ..attachments import ATTACHMENT_TOOLS, AttachmentStore
 from ..events import EventBus
@@ -42,6 +40,7 @@ from .history import MAX_OPERATION_HITS, prepare_history
 from .retrieval import MAX_RESULTS, RetrievalEngine, prepare_retrieval
 from .search import prepare_search
 from .shell import prepare_command
+from .tool_registry import ToolRegistry, ToolResult
 
 
 @dataclass(frozen=True)

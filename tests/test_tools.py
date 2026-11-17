@@ -11,10 +11,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from saturnus import ChatClient, ToolCallValidationError
+from saturnus import ChatClient
 
 from daphnis import Agent, EventBus, History, Operations, Session, TurnStatus
 from daphnis.app import Application
+from daphnis.errors import ToolCallValidationError
 from daphnis.models import ModelInfo
 from daphnis.tools import ApprovalDecision, ApprovalMode, create_tools, files
 from daphnis.tools.files import MAX_FILE_BYTES
@@ -238,8 +239,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(definition["parameters"]["required"], ["path", "content"])
             for arguments in ({"path": "empty.txt"}, {"path": "empty.txt", "content": 1},
                               {"path": "empty.txt", "content": "", "overwrite": True}):
-                with self.subTest(arguments=arguments), self.assertRaises(ToolCallValidationError):
-                    await tools.execute(call("write_file", **arguments))
+                with self.subTest(arguments=arguments):
+                    with self.assertRaises(ToolCallValidationError) as caught:
+                        await tools.execute(call("write_file", **arguments))
+                    self.assertEqual(caught.exception.code, "arguments_schema_mismatch")
             approval.assert_not_awaited()
 
             request = call("write_file", path="empty.txt", content="")
@@ -434,8 +437,9 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 [item["function"]["name"] for item in selected.definitions()],
                 ["read_file"],
             )
-            with self.assertRaises(ToolCallValidationError):
+            with self.assertRaises(ToolCallValidationError) as caught:
                 await selected.execute(call("apply_patch", patch=add))
+            self.assertEqual(caught.exception.code, "unknown_tool")
             bypass = await allowed._registry.execute(call("apply_patch", patch=add))
             self.assertEqual(bypass.value["error"]["code"], "permission_denied")
             self.assertFalse(target.exists())

@@ -124,7 +124,7 @@ def _json_size(value: Any, limit: int) -> int | None:
 
 
 def _result_fits(value: dict[str, Any]) -> bool:
-    # Match Saturnus ToolResult serialization, including UTF-8 and JSON escaping.
+    # Match ToolResult serialization, including UTF-8 and JSON escaping.
     return _json_size(value, MAX_TOOL_RESULT_BYTES) is not None
 
 

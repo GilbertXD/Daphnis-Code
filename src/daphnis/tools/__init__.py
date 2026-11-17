@@ -8,6 +8,7 @@ from .approval import (
     Decision,
 )
 from .registry import ToolExecutor, create_tools
+from .tool_registry import ToolRegistry, ToolResult
 
 __all__ = [
     "ApprovalCallback",
@@ -16,5 +17,7 @@ __all__ = [
     "ApprovalRequest",
     "Decision",
     "ToolExecutor",
+    "ToolRegistry",
+    "ToolResult",
     "create_tools",
 ]

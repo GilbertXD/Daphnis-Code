@@ -1,9 +1,18 @@
 """Strict JSON helpers for Daphnis data."""
 
 import json
-from typing import Any
+from typing import Any, NoReturn
 
 from .errors import ValidationError
+
+
+def _reject_constant(value: str) -> NoReturn:
+    raise ValueError(f"Non-standard JSON constant: {value}.")
+
+
+def decode_json(data: str | bytes) -> Any:
+    """Decode JSON while rejecting non-standard numeric constants."""
+    return json.loads(data, parse_constant=_reject_constant)
 
 
 def validate_json(value: Any) -> None:
