@@ -35,7 +35,7 @@ def main() -> None:
     async def open_bridge():
         try:
             ops = await open_operations(
-                args.workspace or Path.cwd(), session_id=args.session, observe_model_io=True
+                args.workspace or Path.cwd(), session_id=args.session
             )
         except Exception as exc:  # noqa: BLE001 - Avoid leaking configuration in startup logs.
             raise RuntimeError(f"Daphnis 无法启动（{type(exc).__name__}），请检查服务端配置。") from None

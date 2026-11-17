@@ -1,24 +1,14 @@
-"""Opt-in observation at Saturnus's public response boundary."""
+"""Helpers for request compatibility, context overflow, and attachment privacy."""
 
-import json
-import logging
 import re
-from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from typing import Any
 
-from saturnus import APIError, ChatClient, ResponseError
+from saturnus import APIError, ResponseError
 from saturnus import Compatibility as SaturnusCompatibility
 
-from .events import Event
 from .models.compatibility import Compatibility
 
-logger = logging.getLogger(__name__)
-
-_PREVIEW_MESSAGE_LIMIT = 1024
-_PREVIEW_ROLES = ("system", "developer", "user", "assistant", "tool", "function")
 _HIDDEN_CONTENT = "[内容已隐藏]"
-_ATTACHMENT_PREVIEW_NOTICE = "部分内容因附件安全策略而隐藏。"
 _IMAGE_DATA_URL = re.compile(r"data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]+", re.IGNORECASE)
 
 
@@ -54,26 +44,6 @@ def hide_attachment_echo(value: Any, private_values: tuple[str, ...]) -> Any:
     if isinstance(value, list):
         return [hide_attachment_echo(item, private_values) for item in value]
     return value
-
-
-def preview_request(body: dict, *, attachment_sensitive: bool) -> dict:
-    if not attachment_sensitive:
-        return body
-    preview: dict[str, Any] = {}
-    model = body.get("model")
-    if isinstance(model, str) and len(model) <= 256:
-        preview["model"] = model
-    messages = body.get("messages")
-    if isinstance(messages, list):
-        preview["message_count"] = len(messages)
-        preview["messages"] = []
-        for message in messages[-_PREVIEW_MESSAGE_LIMIT:]:
-            role = message.get("role") if isinstance(message, dict) else None
-            preview["messages"].append({
-                "role": role if role in _PREVIEW_ROLES else "unknown",
-                "content": _HIDDEN_CONTENT,
-            })
-    return preview
 
 
 _CONTEXT_CODES = {
@@ -120,77 +90,3 @@ def is_http_context_overflow(exc: APIError | ResponseError) -> bool:
         return is_context_overflow(exc.response.json())
     except (ValueError, RuntimeError):
         return False
-
-
-class ObservedChatClient(ChatClient):
-    def __init__(self, *, events, provider, **options):
-        super().__init__(**options)
-        self._events = events
-        self._request_event: ContextVar[Event | None] = ContextVar("model_request", default=None)
-
-        def identify(event):
-            if event.data["provider"] == provider:
-                self._request_event.set(event)
-
-        events.on("model.started", identify)
-
-    async def _observe(self, event, response, *, failed=False):
-        if event is None:
-            return
-        fields = {
-            "session_id": event.session_id,
-            "turn_id": event.turn_id,
-            "request_number": event.data["request_number"],
-        }
-        if "purpose" in event.data:
-            fields["purpose"] = event.data["purpose"]
-        sensitive = bool(event.data.get("attachment_sensitive"))
-        try:
-            body = json.loads(response.request.content)
-            if sensitive and not isinstance(body, dict):
-                return
-            if sensitive:
-                fields["omitted"] = _ATTACHMENT_PREVIEW_NOTICE
-            await self._events.emit(
-                "model.request",
-                **fields,
-                http_status=response.status_code,
-                body=preview_request(body, attachment_sensitive=sensitive),
-            )
-            if failed and not sensitive:
-                try:
-                    body = response.json()
-                except (ValueError, RuntimeError):
-                    body = None
-                await self._events.emit(
-                    "model.response_error",
-                    **fields,
-                    http_status=response.status_code,
-                    body=body,
-                )
-        except (ValueError, RuntimeError):
-            logger.debug("Model HTTP body unavailable for observation")
-
-    async def create_with_response(self, **options):
-        event = self._request_event.get()
-        try:
-            result = await super().create_with_response(**options)
-        except (APIError, ResponseError) as exc:
-            await self._observe(event, exc.response, failed=True)
-            raise
-        await self._observe(event, result.response)
-        return result
-
-    @asynccontextmanager
-    async def stream_with_response(self, **options):
-        event = self._request_event.get()
-        observed = False
-        try:
-            async with super().stream_with_response(**options) as result:
-                await self._observe(event, result.response)
-                observed = True
-                yield result
-        except (APIError, ResponseError) as exc:
-            if not observed:
-                await self._observe(event, exc.response, failed=True)
-            raise

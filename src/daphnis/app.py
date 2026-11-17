@@ -34,7 +34,7 @@ from .history import (
 )
 from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError, MCPResourceError
 from .mcp_store import MCPStore
-from .model_io import ObservedChatClient, chat_client_compatibility
+from .model_io import chat_client_compatibility
 from .models import (
     MODELS,
     CapabilityError,
@@ -85,6 +85,7 @@ class Application:
         history: History | None = None,
         catalog: Sequence[ModelInfo] = MODELS,
         interactive: bool = False,
+        # Accepted for compatibility while HTTP observation is disabled.
         observe_model_io: bool = False,
         max_primary_requests: int = 20,
         max_maintenance_requests: int = 12,
@@ -113,7 +114,6 @@ class Application:
         self._history = history if history is not None else History()
         self._mcp_store = MCPStore(self._history.directory.parent / "mcp.json")
         self._interactive = interactive
-        self._observe_model_io = observe_model_io
         self._request_limits = {
             "max_primary_requests": max_primary_requests,
             "max_maintenance_requests": max_maintenance_requests,
@@ -217,12 +217,7 @@ class Application:
                 provider, override=options.get("compatibility")
             )
             options["compatibility"] = chat_client_compatibility(compatibility)
-            if self._observe_model_io:
-                self._clients[provider] = ObservedChatClient(
-                    events=self.events, provider=provider, **options
-                )
-            else:
-                self._clients[provider] = ChatClient(**options)
+            self._clients[provider] = ChatClient(**options)
         return self._clients[provider]
 
     def _model_for(self, provider: str, model_id: str) -> ModelInfo:

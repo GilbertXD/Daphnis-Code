@@ -55,7 +55,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
 
             app = Application(
                 workspace=root, provider="deepseek", model_id="deepseek-flash", interactive=True,
-                history=History(root / "sessions"), observe_model_io=True,
+                history=History(root / "sessions"),
                 connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
             )
             ops = Operations(app)
@@ -67,8 +67,14 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(add, ops.effective_tools(b))
             await ops.set_tools((add,), session_id=a)
             ops.subscribe("tool.approval_requested", lambda event: self._approve_event(ops, event))
-            model_requests = []
-            ops.subscribe("model.request", model_requests.append)
+            started = []
+
+            def record_start(event):
+                if event.data["request_number"] == 1 and event.data.get("purpose") != "title":
+                    content = ops.message_snapshot(event.session_id)[-1]["content"]
+                    started.append((event.session_id, content))
+
+            ops.subscribe("model.started", record_start)
             client = app._clients["deepseek"]
             turn = asyncio.create_task(ops.send("A", stream=False, session_id=a))
             try:
@@ -88,10 +94,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(app._clients["deepseek"], client)
                     self.assertEqual(advertised, {"A": [add], "B": [special]})
                     self.assertEqual(ops.message_snapshot(b)[-1]["content"], "42")
-                    matching = {event.session_id: event.data["body"]["messages"][-1]["content"]
-                                for event in model_requests if event.data["request_number"] == 1
-                                and event.data.get("purpose") != "title"}
-                    self.assertEqual(matching, {a: "A", b: "B"})
+                    self.assertEqual(started, [(a, "A"), (b, "B")])
                     project = await ops.create_project("Other", session_id=b)
                     runtime = app._load_runtime(b)
                     await ops.move_session(b, project.id)

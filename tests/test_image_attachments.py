@@ -151,7 +151,7 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
             workspace=self.root, provider=provider, model_id=model_id, catalog=catalog,
             history=History(self.history.directory),
             connections={provider: {"base_url": "https://model.test", "transport": httpx.MockTransport(handler)}},
-            observe_model_io=True, recent_tokens=0,
+            recent_tokens=0,
             output_limits={(provider, model_id): 128},
             compaction_settings=compaction_settings,
         ))
@@ -162,7 +162,7 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         return (self.history.directory / f"{session_id}.json").read_text(encoding="utf-8")
 
     async def test_projection_restart_mixed_upload_and_manual_compaction(self):
-        primary, summaries, previews = [], [], []
+        primary, summaries, events = [], [], []
         summary_mode = "ok"
         summary_started = asyncio.Event()
 
@@ -184,7 +184,8 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
             return reply("Done")
 
         ops = self.runtime(handler)
-        ops.subscribe("model.request", previews.append)
+        for name in ("model.started", "model.finished"):
+            ops.subscribe(name, events.append)
         system = ops.get_system_prompt(ops.initial_session_id)
         result = await ops.send("Inspect old", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
@@ -203,9 +204,11 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         newest = primary[-1][-1]["content"]
         self.assertIn("inline notes", newest[0]["text"])
         self.assertEqual(image_urls([primary[-1][-1]]), [image_url(blue), image_url(green)])
-        self.assertTrue(previews)
-        self.assertTrue(all(event.data.get("omitted") for event in previews))
-        self.assertNotIn("data:image/", json.dumps([event.data for event in previews]))
+        started = [event for event in events
+                   if event.name == "model.started" and not event.data.get("purpose")]
+        self.assertEqual(len(started), 2)
+        self.assertTrue(all(event.data["attachment_sensitive"] for event in started))
+        self.assertNotIn("data:image/", json.dumps([event.data for event in events]))
         session_id = ops.initial_session_id
         self.assertNotIn("base64", self.saved(session_id))
         await ops.close()

@@ -220,7 +220,7 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
             workspace=self.root, history=History(self.history.directory), provider="deepseek", model_id="deepseek-flash",
             connections={name: {"base_url": f"https://{name}.test", "transport": httpx.MockTransport(handle)}
                          for name in ("deepseek", "mimo")},
-            recent_tokens=0, observe_model_io=True,
+            recent_tokens=0,
         ))
         self.addAsyncCleanup(ops.close)
         return ops
@@ -229,11 +229,12 @@ class DocumentOperationsTests(unittest.IsolatedAsyncioTestCase):
         ops = self.runtime()
         self.fail_next = True
         events = []
-        for name in ("model.request", "model.finished", "context.budget"):
+        for name in ("model.started", "model.finished", "context.budget", "turn.finished"):
             ops.subscribe(name, events.append)
         upload = document()
         failed = await ops.send("Read", attachments=[upload], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(failed.status, TurnStatus.FAILED)
+        self.assertEqual(failed.error, "模型请求失败。")
         session = ops.initial_session_id
         refs = self.history.load(session).attachment_refs
         original = self.service.saved[0]["id"]

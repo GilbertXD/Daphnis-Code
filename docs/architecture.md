@@ -78,7 +78,7 @@ MCP 目录与连接由会话共享。每轮根据已启用且在线的工具选�
 | --- | --- |
 | `turn.started`、`turn.finished` | Agent 开始和结束本轮。结束事件包含状态、暂停提示或错误、请求及工具调用计数和可能的外部副作用。消息提交在结束事件前完成。 |
 | `model.started`、`model.delta`、`model.usage`、`model.finished` | 以从 1 开始的 `request_number` 标识本轮内的请求，分别提供请求身份、流式分片、API 用量及解析后的模型响应。 |
-| `model.request`、`model.response_error` | 启用 `observe_model_io` 时，根据可用的 HTTP 响应观测实际请求 JSON、HTTP 状态及错误响应正文。Web 启动启用此选项。 |
+| `model.request`、`model.response_error` | 保留实际请求 JSON、HTTP 状态及错误响应正文的订阅、传输和展示协议。当前暂不产生这两类事件，`observe_model_io` 参数仅用于调用兼容。 |
 | `context.budget`、`context.overflow` | 主模型请求的输入估算、窗口、输出预留和阈值，以及明确超限后的恢复决定。 |
 | `compaction.started`、`compaction.finished` | 手动、压力或超限触发的压缩尝试及结果。摘要模型请求以 `purpose=compaction` 标识。 |
 | `compaction.committed`、`compaction.discarded` | 自动检查点随下一次消息快照保存，或在尚未提交时随本轮结束丢弃。 |

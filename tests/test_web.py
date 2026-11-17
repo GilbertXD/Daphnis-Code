@@ -25,7 +25,6 @@ from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.attachments import MAX_IMAGE_BYTES, TextResourceInput
 from daphnis.history import SessionLease
-from daphnis.model_io import preview_request
 from daphnis.tool_state import PENDING, TOOL_STATE
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
@@ -74,6 +73,7 @@ class WebTests(unittest.TestCase):
         self.titles_at_reply = []
         self.selected_session = ""
         self.parallel_gates = {}
+        self.resume = None
         self.overflowed = False
         self.resource_failed = False
         self.summary_mode = ""
@@ -195,7 +195,7 @@ class WebTests(unittest.TestCase):
             }
             ops = Operations(Application(
                 workspace=self.workspace, provider="deepseek", model_id="deepseek-flash",
-                history=self.history, connections=connections, interactive=True, observe_model_io=True,
+                history=self.history, connections=connections, interactive=True,
             ))
             self.bridge = Bridge(ops, Redactor((ACCESS, API_KEY)))
             return self.bridge
@@ -236,34 +236,33 @@ class WebTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail("Expected Web state did not appear")
 
-    def test_sensitive_request_preview_has_a_bounded_structural_allowlist(self):
-        private = {"content": "secret", "tool_calls": [{"arguments": "secret"}], "name": "secret"}
-        body = {
-            "model": "example", "tools": [private], "user": "secret",
-            "messages": [{"role": "user", **private}] * 5000 + [{"role": "secret", **private}],
-        }
-        self.assertEqual(preview_request(body, attachment_sensitive=False), body)
-        preview = preview_request(body, attachment_sensitive=True)
-        self.assertEqual(preview["model"], "example")
-        self.assertEqual(preview["message_count"], 5001)
-        self.assertEqual(preview["messages"][-1], {"role": "unknown", "content": "[内容已隐藏]"})
-        self.assertLess(len(preview["messages"]), 5001)
-        self.assertLess(len(json.dumps(preview, ensure_ascii=False).encode()), 128 * 1024)
-        self.assertNotIn("secret", json.dumps(preview))
-        self.assertEqual(body["messages"][-1]["content"], "secret")
+    def assert_no_http_observation(self, frame):
+        names = {event["name"] for event in frame["events"]}
+        self.assertNotIn("model.request", names)
+        self.assertNotIn("model.response_error", names)
 
-    def assert_safe_context(self, frame, real_request):
-        event = next(event for event in reversed(frame["events"])
-                     if event["name"] == "model.request" and not event["data"].get("purpose"))
-        data = event["data"]
-        body = data["body"]
-        self.assertEqual(data["omitted"], "部分内容因附件安全策略而隐藏。")
-        self.assertEqual(body["model"], real_request["model"])
-        self.assertEqual(body["message_count"], len(real_request["messages"]))
-        self.assertEqual(body["messages"], [
-            {"role": message["role"], "content": "[内容已隐藏]"} for message in real_request["messages"]
+    def test_websocket_preserves_http_observation_event_payloads(self):
+        session = self.snapshot()["session_id"]
+        turn = "test-http-events"
+        fields = {"request_number": 1, "http_status": 429}
+        request_body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "hello"}]}
+
+        async def publish():
+            events = self.bridge.ops._app.events
+            await events.emit("model.request", session_id=session, turn_id=turn, **fields, body=request_body)
+            await events.emit(
+                "model.response_error", session_id=session, turn_id=turn, **fields,
+                body={"error": {"api_key": API_KEY, "message": "Rate limit"}},
+            )
+
+        self.client.portal.call(publish)
+        records = self.snapshot(session)["events"]
+        self.assertEqual([(event["name"], event["turn_id"], event["data"]) for event in records], [
+            ("model.request", turn, {**fields, "body": request_body}),
+            ("model.response_error", turn, {**fields, "body": {
+                "error": {"api_key": "[REDACTED]", "message": "Rate limit"},
+            }}),
         ])
-        return data
 
     def manual_compaction_outcome(self, expected, count=1):
         frame = self.wait_for(lambda frame: not frame["status"]["running"])
@@ -301,9 +300,10 @@ class WebTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertEqual(frame["status"]["compacted_through"], first.through)
         self.assertEqual(outcome["data"]["through"], first.through)
-        summary = next(event for event in frame["events"] if event["name"] == "model.request"
+        summary = next(event for event in frame["events"] if event["name"] == "model.started"
                        and event["data"].get("purpose") == "compaction")
         self.assertEqual(summary["turn_id"], outcome["turn_id"])
+        self.assertIn("Summarize the conversation", self.requests[-1]["messages"][0]["content"])
         self.assertEqual(self.history.load(sid).messages.snapshot(), before)
 
         for text in ("additional historical details " * 350, "Continue the saved task"):
@@ -426,9 +426,11 @@ class WebTests(unittest.TestCase):
         self.assertIn("compaction.committed", names)
         summary_requests = [
             event for event in frame["events"]
-            if event["name"] == "model.request" and event["data"].get("purpose") == "compaction"
+            if event["name"] == "model.started" and event["data"].get("purpose") == "compaction"
         ]
         self.assertEqual(len(summary_requests), 1)
+        self.assertEqual(sum("Summarize the conversation" in body["messages"][0]["content"]
+                             for body in self.requests), 1)
         self.assertIn("history summary", self.requests[-1]["messages"][1]["content"])
 
     def test_access_session_and_configuration(self):
@@ -738,11 +740,14 @@ class WebTests(unittest.TestCase):
         self.assertEqual(done["status"]["session_usage"]["total_tokens"], 5)
         events = done["events"]
         self.assertEqual([e["id"] for e in events], sorted({e["id"] for e in events}))
-        self.assertEqual(
-            [e["data"]["body"] for e in events if e["name"] == "model.request" and e["data"].get("purpose") != "title"],
-            self.requests,
-        )
-        self.assertEqual(self.requests[0]["reasoning_effort"], "high")
+        starts = [e["data"] for e in events if e["name"] == "model.started" and e["data"].get("purpose") != "title"]
+        self.assertEqual([data["request_number"] for data in starts], [1, 2])
+        first, second = self.requests
+        self.assertEqual([data["model_id"] for data in starts], [first["model"], second["model"]])
+        self.assertEqual(first["messages"][-1], {"role": "user", "content": "test patch"})
+        self.assertEqual(second["messages"], [*first["messages"], *done["state"]["messages"][1:-1]])
+        self.assertEqual(first["reasoning_effort"], "high")
+        self.assert_no_http_observation(done)
         self.assertTrue(any(e["name"] == "tool.finished" for e in events))
         self.command("new", session_id)
         next_frame = self.snapshot()
@@ -937,8 +942,10 @@ class WebTests(unittest.TestCase):
         self.command("mcp_run_prompt", sid, 400, **{**fields, "texts": ["Review", "forged", "resource-retry"]})
         self.command("mcp_run_prompt", sid, 202, **fields)
         failed = self.wait_for(lambda frame: not frame["status"]["running"])
-        self.assertEqual(self.assert_safe_context(failed, self.requests[0])["http_status"], 400)
-        self.assertFalse(any(event["name"] == "model.response_error" for event in failed["events"]))
+        self.assertTrue(self.resource_failed)
+        failure = next(event["data"] for event in failed["events"] if event["name"] == "turn.finished")
+        self.assertEqual((failure["status"], failure["error"]), ("FAILED", "模型请求失败。"))
+        self.assert_no_http_observation(failed)
         self.assertNotIn("original material", json.dumps(failed["events"]))
         saved = self.history.load(sid)
         item, = saved.attachment_refs[1].files
@@ -1006,7 +1013,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.history.attachments.read(sid, item), "standalone material")
         self.assertEqual(self.history.attachments.read(sid, uploaded), "uploaded material")
         frame = self.wait_for(lambda frame: not frame["status"]["running"])
-        self.assert_safe_context(frame, self.requests[-1])
+        self.assert_no_http_observation(frame)
         self.assertNotIn("standalone material", json.dumps(frame["events"]))
         content = self.requests[-1]["messages"][-1]["content"]
         self.assertIn("standalone material", content)
@@ -1067,7 +1074,7 @@ class WebTests(unittest.TestCase):
         frame = self.wait_for(lambda item: item["run"] is None)
         self.assertEqual(self.requests[-1]["messages"][-1]["role"], "tool")
         self.assertIn(marker, self.requests[-1]["messages"][-1]["content"])
-        self.assert_safe_context(frame, self.requests[-1])
+        self.assert_no_http_observation(frame)
         self.assertNotIn(marker, json.dumps(frame["events"]))
 
     def test_multipart_images_commit_in_order_and_history_reads_are_scoped(self):
@@ -1106,7 +1113,8 @@ class WebTests(unittest.TestCase):
             send_path, headers=self.headers, data={**data, "submission_id": "c" * 32}, files=files,
         ).status_code, 409)
 
-        running = self.wait_for(lambda frame: any(e["name"] == "model.request" for e in frame["events"]))
+        running = self.wait_for(lambda frame: frame["status"]["running"] and self.resume is not None)
+        self.assert_no_http_observation(running)
         self.assertTrue(running["state"]["model"]["supports_image"])
         self.assertEqual([item["type"] for item in running["state"]["attachment_refs"]["0"]],
                          ["image", "text", "text", "image", "image"])
@@ -1427,9 +1435,10 @@ class WebTests(unittest.TestCase):
                 self.assertNotIn("embedded-large", source)
                 self.assertNotIn("done", source)
                 self.assertLessEqual(len(source), 3000)
-                title_event = next(event for event in done["events"] if event["name"] == "model.request"
+                title_event = next(event for event in done["events"] if event["name"] == "model.started"
                                    and event["data"].get("purpose") == "title")
-                self.assertEqual(title_event["data"]["body"]["messages"][1]["content"], "[内容已隐藏]")
+                self.assertTrue(title_event["data"]["attachment_sensitive"])
+                self.assert_no_http_observation(done)
                 self.assertNotIn("small private resource excerpt", json.dumps(done["events"]))
                 self.assertEqual(self.history.load(sid).title, "Review this resource.")
                 self.command("new", sid)
@@ -1493,9 +1502,10 @@ class WebTests(unittest.TestCase):
 
         self.command("send", session_id, 202, prompt="force-error")
         failed = self.wait_for(lambda frame: not frame["status"]["running"])
-        response = next(e for e in failed["events"] if e["name"] == "model.response_error" and e["data"].get("purpose") != "title")
-        self.assertEqual(response["data"]["http_status"], 429)
-        self.assertEqual(response["data"]["body"]["error"]["api_key"], "[REDACTED]")
+        failure = next(e["data"] for e in reversed(failed["events"]) if e["name"] == "turn.finished")
+        self.assertEqual(failure["status"], "FAILED")
+        self.assertEqual(failure["error"], "APIError: The server returned HTTP 429.")
+        self.assert_no_http_observation(failed)
         self.assertNotIn(API_KEY, json.dumps(failed))
         self.assertEqual(failed["state"]["messages"], [
             *done["state"]["messages"], {"role": "user", "content": "force-error"},

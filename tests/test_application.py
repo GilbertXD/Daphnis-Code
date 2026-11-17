@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from saturnus import ChatClient
 
 from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
@@ -364,10 +365,13 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             app = Application(
                 workspace=temporary, provider="deepseek", model_id="a", catalog=CATALOG,
                 connections={"deepseek": {"base_url": "https://model.test"}},
+                observe_model_io=True,
             )
             listen, cancelled = asyncio.Event(), asyncio.Event()
             closing, release = asyncio.Event(), asyncio.Event()
             client = app._clients["deepseek"]
+            self.assertIs(type(client), ChatClient)
+            self.assertIs(app._client("deepseek"), client)
             real_close = client.aclose
 
             async def listener(event):
@@ -406,6 +410,30 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     listen.set()
                     release.set()
                     await asyncio.gather(first, second, return_exceptions=True)
+
+    async def test_response_error_is_reported_without_http_observation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transport = httpx.MockTransport(
+                lambda request: httpx.Response(200, text="Invalid JSON")
+            )
+            app = Application(
+                workspace=root, provider="deepseek", model_id="a", catalog=CATALOG,
+                history=History(root / "sessions"), observe_model_io=True,
+                connections={"deepseek": {"base_url": "https://model.test", "transport": transport}},
+            )
+            events = []
+            for name in ("model.request", "model.response_error"):
+                app.events.on(name, events.append)
+            try:
+                result = await Operations(app).send(
+                    "hello", stream=False, session_id=app.initial_session_id
+                )
+            finally:
+                await app.close()
+            self.assertEqual(result.status, TurnStatus.FAILED)
+            self.assertEqual(result.error, "ResponseError: The server returned invalid JSON.")
+            self.assertEqual(events, [])
 
     async def test_stale_application_cannot_overwrite_committed_history(self):
         with tempfile.TemporaryDirectory() as temporary:
