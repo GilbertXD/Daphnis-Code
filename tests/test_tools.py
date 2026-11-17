@@ -704,9 +704,57 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(result.value["exit_code"], 7)
             self.assertEqual(result.value["error"]["code"], "command_failed")
+            self.assertIn("7", result.value["error"]["message"])
             self.assertTrue(result.value["stdout_truncated"])
             self.assertLessEqual(len(result.value["stdout"].encode()), 100)
             self.assertIn("failure", result.value["stderr"])
+
+    async def test_shell_stream_budgets_keep_valid_utf8_and_bound_replacements(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            script = workspace / "binary_output.py"
+            script.write_text(
+                "import sys\n"
+                "if len(sys.argv) > 1:\n"
+                "    sys.stderr.buffer.write(b'\\xff\\xff')\n"
+                "else:\n"
+                "    sys.stdout.buffer.write('a界'.encode() + b'z' * 4096)\n"
+                "    sys.stderr.buffer.write(b'E\\xff' * 4096)\n",
+            )
+            tools = bound(workspace, approval=approve)
+            clipped = (await tools.execute(call("run_command", argv=[sys.executable, str(script)], max_output_bytes=3))).value
+            self.assertEqual((clipped["stdout"], clipped["stderr"]), ("a", "E"))
+            self.assertTrue(clipped["stdout_truncated"])
+            self.assertTrue(clipped["stderr_truncated"])
+            decoded = (await tools.execute(call(
+                "run_command", argv=[sys.executable, str(script), "invalid"], max_output_bytes=4,
+            ))).value
+            self.assertEqual((decoded["stdout"], decoded["stderr"]), ("", "\ufffd"))
+            self.assertFalse(decoded["stdout_truncated"])
+            self.assertTrue(decoded["stderr_truncated"])
+
+    async def test_shell_reports_startup_failure_separately_from_execute_permission(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            script = workspace / "bad-interpreter"
+            script.write_text(f"#!{workspace / 'missing'}\n")
+            script.chmod(0o700)
+            tools = bound(workspace, approval=approve)
+            command = call("run_command", argv=[str(script)])
+            failed = (await tools.execute(command)).value
+            self.assertEqual(failed["error"]["code"], "command_start_failed")
+            self.assertFalse(failed["started"])
+            self.assertIsNone(failed["exit_code"])
+            self.assertEqual((failed["stdout"], failed["stderr"]), ("", ""))
+            self.assertFalse(failed["timed_out"])
+
+            with patch.object(asyncio.get_running_loop(), "subprocess_exec", side_effect=PermissionError(errno.EACCES, "denied")):
+                denied = (await tools.execute(command)).value
+            self.assertEqual(denied["error"]["code"], "permission_denied")
+            self.assertFalse(denied["started"])
+            script.chmod(0o600)
+            invalid = (await tools.execute(command)).value
+            self.assertEqual(invalid["error"]["code"], "permission_denied")
 
     async def test_shell_read_checks_use_the_path_the_command_will_open(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -808,6 +856,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                     result = await task
                     self.assertTrue(result.value["timed_out"])
                     self.assertTrue(result.value["terminated"])
+                    self.assertTrue(result.value["leader_reaped"])
                 self.assertEqual(stopped.read_text(), "terminated")
 
     async def test_shell_timeout_reports_detached_descendants_as_unverified(self):
@@ -832,6 +881,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 pid = int(pid_file.read_text())
                 os.kill(pid, 0)
                 self.assertEqual(result.value["error"]["code"], "command_timeout")
+                self.assertTrue(result.value["leader_reaped"])
                 self.assertEqual(result.value.get("termination_scope"), "original_process_group")
                 self.assertTrue(result.value.get("escaped_descendants_may_remain"))
             finally:

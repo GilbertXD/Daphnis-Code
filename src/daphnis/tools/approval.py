@@ -527,10 +527,8 @@ def resolve_program(value: str, workspace: Path) -> Target:
         if located is None:
             raise ToolError("command_not_found", f"Executable not found: {value}")
         target = Target.capture(located, workspace)
-    if (
-        target.identity is None
-        or not target.path.is_file()
-        or not os.access(target.path, os.X_OK)
-    ):
-        raise ToolError("command_not_found", f"Not an executable file: {value}")
+    if target.identity is None or not target.path.is_file():
+        raise ToolError("command_not_found", f"Executable is missing or is not a regular file: {value}")
+    if not os.access(target.path, os.X_OK):
+        raise ToolError("permission_denied", f"No execute permission for: {value}")
     return target

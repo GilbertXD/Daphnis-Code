@@ -4,9 +4,11 @@ import asyncio
 import logging
 import os
 import signal
+from codecs import getincrementaldecoder
 from pathlib import Path
 from typing import Any
 
+from ..text import decode_text
 from .approval import (
     ASK_PROGRAMS,
     INTERPRETER,
@@ -59,6 +61,23 @@ class _CommandOutput(asyncio.SubprocessProtocol):
                 self.done.set_result(None)
             else:
                 self.done.set_exception(exc)
+
+    def _text(self, fd: int) -> tuple[str, bool]:
+        truncated = self.truncated[fd]
+        text = getincrementaldecoder("utf-8")(errors="replace").decode(self.buffers[fd], final=not truncated)
+        encoded = text.encode("utf-8")
+        if len(encoded) > self.limit:
+            return decode_text(encoded[:self.limit], truncated=True), True
+        return text, truncated
+
+    def result(self, exit_code: int | None, *, timed_out: bool = False) -> dict[str, Any]:
+        stdout, stdout_truncated = self._text(1)
+        stderr, stderr_truncated = self._text(2)
+        return {
+            "stdout": stdout, "stderr": stderr, "exit_code": exit_code,
+            "timed_out": timed_out, "terminated": timed_out and self.reaped.is_set(),
+            "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+        }
 
 
 async def _finish(task: asyncio.Task[Any]) -> Any:
@@ -122,13 +141,20 @@ async def _run(
         output.done.cancel()
         try:
             transport, _ = await _finish(spawn)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.warning("Command spawn failed during cancellation: %s", type(exc).__name__)
         else:
             await _finish(asyncio.create_task(_terminate(transport, output)))
         raise asyncio.CancelledError(
             "Command cancelled; detached descendants and external side effects may remain."
         ) from None
+    except (OSError, ValueError) as exc:
+        output.done.cancel()
+        if isinstance(exc, PermissionError):
+            return failure("permission_denied", "The operating system denied permission to start the command.",
+                           started=False, errno=exc.errno, **output.result(None))
+        return failure("command_start_failed", f"Could not start the command: {exc}", started=False,
+                       errno=exc.errno if isinstance(exc, OSError) else None, **output.result(None))
 
     timed_out = False
     try:
@@ -147,27 +173,21 @@ async def _run(
         raise
     finally:
         transport.close()
-    result = {
-        "stdout": output.buffers[1].decode("utf-8", errors="replace"),
-        "stderr": output.buffers[2].decode("utf-8", errors="replace"),
-        "exit_code": transport.get_returncode(),
-        "timed_out": timed_out,
-        "terminated": timed_out,
-        "stdout_truncated": output.truncated[1],
-        "stderr_truncated": output.truncated[2],
-    }
+    exit_code = transport.get_returncode()
+    result = output.result(exit_code, timed_out=timed_out)
     if timed_out:
         return failure(
             "command_timeout",
             "Command timed out and its leader was reaped. Detached descendants and "
             "external side effects may remain.",
             **result,
+            leader_reaped=output.reaped.is_set(),
             termination_scope="original_process_group" if os.name == "posix" else "leader",
             escaped_descendants_may_remain=True,
         )
-    if transport.get_returncode() != 0:
+    if exit_code != 0:
         return failure(
-            "command_failed", "Command exited with a nonzero status.", **result
+            "command_failed", f"Command exited with status {exit_code}.", **result
         )
     return {"ok": True, **result}
 
