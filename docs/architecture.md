@@ -17,10 +17,11 @@
 | --- | --- |
 | [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接已配置的 MCP 服务。 |
 | [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 按会话维护 Web Run、流式文本、提交确认和有界调试记录，通过 Operations 查询当前状态。每条 WebSocket 独立选择要显示的会话。 |
-| [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime；MCP 连接和目录管理面向整个 Application。 |
+| [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime，Skills 管理从会话取得工作区，MCP 连接和目录管理面向整个 Application。 |
 | [Application](../src/daphnis/app.py) | 按会话 ID 管理已加载的 Runtime，按厂商管理连接配置并缓存 ChatClient。共享 History、EventBus、模型目录、DocumentAdapter 缓存、工具目录与 MCP 连接。负责装配 Agent、提交事务、取消和释放资源。 |
 | [SessionRuntime](../src/daphnis/session_runtime.py) | 保存一个 Session 的活动任务、审批请求与模式、用量跟踪器、上下文预算和压缩状态。空闲 Runtime 保留在内存中；Runtime 本身不落盘。 |
 | [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 推进 Turn，调度模型请求和工具调用，处理响应并提交消息。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
+| [Skills](../src/daphnis/skills.py) | 扫描和导入全局与工作区的 Skill 包，用进程间锁和原子替换保存用户状态。Application 在 Turn 开始时取得目录、状态和固定正文快照。 |
 | [Token Budget](../src/daphnis/token_budget.py)、[Compactor](../src/daphnis/compaction.py) | 估算模型请求输入与输出空间。Compactor 选择完整的工具交换边界，在请求副本中修剪输出，并将旧消息摘要为检查点。 |
 | [Session](../src/daphnis/session.py)、[History](../src/daphnis/history.py) | Session 持有已提交原始消息、摘要检查点、工作区、模型、思考档位、工具偏好和用量。History 负责本地 V2 JSON、会话列表、版本校验和写入互斥。 |
 | [模型适配](../src/daphnis/models) | 模型目录定义各模型的能力。请求选项层检查工具和思考参数，`Compatibility` 将请求字段、值和内容块映射为厂商所需的格式。 |
@@ -52,6 +53,8 @@ Working 由当前 History 和检查点投影生成。模型请求保留合法工
 从保存 `RUNNING` 到保存结果期间，进程可能在实际调用之前、调用期间或返回之后中断。这三个窗口都按结果未知处理。已产生的外部副作用需要核对，History 原子替换只保护会话文件。
 
 ### 上下文与压缩
+
+Context 在主模型请求中附加本轮固定加载的 Skill 正文和按需目录，使用现有 Token 预算估算。`read_skill` 使用本轮的目录和文件指纹，通过常规工具审批和消息提交流程取回文本。原始 Skill 页保留在历史中，后续新 Turn 的请求和摘要使用占位说明。详情见 [Skills](skills.md)。
 
 预算以模型目录登记的窗口为准，按序列化消息、工具定义等估算输入 Token，并预留输出和估算余量。DeepSeek 的默认输出预留随思考档位变化。窗口未知时仍会报告输入估算。已知窗口接近阈值时，Agent 先在请求副本中修剪旧工具输出，再按需摘要旧历史。摘要优先保留当前用户消息和最近一次工具交换。最新工具输出本身过大时也可发送摘录，调用 ID 和结果配对仍完整。
 

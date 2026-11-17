@@ -61,6 +61,7 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 思考档位 | `thinking(session_id)` 查询档位，`await set_thinking(mode, session_id=...)` 保存档位。传入 `None` 使用厂商默认。 |
 | 系统提示词 | `get_system_prompt(session_id)` 返回生效文本。`await set_system_prompt(prompt, session_id=...)` 保存覆盖值，`await reset_system_prompt(session_id)` 恢复内置值。 |
 | 工具 | `all_tools` 是共享的可用目录。`enabled_tools(session_id)` 查询启用偏好，`effective_tools(session_id)` 查询实际可用项。`await set_tools(names, session_id=..., keep_unavailable=True)` 可以保留未列出的离线偏好。 |
+| Skills | `list_skills(session_id)` 返回全局和当前工作区的 `SkillInfo`，包括无效或缺失项。`await import_skill(source, scope, session_id=...)` 复制本地包并设为 `disabled`。`await set_skill_state(skill_id, state, session_id=...)` 和 `await remove_skill(skill_id, session_id=...)` 修改用户状态及受管理副本。 |
 | MCP | `managed_mcp()` 查看配置。`await save_mcp(name, enabled=..., options=..., create=...)` 创建或编辑；省略 `options` 可只切换启用状态。`restart_mcp()`、`delete_mcp()` 管理已保存的连接。直接管理运行时连接可用 `connect_mcp()`、`reconnect_mcp()`、`disconnect_mcp()` 和 `refresh_mcp()`。配置更新要求 Application 没有活动任务。 |
 | MCP Prompts | `list_mcp_prompt_servers()`、`await list_mcp_prompts(server)` 和 `await get_mcp_prompt(server, name, arguments)` 读取模板与预览。`await run_mcp_prompt(PromptInput(...), session_id=...)` 在指定会话运行已验证的 User / Assistant 消息。重试复用已保存的快照。 |
 | MCP Resources | `list_mcp_resource_servers()`、`await list_mcp_resources(server)` 和 `await list_mcp_resource_templates(server)` 读取资源目录。`await read_mcp_resource(server, uri, arguments=None)` 返回可作为 `send()` 附件的文本资源。 |
@@ -76,6 +77,10 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 `send()` 的普通 Turn 失败由 `TurnResult.status` 与 `error` 表示，锁冲突、状态校验和保存失败等可直接抛出异常。取消时会等待已开始的磁盘写入。若最终回复已保存，返回 `COMPLETED`，否则等待该轮的调用会收到 `asyncio.CancelledError`。
 
 审批使用每次请求独立的 `request_id`，而工具调用 ID 由模型提供。决策为 `deny`、`allow_once` 或 `trust_session`，可从 `daphnis.tools` 导入 `ApprovalDecision` 与 `ApprovalMode`。使用范围见[审批规则](tools.md#审批规则)。
+
+## 管理 Skills
+
+`scope` 为 `global` 或 `project`，`skill_id` 使用 `global:<name>` 或 `project:<name>`。`state` 支持 `disabled`、`always`、`on_demand`。项目作用域随 `session_id` 对应的工作区路径解析。相对的 `source` 以该工作区为基准。管理操作可以在任务执行时进行，本轮模型目录、加载状态和固定正文保持启动时的快照。[Skills 使用说明](skills.md)
 
 ## 发送图片附件
 

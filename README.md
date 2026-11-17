@@ -46,6 +46,7 @@ uv run --locked --extra web daphnis-web --workspace .
 - 恢复会话时使用会话保存的工作目录。项目记录缺失、无效或目录不匹配时，会话显示在「无项目」。
 - 通过会话菜单的「移动」可更改归属。移到其他项目后，后续工具操作使用目标项目的工作目录。移到「无项目」会保留原工作目录。
 - 在侧栏新建、恢复、重命名或删除会话，在输入框下方选择模型、思考档位和工具，或编辑、重置会话系统提示词。
+- 点击输入框旁的「Skills」导入本地 `SKILL.md` 目录并设置加载方式。项目 Skills 随会话工作区切换。[Skills 使用说明](docs/skills.md)
 - 点击顶部「MCP」管理共享服务，或用「发现」搜索官方 MCP Registry 并添加远程服务。等所有会话空闲后再更新连接，通过「工具」面板为各会话启用所需的工具。
 - 点击输入框旁的「Prompts」，选择 MCP Prompt、填写参数并编辑预览，点击「运行」直接开始任务。[MCP Prompts 使用说明](docs/tools.md#mcp-prompts)
 - 从「MCP → Resources」浏览和读取资源，预览后点击「添加到消息」，再像普通附件一样发送。[MCP Resources 使用说明](docs/tools.md#mcp-resources)
@@ -60,6 +61,7 @@ uv run --locked --extra web daphnis-web --workspace .
 
 - [运行架构与事件](docs/architecture.md)
 - [公共 Operations 接口](docs/operations.md)
+- [本地 Skills](docs/skills.md)
 - [上下文压缩与历史回查](docs/context_compaction.md)
 - [工具、审批与 MCP](docs/tools.md)
 
