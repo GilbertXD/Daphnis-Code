@@ -199,7 +199,10 @@ class Bridge:
             event.name == "model.started" and data["request_number"] == 1
             and data.get("purpose") != "title"
         )
-        self.notify(session, state=committed_input, shared=committed_input)
+        self.notify(
+            session, state=committed_input or (event.name == "model.started" and bool(data.get("loaded_skills"))),
+            shared=committed_input,
+        )
 
     def _shared_state(self, session):
         ops = self.ops

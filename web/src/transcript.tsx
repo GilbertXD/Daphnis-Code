@@ -1,11 +1,11 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { Fragment, memo, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { AttachmentLabels } from './attachments'
 import type { AttachmentHistory } from './attachments'
 import { readableJson } from './protocol'
-import type { AgentEvent, AttachmentInfo, LoadAttachment, Message, View } from './protocol'
+import type { AgentEvent, AttachmentInfo, LoadAttachment, LoadedSkill, Message, View } from './protocol'
 
 export function Copy({ text }: { text: string }) {
   const [label, setLabel] = useState('复制')
@@ -62,6 +62,7 @@ export type TraceTool = {
   end?: number
   events: AgentEvent[]
   omitted?: string
+  loadedSkill?: LoadedSkill
 }
 
 export function collectTools(events: AgentEvent[]) {
@@ -81,6 +82,7 @@ export function collectTools(events: AgentEvent[]) {
     if (event.name === 'tool.blocked') Object.assign(tool, { status: '已拦截', error: d.reason })
     if (event.name === 'tool.finished') Object.assign(tool, {
       end: event.time, status: d.status ?? '已结束', content: d.content, error: d.error,
+      loadedSkill: d.loaded_skill,
     })
     if (d.omitted) tool.omitted = d.omitted
     tools.set(key, tool)
@@ -153,7 +155,7 @@ function UserMessage({ text, state, retry, attachments = [], history }: {
   </article>
 }
 
-function savedResult(message: Message): { status: string; error?: unknown } {
+function savedResult(message: Message, name?: string): { status: string; error?: unknown; loadedSkill?: LoadedSkill } {
   if (message.daphnis_tool_state === 'PENDING') return { status: '等待恢复' }
   if (message.daphnis_tool_state === 'RUNNING') return { status: '结果未知' }
   try {
@@ -162,12 +164,28 @@ function savedResult(message: Message): { status: string; error?: unknown } {
       return { status: value.error?.code === 'execution_skipped' ? '未执行' : '结果未知', error: value.error }
     }
     if (value?.ok === false || value?.error) return { status: 'ERROR', error: value.error }
-    if (value?.ok === true) return { status: 'COMPLETED' }
+    if (value?.ok === true) {
+      const skill = name === 'read_skill' && value.path === 'SKILL.md' && typeof value.skill_id === 'string'
+        ? /^(?:global|project):([a-z0-9]+(?:-[a-z0-9]+)*)$/.exec(value.skill_id) : null
+      return { status: 'COMPLETED', loadedSkill: skill ? { id: skill[0], name: skill[1] } : undefined }
+    }
   } catch { /* Plain-text results are supported. */ }
   return { status: '已保存' }
 }
 
-const Committed = memo(function Committed({
+function skillNotice(skill: LoadedSkill, shown: Set<string>, anchor?: string) {
+  if (shown.has(skill.id)) return null
+  shown.add(skill.id)
+  return <p key={anchor ?? skill.id} id={anchor} className="muted skill-loaded">已加载 {skill.name} Skill</p>
+}
+
+function transcriptTool(tool: TraceTool, shown: Set<string>) {
+  return tool.loadedSkill
+    ? skillNotice(tool.loadedSkill, shown, `tool-${tool.key}`)
+    : <ToolRow key={tool.key} tool={tool} locate />
+}
+
+function committedRows({
   messages, tools, turns, retry, recoveryTurn, attachmentRefs, promptGroups, sessionId, loadImage, loadDocument,
 }: {
   messages: Message[]
@@ -185,15 +203,17 @@ const Committed = memo(function Committed({
   let request = 0
   const groups = new Map((promptGroups ?? []).map((group) => [group.start, group]))
   let promptEnd = 0
-  return messages.map((message, index) => {
+  const shownSkills = new Set<string>()
+  const rows = messages.map((message, index) => {
     const group = groups.get(index)
     if (group) {
       promptEnd = group.end
       request = 0
       calls = null
+      shownSkills.clear()
       const state = message.daphnis_turn_state
       const taskRetry = retry?.index === index ? retry : undefined
-      return <section className="prompt-transcript" key={group.id} aria-label="MCP Prompt">
+      return <Fragment key={group.id}><section className="prompt-transcript" aria-label="MCP Prompt">
         <div className="prompt-source muted">
           <span>{group.server} / {group.prompt}</span>
           {state === 'ABANDONED' && <small>已作废</small>}
@@ -213,15 +233,20 @@ const Committed = memo(function Committed({
             </div>}
           </div>)}
       </section>
+        {message.daphnis_loaded_skills?.map((skill) => skillNotice(skill, shownSkills))}
+      </Fragment>
     }
     if (index < promptEnd) return null
     if (message.role === 'user') {
       request = 0
       calls = null
-      return <UserMessage key={index} text={messageText(message)}
-        attachments={attachmentRefs?.[index]}
-        history={{ sessionId, messageIndex: index, loadImage, loadDocument }}
-        state={message.daphnis_turn_state} retry={retry?.index === index ? retry : undefined} />
+      shownSkills.clear()
+      return <Fragment key={index}>
+        <UserMessage text={messageText(message)} attachments={attachmentRefs?.[index]}
+          history={{ sessionId, messageIndex: index, loadImage, loadDocument }}
+          state={message.daphnis_turn_state} retry={retry?.index === index ? retry : undefined} />
+        {message.daphnis_loaded_skills?.map((skill) => skillNotice(skill, shownSkills))}
+      </Fragment>
     }
     if (message.role === 'assistant') {
       request += 1
@@ -236,17 +261,19 @@ const Committed = memo(function Committed({
       : undefined
     const observed = resumed ?? tools.find((tool) => tool.turn === turn?.id && tool.number === request && tool.id === message.tool_call_id)
     const id = message.tool_call_id ?? String(index)
-    const saved = savedResult(message)
+    const saved = savedResult(message, call?.function.name)
     const tool: TraceTool = {
       key: observed?.key ?? `saved-${index}`, id, turn: turn?.id ?? '', number: request,
       name: call?.function.name ?? '工具结果', ...saved,
       events: [], ...observed, status: resumed?.status ?? (observed?.end != null ? observed.status : saved.status),
       arguments: call?.function.arguments ?? observed?.arguments,
       content: typeof message.content === 'string' ? message.content : observed?.content,
+      loadedSkill: saved.loadedSkill ?? resumed?.loadedSkill,
     }
-    return <ToolRow key={index} tool={tool} locate />
+    return <Fragment key={index}>{transcriptTool(tool, shownSkills)}</Fragment>
   })
-})
+  return { rows, shownSkills }
+}
 
 export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
   view: View; tools: TraceTool[]; retry?: Retry; loadImage: LoadAttachment; loadDocument: LoadAttachment
@@ -271,6 +298,12 @@ export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
   const committed = run
     ? view.state.messages.slice(0, activeGroup?.end ?? run.base_count + Number(!!committedInput))
     : view.state.messages
+  const { rows, shownSkills } = committedRows({
+    messages: committed, tools, turns, retry, attachmentRefs: view.state.attachment_refs, promptGroups,
+    sessionId: view.session_id, loadImage, loadDocument,
+    recoveryTurn: run?.prompt === null && !activeGroup ? run.turn_id : undefined,
+  })
+  if (run && run.prompt !== null && !committedInput) shownSkills.clear()
   const activeTools = run ? tools.filter((tool) => tool.turn === run.turn_id && tool.number > 0) : []
   const finished = run?.turn_id
     ? events.filter((event) => event.turn_id === run.turn_id && event.name === 'model.finished' && event.data.purpose !== 'compaction')
@@ -290,10 +323,7 @@ export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
         <h2>今天要处理什么？</h2>
         <p>描述任务，或让 Agent 检查当前工作区。</p>
       </div>}
-      <Committed messages={committed} tools={tools} turns={turns} retry={retry}
-        attachmentRefs={view.state.attachment_refs} promptGroups={promptGroups}
-        sessionId={view.session_id} loadImage={loadImage} loadDocument={loadDocument}
-        recoveryTurn={run?.prompt === null && !activeGroup ? run.turn_id : undefined} />
+      {rows}
       {run && <>
         {run.prompt !== null && !committedInput && <UserMessage text={run.prompt}
           attachments={run.attachments?.map((name, index) => ({ id: String(index), name }))} />}
@@ -303,7 +333,7 @@ export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
             <AssistantMessage text={message ? messageText(message) : live[number]?.content ?? ''}
               thinking={message?.reasoning_content ?? live[number]?.reasoning} />
             {activeTools.filter((tool) => tool.number === number).map((tool) =>
-              <ToolRow key={tool.key} tool={tool} locate />)}
+              transcriptTool(tool, shownSkills))}
           </div>
         })}
         <p className="muted live-status" role="status">{view.status.approval ? '等待工具审批' : 'Agent 运行中…'}</p>

@@ -1,4 +1,4 @@
-"""Recovery decisions attached to the original user message."""
+"""Turn metadata attached to the original input message."""
 
 import json
 from dataclasses import dataclass
@@ -11,6 +11,7 @@ from .tool_state import TERMINATED_SKIP_MESSAGE, TOOL_STATE
 
 TURN_STATE = "daphnis_turn_state"
 TURN_ATTEMPT = "daphnis_turn_attempt"
+LOADED_SKILLS = "daphnis_loaded_skills"
 ABANDONED = "ABANDONED"
 CONTINUE = "CONTINUE"
 TERMINATED = "TERMINATED"
@@ -142,6 +143,6 @@ def project_terminated_turns(
 
 def project_turn_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
-        {key: value for key, value in message.items() if key not in (TURN_STATE, TURN_ATTEMPT)}
+        {key: value for key, value in message.items() if key not in (TURN_STATE, TURN_ATTEMPT, LOADED_SKILLS)}
         for message in messages if message.get(TURN_STATE) != ABANDONED
     ]

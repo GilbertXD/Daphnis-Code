@@ -9,7 +9,13 @@ from .compaction import CompactionCheckpoint
 from .messages import Messages
 from .project import validate_project_id
 from .prompt_groups import PromptGroup, validate_messages
-from .turn_state import TURN_ATTEMPT, TURN_STATE, RecoveryState, recovery_state
+from .turn_state import (
+    LOADED_SKILLS,
+    TURN_ATTEMPT,
+    TURN_STATE,
+    RecoveryState,
+    recovery_state,
+)
 from .usage import UsageTotals
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -102,7 +108,7 @@ class Session:
             resource_items = []
             for index in range(group.start, group.end):
                 message = self.messages.get(index)
-                if message.keys() - {"role", "content", TURN_STATE, TURN_ATTEMPT}:
+                if message.keys() - {"role", "content", TURN_STATE, TURN_ATTEMPT, LOADED_SKILLS}:
                     raise ValueError("Invalid message in Session prompt group.")
                 if index in self.attachment_refs:
                     item = self.attachment_refs[index].files[0]

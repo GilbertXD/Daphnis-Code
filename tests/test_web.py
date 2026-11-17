@@ -26,6 +26,7 @@ from daphnis.app import Application
 from daphnis.attachments import MAX_IMAGE_BYTES, TextResourceInput
 from daphnis.history import SessionLease
 from daphnis.tool_state import PENDING, TOOL_STATE
+from daphnis.turn_state import LOADED_SKILLS
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
 from daphnis.web.server import create_app
@@ -152,6 +153,24 @@ class WebTests(unittest.TestCase):
                 return httpx.Response(400, json={"error": {"message": "Fixture first resource turn fails.", "echo": body}})
             if last.get("content") == "force-error":
                 return httpx.Response(429, json={"error": {"api_key": API_KEY, "message": "Rate limit"}})
+            if content == "exercise skill loading":
+                self.resume = asyncio.Event()
+                calls = [
+                    ("fixed", {"skill_id": "global:fixed-review"}),
+                    ("manifest", {"skill_id": "project:code-review"}),
+                    ("repeat", {"skill_id": "project:code-review", "path": "SKILL.md"}),
+                    ("reference", {"skill_id": "project:code-review", "path": "references/notes.md"}),
+                    ("failed", {"skill_id": "project:unread", "start_line": 999}),
+                ]
+                response = chunk({"tool_calls": [
+                    {"index": index, "id": call_id, "type": "function", "function": {
+                        "name": "read_skill", "arguments": json.dumps(arguments),
+                    }} for index, (call_id, arguments) in enumerate(calls)
+                ]}, "tool_calls")
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=PausedReply(
+                    chunk({"role": "assistant", "reasoning_content": "Choose Skills"}),
+                    self.resume, response + b"data: [DONE]\n\n",
+                ))
             if last.get("content") == "read saved attachment":
                 attachment = next(
                     json.loads(line)
@@ -275,6 +294,68 @@ class WebTests(unittest.TestCase):
         self.command("skill_remove", session, skill_id="project:review")
         self.assertEqual([item["id"] for item in self.snapshot(session)["state"]["skills"]], ["global:review"])
         self.assertTrue((source / "SKILL.md").is_file())
+
+    def install_skill(self, session, name, scope, state):
+        source = self.workspace / name
+        (source / "references").mkdir(parents=True)
+        (source / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Review changes\n---\nBody of {name}\n")
+        (source / "references" / "notes.md").write_text("Reference notes")
+        self.command("skill_import", session, source=name, scope=scope)
+        self.command("skill_set_state", session, skill_id=f"{scope}:{name}", state=state)
+
+    def test_skill_load_notices_stream_and_restore_from_saved_messages(self):
+        session = self.snapshot()["session_id"]
+        self.install_skill(session, "fixed-review", "global", "always")
+        self.install_skill(session, "code-review", "project", "on_demand")
+        self.install_skill(session, "unread", "project", "on_demand")
+        fixed = {"id": "global:fixed-review", "name": "fixed-review"}
+        on_demand = {"id": "project:code-review", "name": "code-review"}
+
+        self.command("send", session, 202, prompt="exercise skill loading")
+        live = self.wait_for(lambda frame: frame["live"].get("1", {}).get("reasoning"))
+        try:
+            [started] = [event for event in live["events"] if event["name"] == "model.started"]
+            self.assertEqual(started["data"]["loaded_skills"], [fixed])
+            self.assertNotIn("Body of fixed-review", json.dumps(started))
+            self.assertEqual(live["state"]["messages"][0][LOADED_SKILLS], [fixed])
+        finally:
+            self.client.portal.call(self.resume.set)
+
+        done = self.wait_for(lambda frame: frame["run"] is None)
+        self.assertEqual(done["events"][-1]["data"]["status"], "COMPLETED")
+        self.assertEqual([event["data"]["loaded_skills"] for event in done["events"]
+                          if event["name"] == "model.started" and "loaded_skills" in event["data"]], [[fixed]])
+        finished = {event["data"]["tool_call_id"]: event["data"] for event in done["events"]
+                    if event["name"] == "tool.finished"}
+        self.assertEqual(finished["fixed"]["loaded_skill"], fixed)
+        self.assertEqual(finished["manifest"]["loaded_skill"], on_demand)
+        self.assertEqual(finished["repeat"]["loaded_skill"], on_demand)
+        self.assertNotIn("loaded_skill", finished["reference"])
+        self.assertNotIn("loaded_skill", finished["failed"])
+        self.assertEqual(finished["failed"]["status"], "ERROR")
+        self.assertIn("Body of code-review", finished["manifest"]["content"])
+        self.assertTrue(all(LOADED_SKILLS not in json.dumps(request) for request in [*self.requests, *self.title_requests]))
+
+        other = self.command("new", session)["session_id"]
+        self.assertEqual(self.snapshot(other)["state"]["messages"], [])
+        self.client.portal.call(self.bridge.forget, session)
+        self.client.portal.call(self.bridge.ops._app._drop_runtime, session)
+        self.command("restore", other, id=session)
+        restored = self.snapshot()
+        self.assertFalse(restored["events"])
+        self.assertEqual(restored["state"]["messages"][0][LOADED_SKILLS], [fixed])
+        saved_read = next(message for message in restored["state"]["messages"] if message.get("tool_call_id") == "manifest")
+        self.assertEqual(json.loads(saved_read["content"])["path"], "SKILL.md")
+
+    def test_failed_fixed_skill_does_not_record_a_load_notice(self):
+        session = self.snapshot()["session_id"]
+        self.install_skill(session, "fixed-review", "global", "always")
+        (self.history.directory.parent / "skills" / "fixed-review" / "SKILL.md").unlink()
+        self.command("send", session, 202, prompt="Cannot load a missing Skill")
+        frame = self.wait_for(lambda frame: frame["run"] is None)
+        self.assertEqual(frame["events"][-1]["data"]["status"], "FAILED")
+        self.assertNotIn(LOADED_SKILLS, json.dumps(frame))
+        self.assertEqual(self.requests, [])
 
     def test_websocket_preserves_http_observation_event_payloads(self):
         session = self.snapshot()["session_id"]

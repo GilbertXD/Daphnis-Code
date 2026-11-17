@@ -116,6 +116,7 @@ export type RegistryPage = { servers: RegistryServer[]; cursor: string | null }
 type HistoryIssue = { filename: string; error: string }
 
 export type ToolCall = { id: string; function: { name: string; arguments: string } }
+export type LoadedSkill = { id: string; name: string }
 export type Message = {
   role: string
   content?: string | { type: string; text?: string }[] | null
@@ -125,6 +126,7 @@ export type Message = {
   tool_call_id?: string
   daphnis_tool_state?: 'PENDING' | 'RUNNING'
   daphnis_turn_state?: 'ABANDONED' | 'CONTINUE' | 'TERMINATED'
+  daphnis_loaded_skills?: LoadedSkill[]
 }
 
 export type Recovery = { kind: 'FAILED_USER' | 'INTERRUPTED_TURN'; key: string; message_index: number }
@@ -194,6 +196,8 @@ export type EventData = {
   committed_count?: number
   chunks?: number
   omitted?: string
+  loaded_skill?: LoadedSkill
+  loaded_skills?: LoadedSkill[]
 }
 
 export type AgentEvent = { id: number; name: string; turn_id: string; time: number; data: EventData }

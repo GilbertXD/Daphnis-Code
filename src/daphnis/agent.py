@@ -86,6 +86,7 @@ from .tools.history import can_read_tool_history
 from .turn_state import (
     ABANDONED,
     CONTINUE,
+    LOADED_SKILLS,
     TERMINATED,
     TURN_ATTEMPT,
     TURN_STATE,
@@ -320,7 +321,7 @@ class Agent:
             raise ValueError("A stop response has no visible text or refusal.")
         if reason == "tool_calls":
             Agent._validate_tool_calls(calls)
-        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT, IMAGE_REFS, DOCUMENT_REFS):
+        for field in (TOOL_STATE, TURN_STATE, TURN_ATTEMPT, LOADED_SKILLS, IMAGE_REFS, DOCUMENT_REFS):
             message.pop(field, None)
         return message, reason
 
@@ -839,6 +840,7 @@ class Agent:
                     raise ValueError("恢复状态已变化，请刷新后再操作。")
                 if kind is RecoveryKind.FAILED_USER and committed[-1]["role"] != "user":
                     raise ValueError("当前模型接口无法续写 Assistant 结尾的消息组。请发送新消息。")
+            turn_start = len(committed) if recovery_action is None else recovery.message_index
             interrupted = interrupted_tool_group(committed)
             tools = None if recovery_action is RecoveryAction.TERMINATE else self.tools
             if isinstance(tools, ToolExecutor):
@@ -882,12 +884,14 @@ class Agent:
             async def commit(
                 snapshot: list[dict[str, Any]], *, tool_finished: dict[str, Any] | None = None,
                 refs_update: dict[int, AttachmentBatch] | None = None, group: PromptGroup | None = None,
+                persist_checkpoint: bool = True,
             ) -> None:
                 check_session()
                 refs = {**session.attachment_refs, **refs_update} if refs_update else session.attachment_refs
                 groups = session.prompt_groups if group is None else (*session.prompt_groups, group)
+                saved_checkpoint = checkpoint if persist_checkpoint else committed_checkpoint
                 candidate = replace(
-                    session, messages=Messages(snapshot), compaction=checkpoint,
+                    session, messages=Messages(snapshot), compaction=saved_checkpoint,
                     attachment_refs=refs, prompt_groups=groups,
                 )
 
@@ -907,9 +911,9 @@ class Agent:
                         await self.events.emit("attachments.committed", **fields, submission_id=attachment_batch.submission_id)
                     if group is not None:
                         await self.events.emit("prompt.committed", **fields, group_id=group.id)
-                    if committed_checkpoint != checkpoint:
-                        committed_checkpoint = checkpoint
-                        await self.events.emit("compaction.committed", **fields, through=checkpoint.through)
+                    if committed_checkpoint != saved_checkpoint:
+                        committed_checkpoint = saved_checkpoint
+                        await self.events.emit("compaction.committed", **fields, through=saved_checkpoint.through)
                     if tool_finished is not None:
                         await self.events.emit("tool.finished", **tool_finished)
 
@@ -948,6 +952,7 @@ class Agent:
                     side_effects = True
 
                 tool_error = None
+                skill_loaded = {}
                 try:
                     if tools is None:
                         raise ToolCallValidationError("Tool is no longer enabled.", code="unknown_tool")
@@ -962,8 +967,12 @@ class Agent:
                         await _checkpoint()
                         result = await tools.execute(call)
                     content = result.content
-                    if isinstance(tools, ToolExecutor) and not result.value.get("ok", False):
-                        tool_error = result.value.get("error")
+                    if isinstance(tools, ToolExecutor):
+                        if not result.value.get("ok", False):
+                            tool_error = result.value.get("error")
+                        elif tool_fields["name"] == "read_skill" and result.value.get("path") == "SKILL.md":
+                            skill_id = result.value["skill_id"]
+                            skill_loaded = {"loaded_skill": {"id": skill_id, "name": skill_id.split(":", 1)[1]}}
                 except (ToolCallValidationError, ToolExecutionError) as exc:
                     if isinstance(exc.__cause__, FatalToolError):
                         raise exc.__cause__
@@ -978,7 +987,7 @@ class Agent:
                 await commit(
                     update_tool_result(committed, index, call_id, content=content),
                     tool_finished={
-                        **tool_fields, "status": "ERROR" if tool_error else "COMPLETED",
+                        **tool_fields, **skill_loaded, "status": "ERROR" if tool_error else "COMPLETED",
                         "content": ("[附件工具输出已隐藏]" if call["function"]["name"] in ATTACHMENT_TOOLS else content),
                         "error": tool_error,
                     },
@@ -1032,11 +1041,23 @@ class Agent:
                             messages, documents, lambda item: attachment_store.read_document(session.id, item),
                         )
                         await _checkpoint()
+                    skill_loads = {}
+                    if primary_requests == 0 and self.context.skills and self.context.skills.fixed_skills:
+                        loaded = [{"id": skill_id, "name": name} for skill_id, name in self.context.skills.fixed_skills]
+                        entry = committed[turn_start]
+                        previous = {skill["id"]: skill for skill in entry.get(LOADED_SKILLS, [])}
+                        merged = {**previous, **{skill["id"]: skill for skill in loaded}}
+                        if merged != previous:
+                            snapshot = committed.copy()
+                            snapshot[turn_start] = {**entry, LOADED_SKILLS: list(merged.values())}
+                            # Keep a pending checkpoint tied to the normal response commit.
+                            await commit(snapshot, persist_checkpoint=False)
+                        skill_loads = {"loaded_skills": loaded}
                     primary_requests += 1
                     requests += 1
                     request_fields = {**fields, "request_number": requests}
                     await self.events.emit(
-                        "model.started", **request_fields, provider=provider, model_id=model_id,
+                        "model.started", **request_fields, **skill_loads, provider=provider, model_id=model_id,
                     )
                     await self.events.emit(
                         "context.budget", **request_fields, **asdict(budget),

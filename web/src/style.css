@@ -102,6 +102,7 @@ hr { border: 0; border-top: 1px solid var(--line); }
 table { border-collapse: collapse; }
 th, td { border: 1px solid var(--line); padding: 4px 8px; }
 .thinking { margin: 0 0 11px; color: var(--muted); font-size: .86rem; }
+.skill-loaded { margin: 0 0 11px; }
 .reasoning { border-left: 1px solid var(--line); padding: 0 12px; margin: 7px 0; white-space: pre-wrap; }
 .tool-row { border: 1px solid var(--line); margin: 0 0 8px; min-width: 0; }
 .tool-row + .assistant-message { margin-top: 19px; }

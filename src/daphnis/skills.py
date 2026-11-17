@@ -238,6 +238,7 @@ def _scan_bundle(fd: int, directory: Path) -> tuple[_Bundle, list[Path]]:
 class SkillSnapshot:
     instructions: str
     _enabled: Mapping[str, _Bundle]
+    fixed_skills: tuple[tuple[str, str], ...] = ()
 
     @property
     def enabled(self) -> bool:
@@ -388,6 +389,7 @@ class SkillStore:
     def snapshot(self, workspace: Path) -> SkillSnapshot:
         enabled = {}
         instructions = []
+        fixed_skills = []
         for info, bundle in self._entries(workspace):
             if bundle is None or info.state is SkillState.DISABLED:
                 continue
@@ -399,10 +401,11 @@ class SkillStore:
                 except SkillError as exc:
                     raise SkillError(f"Cannot load {info.id}: {exc}") from exc
                 label += f"\nSkill directory: {bundle.directory}\n\n{body}"
+                fixed_skills.append((info.id, info.name))
             instructions.append(label)
         if instructions:
             instructions.insert(0, _NOTICE + "\nUse read_skill with the exact Skill ID when the tool is available.")
-        return SkillSnapshot("\n\n".join(instructions), MappingProxyType(enabled))
+        return SkillSnapshot("\n\n".join(instructions), MappingProxyType(enabled), tuple(fixed_skills))
 
     def import_skill(self, source: str | Path, scope: SkillScope, workspace: Path) -> SkillInfo:
         scope = SkillScope(scope)
