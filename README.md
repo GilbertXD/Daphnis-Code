@@ -1,6 +1,6 @@
 # Daphnis
 
-Daphnis 是基于 Saturnus 的本地 Coding Agent，通过浏览器使用。它通过模型 API 理解任务，在指定工作区内读取和搜索代码，并按工具权限规则执行命令、应用补丁或调用 MCP 工具。会话历史存储在本地。
+Daphnis 是通过浏览器使用的本地 Coding Agent，内置 Chat Completions 模型通信与流式响应处理。它通过模型 API 理解任务，在指定工作区内读取和搜索代码，并按工具权限规则执行命令、应用补丁或调用 MCP 工具。会话历史存储在本地。
 
 ## 安装与配置
 
@@ -62,8 +62,6 @@ uv run --locked --extra web daphnis-web --workspace .
 - [公共 Operations 接口](docs/operations.md)
 - [上下文压缩与历史回查](docs/context_compaction.md)
 - [工具、审批与 MCP](docs/tools.md)
-
-锁文件使用仓库内的 `saturnus-llm==0.1.2` wheel，构建自 Saturnus 提交 `4a51e29531e719bc71e2ce734c6e03a9443614c1`。`uv sync --locked --extra web` 从该 wheel 安装。共同开发两个仓库时，可在隔离环境中用 `uv pip install --no-deps -e ../Saturnus` 切换为本地源码，再用 `uv run --no-sync daphnis-web` 启动。
 
 ```sh
 uv run --locked --extra web python -m unittest discover -s tests -v

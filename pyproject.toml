@@ -1,15 +1,16 @@
 [project]
 name = "daphnis"
 version = "0.1.0"
-description = "Agent harness built on saturnus-llm."
+description = "Local coding agent with built-in model communication."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "httpx>=0.28.1",
     "httpx2>=2.16,<3",
+    "jsonschema>=4.26.0",
     "mcp>=2,<3",
     "pillow>=12.3,<14",
     "python-dotenv>=1.2.4",
-    "saturnus-llm==0.1.2",
     "uritemplate>=4.2,<5",
 ]
 
@@ -30,6 +31,3 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = ["ruff==0.17.4"]
-
-[tool.uv.sources]
-saturnus-llm = { path = "vendor/saturnus_llm-0.1.2-py3-none-any.whl" }

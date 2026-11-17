@@ -18,13 +18,14 @@
 | [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接已配置的 MCP 服务。 |
 | [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 按会话维护 Web Run、流式文本、提交确认和有界调试记录，通过 Operations 查询当前状态。每条 WebSocket 独立选择要显示的会话。 |
 | [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime；MCP 连接和目录管理面向整个 Application。 |
-| [Application](../src/daphnis/app.py) | 按 ID 管理已加载的 Runtime。共享 History、EventBus、模型目录、ChatClient 和 DocumentAdapter 缓存、工具目录、MCP 连接与配置。负责装配 Agent、提交事务、取消和释放资源。 |
+| [Application](../src/daphnis/app.py) | 按会话 ID 管理已加载的 Runtime，按厂商管理连接配置并缓存 ChatClient。共享 History、EventBus、模型目录、DocumentAdapter 缓存、工具目录与 MCP 连接。负责装配 Agent、提交事务、取消和释放资源。 |
 | [SessionRuntime](../src/daphnis/session_runtime.py) | 保存一个 Session 的活动任务、审批请求与模式、用量跟踪器、上下文预算和压缩状态。空闲 Runtime 保留在内存中；Runtime 本身不落盘。 |
-| [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 负责模型和工具循环及消息提交。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
+| [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 推进 Turn，调度模型请求和工具调用，处理响应并提交消息。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
 | [Token Budget](../src/daphnis/token_budget.py)、[Compactor](../src/daphnis/compaction.py) | 估算模型请求输入与输出空间。Compactor 选择完整的工具交换边界，在请求副本中修剪输出，并将旧消息摘要为检查点。 |
 | [Session](../src/daphnis/session.py)、[History](../src/daphnis/history.py) | Session 持有已提交原始消息、摘要检查点、工作区、模型、思考档位、工具偏好和用量。History 负责本地 V2 JSON、会话列表、版本校验和写入互斥。 |
-| [模型适配](../src/daphnis/models)、[模型观测](../src/daphnis/model_io.py) | Daphnis 管理模型能力目录，检查工具和思考选项，并为厂商配置 Saturnus `Compatibility` 映射。Saturnus 提供 Chat Completions 通信、消息与流式响应累积、工具参数校验和注册表执行。可选的模型观测通过 Saturnus 的公开响应接口读取 HTTP 数据。 |
-| [工具与审批](../src/daphnis/tools)、[MCP](../src/daphnis/mcp/__init__.py) | ToolExecutor 在调用 Saturnus 注册表执行前检查路径、权限和审批。MCP 模块通过 SDK 建立连接、发现工具、处理目录变化和调用结果，发现的工具进入同一套审批流程。 |
+| [模型适配](../src/daphnis/models) | 模型目录定义各模型的能力。请求选项层检查工具和思考参数，`Compatibility` 将请求字段、值和内容块映射为厂商所需的格式。 |
+| [模型通信](../src/daphnis/llm/client.py)、[SSE 解析](../src/daphnis/llm/streaming.py)、[响应累积](../src/daphnis/response.py) | ChatClient 构造并发送 Chat Completions 请求，管理 HTTP 连接和响应资源。SSE 解析器将流式事件解码为 JSON 分片，ResponseAccumulator 将分片组装为完整响应。[Messages](../src/daphnis/messages.py) 负责消息结构校验和独立快照。 |
+| [工具与审批](../src/daphnis/tools)、[MCP](../src/daphnis/mcp/__init__.py) | ToolRegistry 注册工具、通过 JSON Schema 校验参数并支持执行注册的函数。ToolExecutor 检查路径、权限和审批后执行内置工具或 MCP 工具。MCP 模块通过 SDK 管理连接、发现工具、处理目录变化和调用结果。 |
 | [EventBus](../src/daphnis/events.py)、[Usage](../src/daphnis/usage.py) | EventBus 分发观察通知。UsageTracker 按请求记录 API 报告的用量并汇总到本轮与会话，流式的重复用量快照以该请求的最新报告为准。 |
 
 压缩、请求额度和回查的细节见[上下文压缩与历史回查](context_compaction.md)。
