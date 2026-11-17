@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from saturnus import Messages
 from test_agent_core import (
     CATALOG,
     make_client,
@@ -28,6 +27,7 @@ from daphnis.compaction import (
     safe_boundaries,
 )
 from daphnis.compaction_settings import CompactionSettings
+from daphnis.messages import Messages
 from daphnis.models import ModelInfo
 from daphnis.redaction import Redactor
 from daphnis.token_budget import TokenCounter, request_budget

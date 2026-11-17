@@ -4,14 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from saturnus import Messages
-
 from daphnis.attachments import (
     TextAttachmentInput,
     TextResourceInput,
     prepare_attachments,
 )
 from daphnis.history import History, SessionBusyError
+from daphnis.messages import Messages
 from daphnis.session import Session
 
 

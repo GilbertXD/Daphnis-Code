@@ -4,10 +4,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from saturnus import Messages
-
 from .attachments import AttachmentBatch
 from .compaction import CompactionCheckpoint
+from .messages import Messages
 from .project import validate_project_id
 from .prompt_groups import PromptGroup, validate_messages
 from .turn_state import TURN_ATTEMPT, TURN_STATE, RecoveryState, recovery_state
@@ -63,7 +62,7 @@ class Session:
         if self.project_id is not None:
             validate_project_id(self.project_id)
         if not isinstance(self.messages, Messages):
-            raise TypeError("messages must be a Saturnus Messages instance.")
+            raise TypeError("messages must be a Daphnis Messages instance.")
         if not isinstance(self.attachment_refs, dict):
             raise TypeError("Session attachment_refs must be an object.")
         embedded_indices: set[int] = set()

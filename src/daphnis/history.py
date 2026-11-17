@@ -12,10 +12,10 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Self, TypeVar
 
-from saturnus import Messages, ValidationError
-
 from .attachments import AttachmentBatch, AttachmentStore
 from .compaction import CompactionCheckpoint
+from .errors import ValidationError
+from .messages import Messages
 from .project import Project, validate_project_id
 from .prompt_groups import PromptGroup
 from .session import Session

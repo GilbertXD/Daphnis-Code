@@ -7,8 +7,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 
-from saturnus import Messages
-
+from ..messages import Messages
 from ..redaction import Redactor
 from ..token_budget import DEFAULT_COUNTER
 from .approval import Decision, Operation, ToolError

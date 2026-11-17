@@ -3,7 +3,7 @@
 import json
 from typing import Any
 
-from saturnus import Messages
+from .messages import Messages
 
 TOOL_STATE = "daphnis_tool_state"
 PENDING = "PENDING"

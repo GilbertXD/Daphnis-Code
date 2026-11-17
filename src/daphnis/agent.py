@@ -14,7 +14,6 @@ from uuid import uuid4
 from saturnus import (
     APIError,
     ChatClient,
-    Messages,
     ResponseAccumulator,
     ResponseError,
     SaturnusError,
@@ -54,6 +53,7 @@ from .context import (
 )
 from .events import EventBus
 from .history import finish_io
+from .messages import Messages
 from .model_io import (
     ContextOverflowError,
     hide_attachment_echo,

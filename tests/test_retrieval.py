@@ -4,7 +4,6 @@ import unittest
 from pathlib import Path
 
 import httpx
-from saturnus import Messages
 from test_agent_core import CATALOG, reply, tool_call
 
 from daphnis import History, Operations, TurnStatus
@@ -12,6 +11,7 @@ from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction import CompactionCheckpoint
 from daphnis.events import EventBus
+from daphnis.messages import Messages
 from daphnis.redaction import Redactor
 from daphnis.session import Session
 from daphnis.tools import create_tools

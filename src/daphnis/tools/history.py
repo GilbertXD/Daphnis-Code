@@ -6,9 +6,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from saturnus import Messages
-
 from ..attachments import AttachmentBatch, attachment_metadata
+from ..messages import Messages
 from ..redaction import Redactor
 from ..turn_state import ABANDONED, TURN_STATE
 from .approval import Decision, Operation, ToolError

@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-from saturnus import ChatClient, Messages, ToolRegistry
+from saturnus import ChatClient, ToolRegistry
 
 from daphnis import (
     Agent,
@@ -19,6 +19,7 @@ from daphnis import (
     TurnStatus,
 )
 from daphnis.compaction import CompactionCheckpoint
+from daphnis.messages import Messages
 from daphnis.models import ModelInfo, provider_compatibility
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.turn_state import (

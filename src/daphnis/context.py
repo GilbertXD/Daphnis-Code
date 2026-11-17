@@ -4,8 +4,6 @@ import json
 from base64 import b64encode
 from typing import Any
 
-from saturnus import Messages
-
 from .attachments import (
     AttachmentBatch,
     AttachmentStore,
@@ -13,6 +11,7 @@ from .attachments import (
     ImageAttachment,
 )
 from .compaction import SUMMARY_POLICY, CompactionCheckpoint, project, safe_boundaries
+from .messages import Messages
 from .prompt_groups import PromptGroup
 from .turn_state import (
     ABANDONED,

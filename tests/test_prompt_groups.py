@@ -5,10 +5,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import httpx
-from saturnus import Messages
 from test_agent_core import make_agent, make_client, reply, session
 
 from daphnis import History, Session, TurnStatus
+from daphnis.messages import Messages
 from daphnis.prompt_groups import PromptInput
 from daphnis.turn_state import ABANDONED, TURN_STATE, RecoveryAction, RecoveryKind
 
