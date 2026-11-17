@@ -11,16 +11,9 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from saturnus import (
-    APIError,
-    ChatClient,
-    ResponseAccumulator,
-    ResponseError,
-    SaturnusError,
-    get_finish_reason,
-    get_message,
-)
+from saturnus import APIError, ChatClient, ResponseError, SaturnusError
 
+from ._json import validate_json
 from .attachments import (
     ATTACHMENT_TOOLS,
     MAX_IMAGE_REQUEST_BYTES,
@@ -48,10 +41,15 @@ from .context import (
     materialize_images,
     projected_image_bytes,
 )
-from .errors import DaphnisError, ToolCallValidationError, ToolExecutionError
+from .errors import (
+    DaphnisError,
+    ToolCallValidationError,
+    ToolExecutionError,
+    ValidationError,
+)
 from .events import EventBus
 from .history import finish_io
-from .messages import Messages
+from .messages import Messages, validate_message
 from .model_io import (
     ContextOverflowError,
     hide_attachment_echo,
@@ -69,6 +67,7 @@ from .models.documents import DocumentAdapter, DocumentInputError
 from .models.models import validate_catalog
 from .models.requests import require_document_input, require_image_input
 from .prompt_groups import PromptGroup, PromptInput
+from .response import ResponseAccumulator, _response_choice
 from .session import Session
 from .token_budget import TokenBudget, image_token_reserve, request_budget
 from .tool_state import (
@@ -286,13 +285,29 @@ class Agent:
     def _parse_response(
         response: dict[str, Any], *, require_visible: bool = True,
     ) -> tuple[dict[str, Any], str | None]:
-        message = get_message(response)
+        choice, path = _response_choice(response)
+        message_path = f"{path}.message"
+        if "message" not in choice:
+            raise ValidationError(f"{message_path} is required.")
+        message = choice["message"]
+        validate_message(message, path=message_path, require_role=False)
+        try:
+            validate_json(message)
+        except ValidationError as exc:
+            raise ValidationError(f"{message_path} must be valid JSON.") from exc
+        message = deepcopy(message)
+
         if len(response["choices"]) != 1:
             raise ValueError("Agent requires exactly one response choice.")
         message.setdefault("role", "assistant")
         if message["role"] != "assistant":
             raise ValueError("Expected an assistant response.")
-        reason = get_finish_reason(response)
+        if "finish_reason" not in choice:
+            raise ValidationError(f"{path}.finish_reason is required.")
+        reason = choice["finish_reason"]
+        if reason is not None and (not isinstance(reason, str) or not reason.strip()):
+            raise ValidationError(f"{path}.finish_reason must be a non-empty string or null.")
+
         calls = message.get("tool_calls")
         if calls is not None and not isinstance(calls, list):
             raise ValueError("Tool calls must be a list or null.")
@@ -435,7 +450,7 @@ class Agent:
         await _checkpoint()
         try:
             message, reason = self._parse_response(response, require_visible=False)
-        except (TypeError, ValueError, SaturnusError) as exc:
+        except (TypeError, ValueError, ValidationError) as exc:
             raise CompactionError("Invalid history summary response.", reason="summary_response") from exc
         await self.events.emit(
             "model.finished", **fields, finish_reason=reason, response=response,

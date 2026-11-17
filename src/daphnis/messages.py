@@ -7,13 +7,17 @@ from ._json import validate_json
 from .errors import ValidationError
 
 
-def validate_message(message: dict[str, Any], *, path: str = "message") -> None:
+def validate_message(
+    message: dict[str, Any], *, path: str = "message", require_role: bool = True
+) -> None:
     """Validate the basic structure without restricting extension fields."""
     if not isinstance(message, dict):
         raise ValidationError(f"{path} must be an object.")
 
     role = message.get("role")
-    if not isinstance(role, str) or not role.strip():
+    if (require_role or "role" in message) and (
+        not isinstance(role, str) or not role.strip()
+    ):
         raise ValidationError(f"{path}.role must be a non-empty string.")
 
     content = message.get("content")
