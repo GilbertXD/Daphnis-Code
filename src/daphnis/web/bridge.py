@@ -234,6 +234,7 @@ class Bridge:
             "history_error": history_error,
             "all_tools": ops.all_tools,
             "effective_tools": ops.effective_tools(session),
+            "skills": [asdict(skill) for skill in ops.list_skills(session)],
         })
         state["mcp_error"] = mcp_error
         state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers()

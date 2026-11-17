@@ -216,6 +216,17 @@ export type LoadAttachment = (
   sessionId: string, messageIndex: number, attachmentId: string, signal: AbortSignal,
 ) => Promise<Blob>
 
+export type SkillScope = 'global' | 'project'
+export type SkillState = 'disabled' | 'always' | 'on_demand'
+export type Skill = {
+  id: string
+  scope: SkillScope
+  name: string
+  description: string
+  state: SkillState
+  error: string | null
+}
+
 type State = {
   session: Session
   sessions: Session[]
@@ -225,6 +236,7 @@ type State = {
   mcp_error: string | null
   mcp_prompt_servers: string[]
   mcp_resource_servers: string[]
+  skills: Skill[]
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
@@ -243,7 +255,7 @@ type State = {
 
 type SharedState = Pick<State,
   'session' | 'sessions' | 'projects' | 'projects_error' | 'mcp_servers' | 'mcp_error' | 'mcp_prompt_servers'
-  | 'mcp_resource_servers' | 'history_issues' | 'history_error' | 'all_tools' | 'effective_tools'
+  | 'mcp_resource_servers' | 'history_issues' | 'history_error' | 'all_tools' | 'effective_tools' | 'skills'
 >
 
 type Frame = {

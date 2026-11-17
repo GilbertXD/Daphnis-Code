@@ -58,6 +58,9 @@ _FIELDS = {
     "thinking": {"mode": (str, type(None))},
     "system": {"prompt": (str, type(None))},
     "tools": {"names": list},
+    "skill_import": {"source": str, "scope": str},
+    "skill_set_state": {"skill_id": str, "state": str},
+    "skill_remove": {"skill_id": str},
     "mcp_save": {"name": str, "enabled": bool, "options": dict, "create": bool},
     "mcp_enable": {"name": str, "enabled": bool},
     "mcp_restart": {"name": str},
@@ -86,7 +89,10 @@ _PROMPT_ACTIONS = {"mcp_list_prompts", "mcp_get_prompt"}
 _SESSION_SWITCHES = {"new", "project_open", "restore"}
 _SESSION_EDITS = {"rename", "move", "delete"}
 _SESSION_SETTINGS = {"model", "thinking", "system", "tools", "set_approval_mode", "confirm_full"}
-_SHARED_EDITS = {"project_create", "project_remove", "mcp_save", "mcp_enable", "mcp_restart", "mcp_delete", "mcp_add_registry"}
+_SHARED_EDITS = {
+    "project_create", "project_remove", "mcp_save", "mcp_enable", "mcp_restart", "mcp_delete", "mcp_add_registry",
+    "skill_import", "skill_set_state", "skill_remove",
+}
 
 
 class RequestError(ValueError):
@@ -390,6 +396,15 @@ async def _execute(bridge, action, session, args, discovery):
                 await ops.set_system_prompt(args["prompt"], session_id=session)
         case "tools":
             await ops.set_tools(args["names"], session_id=session)
+        case "skill_import":
+            try:
+                await ops.import_skill(args["source"], args["scope"], session_id=session)
+            except FileNotFoundError as exc:
+                raise RequestError("Skill 来源目录不存在。") from exc
+        case "skill_set_state":
+            await ops.set_skill_state(args["skill_id"], args["state"], session_id=session)
+        case "skill_remove":
+            await ops.remove_skill(args["skill_id"], session_id=session)
         case "mcp_save" | "mcp_enable":
             return await ops.save_mcp(**args), None
         case "mcp_restart":

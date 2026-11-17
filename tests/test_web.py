@@ -241,6 +241,41 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("model.request", names)
         self.assertNotIn("model.response_error", names)
 
+    def test_skills_management_shares_global_and_scopes_project_state(self):
+        session = self.snapshot()["session_id"]
+        source = self.workspace / "review"
+        source.mkdir()
+        (source / "SKILL.md").write_text("---\nname: review\ndescription: Review changes\n---\nPRIVATE BODY\n")
+        other = self.workspace.parent / "other"
+        other.mkdir()
+        self.command("project_create", session, name="Other workspace", workspace=str(other))
+        project = self.snapshot(session)["state"]["projects"][0]["id"]
+        other_session = self.command("project_open", session, project_id=project)["session_id"]
+
+        with self.socket(other_session) as socket:
+            socket.send_text(ACCESS)
+            self.assertEqual(socket.receive_json()["state"]["skills"], [])
+            self.command("skill_import", session, source="review", scope="global")
+            update = socket.receive_json()
+            skills = (update.get("state") or update["shared"])["skills"]
+            self.assertEqual(skills, [{
+                "id": "global:review", "name": "review", "description": "Review changes",
+                "scope": "global", "state": "disabled", "error": None,
+            }])
+
+        self.command("skill_import", session, source="review", scope="project")
+        self.command("skill_import", session, source="review", scope="project", expected=409)
+        self.command("skill_set_state", session, skill_id="project:review", state="always")
+        self.command("skill_set_state", session, skill_id="global:review", state="on_demand")
+        self.assertEqual(
+            [(item["id"], item["state"]) for item in self.snapshot(session)["state"]["skills"]],
+            [("global:review", "on_demand"), ("project:review", "always")],
+        )
+        self.assertEqual([item["id"] for item in self.snapshot(other_session)["state"]["skills"]], ["global:review"])
+        self.command("skill_remove", session, skill_id="project:review")
+        self.assertEqual([item["id"] for item in self.snapshot(session)["state"]["skills"]], ["global:review"])
+        self.assertTrue((source / "SKILL.md").is_file())
+
     def test_websocket_preserves_http_observation_event_payloads(self):
         session = self.snapshot()["session_id"]
         turn = "test-http-events"

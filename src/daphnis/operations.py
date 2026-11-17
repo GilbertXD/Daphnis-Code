@@ -29,6 +29,7 @@ from .models import ModelInfo, list_models
 from .project import Project
 from .prompt_groups import PromptGroup, PromptInput
 from .session import Session
+from .skills import SkillInfo, SkillScope, SkillState
 from .tools import ApprovalDecision, ApprovalMode
 from .turn_state import RecoveryAction, RecoveryKind, RecoveryState
 
@@ -225,6 +226,26 @@ class Operations:
         app._validate_tools(self.model(session_id), selected, retained=runtime.session.enabled_tools)
         updated = replace(runtime.session, enabled_tools=selected)
         await app._update_session(runtime, updated)
+
+    def list_skills(self, session_id: str) -> tuple[SkillInfo, ...]:
+        """List global and workspace Skills, including invalid or missing entries."""
+        workspace = self._runtime(session_id).session.workspace
+        return self._app._skills.list(Path(workspace))
+
+    async def import_skill(self, source: str | Path, scope: SkillScope | str, *, session_id: str) -> SkillInfo:
+        """Copy a local package into the selected scope with state disabled."""
+        workspace = Path(self._runtime(session_id).session.workspace)
+        return await finish_io(asyncio.to_thread(self._app._skills.import_skill, source, SkillScope(scope), workspace))
+
+    async def set_skill_state(self, skill_id: str, state: SkillState | str, *, session_id: str) -> SkillInfo:
+        """Set the user's Skill state for future Turns."""
+        workspace = Path(self._runtime(session_id).session.workspace)
+        return await finish_io(asyncio.to_thread(self._app._skills.set_state, skill_id, SkillState(state), workspace))
+
+    async def remove_skill(self, skill_id: str, *, session_id: str) -> None:
+        """Remove the managed copy and its state record in the selected scope."""
+        workspace = Path(self._runtime(session_id).session.workspace)
+        await finish_io(asyncio.to_thread(self._app._skills.remove, skill_id, workspace))
 
     async def connect_mcp(
         self,

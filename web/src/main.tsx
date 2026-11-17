@@ -9,6 +9,7 @@ import { MCPManager } from './mcp'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
 import type { Approval, Command, LoadAttachment, Model, Project, ResourceDraft, Session, View } from './protocol'
+import { SkillsManager } from './skills'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
 
@@ -382,7 +383,7 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
 }
 
 type SettingAction = 'model' | 'thinking' | 'approval'
-type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system' | SettingAction; sessionId: string }
+type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system' | 'skills' | SettingAction; sessionId: string }
   | { action: 'prompts'; sessionId: string }
   | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
@@ -717,6 +718,10 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
                 }}>
                 工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'}
               </button>
+              <button type="button" aria-haspopup="dialog" title="管理全局和当前工作区 Skills" onClick={() => {
+                setNotice('')
+                setModal({ action: 'skills', sessionId: id })
+              }}>Skills</button>
               <button type="button" aria-haspopup="dialog" title="管理 MCP 服务和资源" onClick={() => {
                 setNotice('')
                 setModal({ action: 'mcp' })
@@ -753,6 +758,11 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
     {modal?.action === 'tools' && <ToolsDialog key={id} view={view} close={() => setModal(null)}
       disabled={disabled || state.model.supports_tools !== true}
       notice={notice} apply={(names) => perform('tools', { names })} />}
+    {modal?.action === 'skills' && modal.sessionId === id &&
+      <Dialog title="Skills" close={() => setModal(null)} className="mcp-dialog">
+        <SkillsManager skills={state.skills} notice={notice} perform={perform}
+          disabled={!connected || busy || navigationDisabled || view.revision < (acknowledged[id] ?? 0)} />
+      </Dialog>}
     {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)} className="mcp-dialog">
       <MCPManager key={id} servers={state.mcp_servers} disabled={disabled} connected={connected} error={state.mcp_error}
         notice={notice} perform={perform} command={command}
