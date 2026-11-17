@@ -1,5 +1,6 @@
 import asyncio
 import difflib
+import errno
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import signal
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -259,6 +261,30 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(created.value, {"ok": True, "path": str(target), "bytes_written": 0})
             self.assertEqual(target.read_bytes(), b"")
 
+    async def test_list_directory_returns_the_sorted_prefix_before_truncating(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary).resolve()
+            (workspace / "z.txt").touch()
+            (workspace / "a-dir").mkdir()
+            (workspace / "b-link").symlink_to(workspace / "a-dir", target_is_directory=True)
+            scan = os.scandir
+
+            @contextmanager
+            def reverse_scan(fd):
+                with scan(fd) as entries:
+                    yield iter(sorted(entries, key=lambda entry: entry.name, reverse=True))
+
+            tools = bound(workspace)
+            with patch.object(files.os, "scandir", side_effect=reverse_scan):
+                limited = await tools.execute(call("list_directory", max_entries=2))
+                exact = await tools.execute(call("list_directory", max_entries=3))
+            self.assertEqual(limited.value["entries"], [
+                {"name": "a-dir", "type": "directory"}, {"name": "b-link", "type": "symlink"},
+            ])
+            self.assertTrue(limited.value["truncated"])
+            self.assertEqual(exact.value["entries"][-1], {"name": "z.txt", "type": "file"})
+            self.assertFalse(exact.value["truncated"])
+
     async def test_write_file_rejects_unsafe_paths_and_oversized_utf8(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -280,6 +306,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(path=path):
                     result = await tools.execute(call("write_file", path=path, content="text"))
                     self.assertEqual(result.value["error"]["code"], code)
+                    if path == "missing/new.txt":
+                        self.assertEqual(result.value["parent"], str(workspace / "missing"))
             result = await tools.execute(call(
                 "write_file", path="large.txt", content="中" * (MAX_FILE_BYTES // 3 + 1),
             ))
@@ -301,6 +329,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             with patch("daphnis.tools.files.os.fsync", side_effect=OSError("disk failure")):
                 result = await tools.execute(request)
             self.assertEqual(result.value["error"]["code"], "io_error")
+            self.assertFalse(result.value["partial"])
+            self.assertEqual(result.value["path"], str(target))
             self.assertEqual(list(parent.iterdir()), [])
 
             real_sync = os.fsync
@@ -330,6 +360,18 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.read_bytes(), b"concurrent file")
             self.assertEqual(list(parent.iterdir()), [target])
 
+            rmdir = os.rmdir
+
+            def fail_cleanup(*args, **kwargs):
+                rmdir(*args, **kwargs)
+                raise FileExistsError("injected cleanup error")
+
+            with patch.object(files.os, "rmdir", side_effect=fail_cleanup):
+                partial = await tools.execute(call("write_file", path="sub/published.txt", content="published"))
+            self.assertEqual(partial.value["error"]["code"], "io_error")
+            self.assertTrue(partial.value["partial"])
+            self.assertEqual((parent / "published.txt").read_text(), "published")
+
     async def test_replace_text_matches_exactly_once_and_preserves_file_on_error(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary).resolve()
@@ -342,10 +384,18 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(old=old):
                     result = await tools.execute(call("replace_text", path=target.name, old_text=old, new_text=""))
                     self.assertEqual(result.value["error"]["code"], error)
+                    self.assertEqual(result.value["path"], str(target))
+                    if error == "ambiguous_match":
+                        self.assertEqual(result.value["match_lines"], [2, 2])
                     self.assertEqual(target.read_bytes(), initial)
             oversized = await tools.execute(call("replace_text", path=target.name, old_text="你好",
                                                   new_text="中" * (MAX_FILE_BYTES // 3 + 1)))
             self.assertEqual(oversized.value["error"]["code"], "file_too_large")
+            self.assertEqual(target.read_bytes(), initial)
+            with patch.object(files.os, "replace", side_effect=OSError(errno.EBUSY, "busy")):
+                busy = await tools.execute(call("replace_text", path=target.name, old_text="你好", new_text=""))
+            self.assertEqual(busy.value["error"]["code"], "file_busy")
+            self.assertFalse(busy.value["partial"])
             self.assertEqual(target.read_bytes(), initial)
             result = await tools.execute(call("replace_text", path=target.name, old_text="你好\r\n", new_text=""))
             self.assertEqual(result.value, {"ok": True, "path": str(target), "bytes_written": 4})
@@ -477,6 +527,9 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             tools = bound(workspace, approval=approve)
             result = await tools.execute(call("apply_patch", patch=valid + invalid))
             self.assertEqual(result.value["error"]["code"], "patch_mismatch")
+            self.assertEqual((result.value["failed_path"], result.value["line"]), (str(b), 1))
+            self.assertEqual(result.value["applied_files"], [])
+            self.assertFalse(result.value["partial"])
             self.assertEqual(a.read_text(), "a\n")
 
             async def race(request):
@@ -505,6 +558,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result.value["ok"])
             self.assertTrue(result.value["partial"])
             self.assertEqual(result.value["applied_files"], [str(a)])
+            self.assertEqual(result.value["failed_path"], str(b))
             self.assertEqual(a.read_text(), "A\n")
             self.assertEqual(b.read_text(), "b\n")
             self.assertEqual(list(workspace.glob(".daphnis-*.tmp")), [])

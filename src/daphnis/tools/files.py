@@ -12,6 +12,9 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from hashlib import sha256
+from heapq import nsmallest
+from itertools import takewhile
+from operator import attrgetter
 from pathlib import Path
 from threading import Event
 from typing import Any, TextIO
@@ -274,18 +277,12 @@ def prepare_read(
 def prepare_list(arguments: dict[str, Any], workspace: Path) -> Operation:
     target = Target.capture(arguments.get("path", "."), workspace)
 
-    async def run():
+    def list_entries(cancelled: Event):
         limit = arguments.get("max_entries", 200)
         entries = []
         with target.open(directory=True) as fd, os.scandir(fd) as iterator:
-            for entry in iterator:
-                if len(entries) >= limit:
-                    return {
-                        "ok": True,
-                        "path": str(target.path),
-                        "entries": sorted(entries, key=lambda item: item["name"]),
-                        "truncated": True,
-                    }
+            selected = nsmallest(limit + 1, takewhile(lambda _: not cancelled.is_set(), iterator), key=attrgetter("name"))
+            for entry in selected[:limit]:
                 kind = (
                     "symlink"
                     if entry.is_symlink()
@@ -297,9 +294,16 @@ def prepare_list(arguments: dict[str, Any], workspace: Path) -> Operation:
         return {
             "ok": True,
             "path": str(target.path),
-            "entries": sorted(entries, key=lambda item: item["name"]),
-            "truncated": False,
+            "entries": entries,
+            "truncated": len(selected) > limit,
         }
+
+    async def run():
+        cancelled = Event()
+        try:
+            return await asyncio.to_thread(list_entries, cancelled)
+        finally:
+            cancelled.set()
 
     return Operation(
         path_decision(workspace, (target,)),
@@ -433,19 +437,20 @@ def _apply_text(original: str, patch: FilePatch) -> bytes:
         new_position = hunk.new_start - 1 if hunk.new_count else hunk.new_start
         if position < cursor or position > len(lines):
             raise ToolError(
-                "patch_mismatch", "Hunk position is outside the original file."
+                "patch_mismatch", "Hunk position is outside the original file.", hunk_start_line=hunk.old_start,
             )
         result.extend(lines[cursor:position])
         cursor = position
         if new_position != len(result):
             raise ToolError(
-                "patch_mismatch", "New hunk position does not match previous changes."
+                "patch_mismatch", "New hunk position does not match previous changes.", hunk_start_line=hunk.old_start,
             )
         for kind, text in hunk.lines:
             if kind in (" ", "-"):
                 if cursor >= len(lines) or lines[cursor] != text:
                     raise ToolError(
-                        "patch_mismatch", "Hunk original text does not match exactly."
+                        "patch_mismatch", "Hunk original text differs. Read the indicated line and regenerate the diff.",
+                        hunk_start_line=hunk.old_start, line=cursor + 1,
                     )
                 cursor += 1
             if kind in (" ", "+"):
@@ -562,10 +567,12 @@ def _workspace_file(value: str, workspace: Path) -> tuple[Target, Target, Target
             except FileNotFoundError:
                 identity = None
     except FileNotFoundError as exc:
-        raise ToolError("file_not_found", "The parent directory must already exist.") from exc
+        raise ToolError("file_not_found", "The parent directory must already exist.", path=str(path),
+                        parent=str(path.parent)) from exc
     except OSError as exc:
         if exc.errno in (errno.ENOTDIR, errno.ELOOP):
-            raise ToolError("invalid_path", "Parent components must be directories, without symlinks.") from exc
+            raise ToolError("invalid_path", "Parent components must be directories, without symlinks.",
+                            path=str(path)) from exc
         raise
     return Target(path, path, identity), parent, workspace_target
 
@@ -588,15 +595,10 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
                 raise FileExistsError(path)
             _write(target, "create", None, content, workspace=workspace_target,
                    parent=parent, created=None, applied=applied)
-        except FileExistsError as exc:
-            raise ToolError("file_exists", f"Creation will not overwrite: {path}") from exc
         except (OSError, ToolError) as exc:
-            if not applied:
-                raise
-            return failure(
-                exc.code if isinstance(exc, ToolError) else "io_error",
-                str(exc), partial=True, **details,
-            )
+            if isinstance(exc, FileExistsError) and not applied:
+                return failure("file_exists", f"Creation will not overwrite: {path}", path=str(path), partial=False)
+            return _edit_failure(exc, path, partial=bool(applied), **({"bytes_written": len(content)} if applied else {}))
         return {"ok": True, **details}
 
     async def run():
@@ -612,6 +614,23 @@ def prepare_write(arguments: dict[str, Any], workspace: Path) -> Operation:
         force_approval=True,
         allow_session_trust=False,
     )
+
+
+def _edit_failure(exc: OSError | ToolError, path: Path, *, partial: bool, **details: Any) -> dict[str, Any]:
+    message = str(exc)
+    if isinstance(exc, ToolError):
+        code = exc.code
+        details.update(exc.details)
+    elif isinstance(exc, PermissionError):
+        code = "permission_denied"
+    elif isinstance(exc, FileNotFoundError):
+        code = "file_not_found"
+    elif exc.errno in (errno.EBUSY, errno.ETXTBSY):
+        code = "file_busy"
+        message = "The file is busy. Check the current file and retry when it is available."
+    else:
+        code = "io_error"
+    return failure(code, message, **{**details, "path": str(path), "partial": partial})
 
 
 def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
@@ -630,9 +649,13 @@ def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
         text = decode_text(original, False)
         start = text.find(old)
         if start < 0:
-            raise ToolError("text_not_found", "old_text was not found. Read the file and use exact text.")
-        if text.find(old, start + 1) >= 0:
-            raise ToolError("ambiguous_match", "old_text matches more than once. Include surrounding text to make it unique.")
+            raise ToolError("text_not_found", "old_text was not found. Read the file and use exact text.", path=str(target.path))
+        second = text.find(old, start + 1)
+        if second >= 0:
+            raise ToolError(
+                "ambiguous_match", "old_text matches more than once. Include surrounding text to make it unique.",
+                path=str(target.path), match_lines=[len(text[:position + 1].splitlines()) for position in (start, second)],
+            )
         updated = (text[:start] + new + text[start + len(old):]).encode("utf-8")
         if len(updated) > MAX_FILE_BYTES:
             raise ToolError("file_too_large", "Updated file exceeds the 1 MiB limit.")
@@ -641,13 +664,7 @@ def prepare_replace(arguments: dict[str, Any], workspace: Path) -> Operation:
             _write(target, "modify", original, updated, workspace=workspace_target,
                    parent=parent, created=None, applied=applied)
         except (OSError, ToolError) as exc:
-            if not applied:
-                raise
-            return failure(
-                exc.code if isinstance(exc, ToolError) else "io_error",
-                str(exc), partial=True, path=str(target.path),
-                **(exc.details if isinstance(exc, ToolError) else {}),
-            )
+            return _edit_failure(exc, target.path, partial=bool(applied))
         return {"ok": True, "path": str(target.path), "bytes_written": len(updated)}
 
     async def run():
@@ -684,14 +701,18 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
         # Read/validate every hunk only after authorization and before any writes.
         updates = []
         for target, patch in zip(targets, patches, strict=True):
-            if patch.action == "create":
-                original, data = "", None
-            else:
-                data, truncated = read_bytes(target, MAX_FILE_BYTES)
-                if truncated:
-                    raise ToolError("file_too_large", "Patch target exceeds 1 MiB.")
-                original = decode_text(data, False)
-            updates.append((data, _apply_text(original, patch)))
+            try:
+                if patch.action == "create":
+                    original, data = "", None
+                else:
+                    data, truncated = read_bytes(target, MAX_FILE_BYTES)
+                    if truncated:
+                        raise ToolError("file_too_large", "Patch target exceeds 1 MiB.")
+                    original = decode_text(data, False)
+                updates.append((data, _apply_text(original, patch)))
+            except ToolError as exc:
+                return failure(exc.code, str(exc), failed_path=str(target.path), applied_files=[],
+                               created_directories=[], partial=False, **exc.details)
         applied: list[str] = []
         created: list[str] = []
         try:
@@ -708,6 +729,7 @@ def prepare_patch(arguments: dict[str, Any], workspace: Path) -> Operation:
                 if isinstance(exc, (FileExistsError, FileNotFoundError))
                 else "patch_failed",
                 str(exc),
+                failed_path=str(target.path),
                 applied_files=applied,
                 created_directories=created,
                 partial=bool(applied or created),
