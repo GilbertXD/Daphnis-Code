@@ -5,6 +5,7 @@ description = "Local coding agent with built-in model communication."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "google-re2>=1.1,<2",
     "httpx>=0.28.1",
     "httpx2>=2.16,<3",
     "jsonschema>=4.26.0",

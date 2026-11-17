@@ -3,6 +3,8 @@
 import codecs
 from collections.abc import Iterable, Iterator
 
+LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
 
 def decode_text(data: bytes, truncated: bool = False) -> str:
     if not truncated:

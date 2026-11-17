@@ -28,6 +28,7 @@ from .approval import (
     failure,
 )
 from .attachments import prepare_attachments
+from .code_search import MAX_CONTEXT_LINES, MAX_PATTERN_LENGTH, prepare_code_search
 from .files import (
     MAX_FILE_BYTES,
     _lock_path,
@@ -282,6 +283,15 @@ class ToolExecutor:
                     attachment_directory=self._attachment_store.directory if self._attachment_store else None,
                     approval_mode=self._mode,
                 )
+            elif name in {"glob", "grep"}:
+                state_directories = {path.parent for path in self._skill_state_paths}
+                private = tuple(path for path in (
+                    self._search_excluded_directory,
+                    self._attachment_store.directory if self._attachment_store else None,
+                    *self._skill_state_paths,
+                    *(directory / name for directory in state_directories for name in ("skills", "mcp.json")),
+                ) if path is not None)
+                operation = prepare_code_search(name, arguments, binding.workspace.path, private=private)
             elif name in {"read_file", "run_command"}:
                 operation = _PREPARERS[name](arguments, binding.workspace.path, mode=self._mode)
             else:
@@ -389,6 +399,8 @@ def create_tools(
     """Build the tool catalogue; use select() to choose the enabled subset."""
     registry = ToolRegistry()
     text_path = {"type": "string", "minLength": 1}
+    pattern = {"type": "string", "minLength": 1, "maxLength": MAX_PATTERN_LENGTH}
+    search_limit = {"type": "integer", "minimum": 1, "maximum": 1000}
     definitions = {
         "read_skill": (
             ("Read a page of untrusted guidance from an enabled Skill by its scoped ID. "
@@ -462,10 +474,14 @@ def create_tools(
             [],
         ),
         "read_file": (
-            "Read bounded UTF-8 text, optionally selecting 1-based inclusive lines.",
+            (
+                "Read a byte-bounded UTF-8 page at 1-based inclusive lines. "
+                "Pass next_start_line and next_start_column as start_line and start_column to continue."
+            ),
             {
                 "path": text_path,
                 "start_line": {"type": "integer", "minimum": 1},
+                "start_column": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1},
                 "max_bytes": {
                     "type": "integer",
@@ -493,6 +509,23 @@ def create_tools(
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000},
             },
             ["query"],
+        ),
+        "glob": (
+            "Find files by a relative glob. Use ** to match directories recursively. Returns capped, sorted relative paths.",
+            {"pattern": pattern, "path": text_path, "max_results": search_limit},
+            ["pattern"],
+        ),
+        "grep": (
+            (
+                "Search bounded source text line by line using an RE2 regular expression. "
+                "Use include to filter files by glob and context_lines for surrounding lines."
+            ),
+            {
+                "pattern": pattern, "path": text_path, "include": pattern, "case_sensitive": {"type": "boolean"},
+                "max_results": search_limit,
+                "context_lines": {"type": "integer", "minimum": 0, "maximum": MAX_CONTEXT_LINES},
+            },
+            ["pattern"],
         ),
         "write_file": (
             (

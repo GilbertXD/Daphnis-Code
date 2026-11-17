@@ -8,15 +8,17 @@ import re
 import stat
 import sys
 import unicodedata
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from threading import Event
+from typing import Any, TextIO
 from uuid import uuid4
 
 from ..history import finish_io
-from ..text import decode_text, line_range
+from ..text import LINE_BREAKS, decode_text
 from .approval import (
     ApprovalMode,
     Decision,
@@ -151,6 +153,73 @@ def read_bytes(target: Target, limit: int, *, mode: ApprovalMode = ApprovalMode.
         return bytes(data[:limit]), len(data) > limit
 
 
+def _line_fragments(source: TextIO, cancelled: Event) -> Iterator[tuple[str, bool]]:
+    pending_cr = ""
+    while not cancelled.is_set():
+        block = source.read(65536)
+        if not block:
+            if pending_cr:
+                yield pending_cr, True
+            return
+        block = pending_cr + block
+        pending_cr = "\r" if block.endswith("\r") else ""
+        if pending_cr:
+            block = block[:-1]
+        for fragment in block.splitlines(keepends=True):
+            yield fragment, fragment[-1] in LINE_BREAKS
+
+
+def _read_page(source: TextIO, arguments: dict[str, Any], cancelled: Event) -> dict[str, Any]:
+    start = arguments.get("start_line", 1)
+    start_column = arguments.get("start_column", 1)
+    end = arguments.get("end_line")
+    budget = arguments.get("max_bytes", 65536)
+    content: list[str] = []
+    line = column = 1
+    last_line = next_line = next_column = None
+    scanned = 0
+    for fragment, complete in _line_fragments(source, cancelled):
+        length = len(fragment)
+        encoded = fragment.encode("utf-8")
+        scanned += len(encoded)
+        if line >= start:
+            offset = max(0, start_column - column) if line == start else 0
+            if offset < length:
+                if offset:
+                    fragment = fragment[offset:]
+                    encoded = fragment.encode("utf-8")
+                if len(encoded) > budget:
+                    prefix = decode_text(encoded[:budget], truncated=True)
+                    if not content and not prefix:
+                        raise ToolError(
+                            "byte_limit_too_small", "Increase max_bytes to fit the next UTF-8 character.",
+                            minimum_bytes=len(fragment[0].encode("utf-8")),
+                        )
+                    if prefix:
+                        content.append(prefix)
+                        last_line = line
+                    next_line, next_column = line, column + offset + len(prefix)
+                    break
+                content.append(fragment)
+                last_line = line
+                budget -= len(encoded)
+            elif complete:
+                raise ToolError("invalid_range", "start_column is outside start_line.")
+        if complete:
+            if line == end:
+                break
+            line, column = line + 1, 1
+        else:
+            column += length
+    if start_column > 1 and last_line is None and not cancelled.is_set():
+        raise ToolError("invalid_range", "start_column is outside start_line.")
+    return {
+        "content": "".join(content), "start_line": start, "start_column": start_column,
+        "end_line": last_line, "truncated": next_line is not None,
+        "next_start_line": next_line, "next_start_column": next_column, "scanned_bytes": scanned,
+    }
+
+
 def prepare_read(
     arguments: dict[str, Any], workspace: Path, *, mode: ApprovalMode = ApprovalMode.AUTO,
 ) -> Operation:
@@ -161,31 +230,36 @@ def prepare_read(
         mode is not ApprovalMode.FULL and decision is Decision.ASK
     )
     parent = Target.capture(target.path.parent, workspace)
+    end = arguments.get("end_line")
+    if end is not None and end < arguments.get("start_line", 1):
+        raise ToolError("invalid_range", "end_line must be at least start_line.")
 
-    def read():
+    def read(cancelled: Event):
         if parent.identity is not None:
             verify_directory(parent.path, parent.identity)
         current = target if pin_version else _current_target(target)
-        data, truncated = read_bytes(current, arguments.get("max_bytes", 65536), mode=mode)
-        lines = decode_text(data, truncated).splitlines(keepends=True)
-        start = arguments.get("start_line", 1)
-        end = arguments.get("end_line")
-        if end is not None and end < start:
-            raise ToolError("invalid_range", "end_line must be at least start_line.")
-        selected = line_range(lines, start, end)
-        return {
-            "ok": True,
-            "path": str(target.path),
-            "content": "".join(selected),
-            "start_line": start,
-            "end_line": start + len(selected) - 1 if selected else None,
-            "truncated": truncated,
-            "scanned_bytes": len(data),
-        }
+        require_readable_path(current, mode=mode)
+        with current.open() as fd:
+            before = os.fstat(fd)
+            if before.st_nlink > 1:
+                raise ToolError("sensitive_path", "Files with multiple hard links cannot be read.")
+            with open(fd, encoding="utf-8", newline="", closefd=False) as source:
+                page = _read_page(source, arguments, cancelled)
+            if signature(os.fstat(fd)) != signature(before):
+                raise ToolError("target_changed", "File changed while reading.")
+            current.verify()
+        return {"ok": True, "path": str(target.path), **page}
 
     async def run():
         async with _file_locks((target.path,), shared=True):
-            return await finish_io(asyncio.to_thread(read))
+            cancelled = Event()
+            worker = asyncio.create_task(asyncio.to_thread(read, cancelled))
+            try:
+                return await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled.set()
+                await finish_io(asyncio.gather(worker, return_exceptions=True))
+                raise
 
     operation = Operation if pin_version else _PathOperation
     return operation(

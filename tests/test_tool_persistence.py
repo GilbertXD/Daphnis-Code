@@ -75,6 +75,36 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         ops.subscribe("tool.approval_requested", approve)
 
+    async def test_glob_and_grep_await_approval_and_commit_execution_before_searching(self):
+        (self.root / "calc.py").write_text("value = 42\n")
+        self.calls = [{
+            "id": name, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)},
+        } for name, arguments in (("glob", {"pattern": "*.py"}), ("grep", {"pattern": r"value\s*=\s*42"}))]
+        ops = self.application(interactive=True)
+        sid = ops.initial_session_id
+        ops.set_approval_mode("ask", session_id=sid)
+        await ops.set_tools(["glob", "grep"], session_id=sid)
+        approved = []
+        executed = []
+
+        async def approve(event):
+            approved.append(event.data["name"])
+            ops.resolve_approval(event.data["request_id"], "allow_once", session_id=sid)
+
+        def executing(event):
+            running = [item["tool_call_id"] for item in tool_results(self.saved(ops)) if item.get(TOOL_STATE) == RUNNING]
+            executed.append((event.data["name"], running))
+
+        ops.subscribe("tool.approval_requested", approve)
+        ops.subscribe("tool.executing", executing)
+        outcome = await asyncio.wait_for(ops.send("Find value", stream=False, session_id=sid), 3)
+        self.assertEqual(outcome.status, TurnStatus.COMPLETED, outcome.error)
+        self.assertEqual(approved, ["glob", "grep"])
+        self.assertEqual(executed, [("glob", ["glob"]), ("grep", ["grep"])])
+        paths, hits = [json.loads(item["content"]) for item in tool_results(self.saved(ops))]
+        self.assertEqual(paths["matches"], ["calc.py"])
+        self.assertEqual(hits["matches"][0]["line"], 1)
+
     async def test_complete_tool_results_can_continue_or_terminate(self):
         await self.check_complete_tool_recovery(grouped=False)
 

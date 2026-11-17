@@ -1,8 +1,16 @@
 # 工具、审批与 MCP
 
-内置工具包括 `read_file`、`list_directory`、`search`、`write_file`、`replace_text`、`apply_patch` 和 `run_command`。启用工具后，只有能力明确支持工具调用的模型可以使用它们，实际执行仍受审批规则约束。
+内置工具包括 `read_file`、`list_directory`、`search`、`glob`、`grep`、`write_file`、`replace_text`、`apply_patch` 和 `run_command`。启用工具后，只有能力明确支持工具调用的模型可以使用它们，实际执行仍受审批规则约束。
 
 工作区的 `search` 跳过 Daphnis 会话存储目录。对话记录可通过受限的[历史回查工具](context_compaction.md#历史回查)访问。
+
+## 读取与检索源码
+
+- `read_file(path, start_line, end_line, max_bytes, start_column)` 使用从 1 开始的行号，包含 `end_line`。`max_bytes` 默认 64 KiB，约束正文的 UTF-8 字节数。截断后将 `next_start_line`、`next_start_column` 分别作为下一次的起始行和起始字符位置。空文件或起始行超出文件时返回空正文和 `end_line: null`。
+- `glob(pattern, path, max_results)` 返回排序后的相对路径数组 `matches`。`*.py` 只匹配搜索根内的文件，`**/*.py` 也匹配子目录。`path` 默认当前工作区，`max_results` 默认 100，最大 1000。
+- `grep(pattern, path, include, case_sensitive, max_results, context_lines)` 返回 `matches`，每项包含相对路径、行号、首个匹配的起始列和有界文本。可返回最多三行前后文。`include` 无斜杠时按文件名过滤，包含斜杠时按相对路径过滤。正则使用 RE2 语法，默认区分大小写。[RE2 语法](https://github.com/google/re2/wiki/Syntax)
+
+`glob` 和 `grep` 都报告 `truncated`、扫描计数及跳过计数。每次最多检查 10,000 个目录项和约 64 KiB 的匹配结果。`grep` 另外限制为 1,000 个文件、每文件 1 MiB、总计 8 MiB。两个工具跳过符号链接、受保护的凭据、会话和附件存储，以及 Daphnis 的 Skills 目录和状态文件。使用 `read_skill` 读取当前 Turn 启用的 Skill。
 
 ## 文本附件
 
