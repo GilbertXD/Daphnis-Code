@@ -11,6 +11,7 @@ dependencies = [
     "mcp>=2,<3",
     "pillow>=12.3,<14",
     "python-dotenv>=1.2.4",
+    "pyyaml>=6.0.3,<7",
     "uritemplate>=4.2,<5",
 ]
 
