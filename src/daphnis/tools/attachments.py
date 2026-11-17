@@ -24,14 +24,14 @@ async def _read(store: AttachmentStore, session: Session, item: TextAttachment) 
         raise ToolError("attachment_unavailable", "The attachment snapshot is missing or invalid.") from None
 
 
-def _page(item: TextAttachment, text: str, args: dict) -> dict:
+def page_text(text: str, args: dict, fields: dict, *, resource: str) -> dict:
     rows = text.split("\n")
     line = args.get("start_line", 1)
     column = args.get("start_column", 1)
     end = min(args.get("end_line", len(rows)), len(rows))
     if line > end or column > len(rows[line - 1]) + 1:
-        raise ToolError("invalid_range", "Requested attachment range is outside the file.")
-    result = {"ok": True, "notice": _NOTICE, "id": item.id, "name": item.model_name, "total_lines": item.lines,
+        raise ToolError("invalid_range", f"Requested {resource} range is outside the file.")
+    result = {"ok": True, **fields, "total_lines": len(rows),
               "lines": [], "next_line": None, "next_column": None}
     remaining = _LIMIT - _wire_size(result) - 32
     for number, value in enumerate(line_range(rows, line, end), line):
@@ -75,7 +75,9 @@ def prepare_attachments(name: str, args: dict, session: Session, store: Attachme
     async def run():
         if name == "read_attachment":
             item = files[args["id"]]
-            return _page(item, await _read(store, session, item), args)
+            return page_text(await _read(store, session, item), args, {
+                "notice": _NOTICE, "id": item.id, "name": item.model_name,
+            }, resource="attachment")
         hits = []
         result = {"ok": True, "notice": _NOTICE, "matches": hits, "truncated": False}
         query = args["query"]

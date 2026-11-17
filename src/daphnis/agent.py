@@ -37,6 +37,7 @@ from .context import (
     attachment_note,
     history_range_hint,
     materialize_images,
+    project_skill_results,
     projected_image_bytes,
 )
 from .errors import (
@@ -483,7 +484,8 @@ class Agent:
             document_metadata=any(batch.documents for batch in session.attachment_refs.values()),
         )
         notes = {index: attachment_note(batch) for index, batch in session.attachment_refs.items()}
-        raw = annotate_attachments(session.messages.snapshot(), {
+        history = project_skill_results(session.messages.snapshot())
+        raw = annotate_attachments(history.copy(), {
             index: attachment_note(batch, include_images=True, include_documents=True) for index, batch in session.attachment_refs.items()
         })
         fields = {"session_id": session.id, "turn_id": operation_id, "trigger": "manual"}
@@ -493,7 +495,7 @@ class Agent:
             raise ValueError("工具交换尚未完成。请先选择继续或终止。")
         previous = session.compaction
         tail_budget, attachment_inputs = self._attachment_tail_budget(raw, previous, session.attachment_refs, model)
-        cut_source = annotate_attachments(session.messages.snapshot(), notes) if tail_budget else raw
+        cut_source = annotate_attachments(history, notes) if tail_budget else raw
         through = compactor.cut(
             cut_source, previous, prompt_groups=session.prompt_groups,
             tail_budget=tail_budget, keep_latest_input_for=attachment_inputs,
@@ -655,7 +657,7 @@ class Agent:
         error = None
         failure_reason = None
         try:
-            raw = (annotate_attachments(history.snapshot(), {
+            raw = (annotate_attachments(project_skill_results(history.snapshot()), {
                        index: attachment_note(batch, include_images=True, include_documents=True)
                        for index, batch in (attachment_refs or {}).items()
                    })
@@ -691,7 +693,7 @@ class Agent:
                     if history_lookup:
                         available -= compactor.counter.count(history_range_hint(len(raw)))
                 tail_budget, attachment_inputs = self._attachment_tail_budget(raw, checkpoint, attachment_refs or {}, model)
-                cut_source = annotate_attachments(history.snapshot(), attachment_notes) if tail_budget else raw
+                cut_source = annotate_attachments(project_skill_results(history.snapshot()), attachment_notes) if tail_budget else raw
                 through = compactor.cut(
                     cut_source, checkpoint, within_turn=True, available_tokens=available, prompt_groups=prompt_groups,
                     tail_budget=tail_budget, keep_latest_input_for=attachment_inputs,
@@ -840,7 +842,7 @@ class Agent:
             interrupted = interrupted_tool_group(committed)
             tools = None if recovery_action is RecoveryAction.TERMINATE else self.tools
             if isinstance(tools, ToolExecutor):
-                tools = tools.bind(session=session, events=self.events, turn_id=turn_id)
+                tools = tools.bind(session=session, events=self.events, turn_id=turn_id, skills=self.context.skills)
             definitions = tools.definitions() if tools is not None else []
             if definitions:
                 require_tools(model)
@@ -1064,6 +1066,16 @@ class Agent:
             await _checkpoint()
             pending = []
             body = None
+            if self.context.skill_prompt:
+                body = request_options()
+                budget = self._request_budget(self.context.build(Messages()), body, model)
+                if not budget.fits:
+                    raise CompactionError(
+                        f"Skill 目录、固定正文、系统提示及工具定义超出上下文安全上限（输入 {budget.input_tokens:,}"
+                        f" + 输出预留 {budget.output_reserve:,} > {budget.hard_limit:,} Token）。"
+                        "请在 Skills 中关闭部分固定加载项，或降低 output_limit。",
+                        reason="skill_context_limit",
+                    )
             if recovery_action is None:
                 if committed and len(committed) not in safe_boundaries(committed, session.prompt_groups):
                     raise ValueError("Cannot append to an incomplete tool exchange.")
@@ -1215,10 +1227,11 @@ class Agent:
                 if not budget.fits:
                     if maintenance_limited:
                         break
+                    skill_hint = "也可在 Skills 中关闭部分固定加载项。" if self.context.skill_prompt else ""
                     raise CompactionError(
                         f"请求超过上下文安全上限（输入 {budget.input_tokens:,} + 输出预留 "
                         f"{budget.output_reserve:,} > {budget.hard_limit:,} Token）。"
-                        "请缩短输入或降低 output_limit。",
+                        f"请缩短输入或降低 output_limit。{skill_hint}",
                         reason="context_safety_limit",
                     )
                 while True:

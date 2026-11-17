@@ -49,6 +49,7 @@ from .prompt_groups import PromptInput
 from .redaction import Redactor
 from .session import Session
 from .session_runtime import SessionRuntime
+from .skills import SkillStore
 from .title import build_title_source, fallback_title, normalize_title
 from .token_budget import TokenBudget
 from .tools import (
@@ -110,6 +111,7 @@ class Application:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
+        self._skills = SkillStore(self._history.directory.parent)
         self._mcp_store = MCPStore(self._history.directory.parent / "mcp.json")
         self._interactive = interactive
         self._request_limits = {
@@ -151,6 +153,7 @@ class Application:
     def _add_runtime(self, session: Session) -> SessionRuntime:
         if session.id in self._runtimes:
             raise ValueError("会话已加载。")
+        self._skills.load_workspace(Path(session.workspace))
         runtime = SessionRuntime(session)
         self._runtimes[session.id] = runtime
         return runtime
@@ -298,7 +301,7 @@ class Application:
         return tuple(
             name
             for item in self._tools.definitions()
-            if not (name := item["function"]["name"]).startswith(offline)
+            if (name := item["function"]["name"]) != "read_skill" and not name.startswith(offline)
         )
 
     async def _mcp_error(self, name: str, error: str) -> None:
@@ -334,6 +337,7 @@ class Application:
             redactor=self._history_redactor,
             search_excluded_directory=self._history.directory,
             attachment_store=self._history.attachments,
+            skill_state_paths=(self._skills.state_path, self._skills.lock_path),
             connections=(
                 server
                 for server in self._mcp.values()
@@ -521,6 +525,11 @@ class Application:
         thinking = session.thinking
         available = set(self._all_tools)
         enabled_tools = [name for name in session.enabled_tools if name in available]
+        skills = None if recovery_action is RecoveryAction.TERMINATE else self._skills.snapshot(Path(session.workspace))
+        if skills and skills.enabled and model.supports_tools is True:
+            enabled_tools.append("read_skill")
+        recovery = session.recovery if recovery_action is not None else None
+        skill_result_start = recovery.message_index if recovery else len(session.messages)
         provider = session.provider
         custom_compatibility = (
             self._connection(provider).get("compatibility") is not None
@@ -532,7 +541,7 @@ class Application:
             custom_compatibility=custom_compatibility,
             tools=self._tools.select(enabled_tools, mode=runtime.approval_mode),
             events=self.events,
-            context=Context(system_prompt=session.effective_system_prompt),
+            context=Context(system_prompt=session.effective_system_prompt, skills=skills, skill_result_start=skill_result_start),
             compaction_settings=self._model_compaction_settings.get(
                 (provider, session.model_id), self._compaction_settings,
             ),

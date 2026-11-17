@@ -2,7 +2,7 @@
 
 import json
 from base64 import b64encode
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .attachments import (
     AttachmentBatch,
@@ -19,6 +19,9 @@ from .turn_state import (
     project_terminated_turns,
     project_turn_messages,
 )
+
+if TYPE_CHECKING:
+    from .skills import SkillSnapshot
 
 IMAGE_REFS = "_daphnis_image_refs"
 DOCUMENT_REFS = "_daphnis_document_refs"
@@ -129,11 +132,56 @@ def history_range_hint(through: int) -> str:
     )
 
 
+def project_skill_results(
+    messages: list[dict[str, Any]], *, skills: "SkillSnapshot | None" = None, since: int | None = None,
+) -> list[dict[str, Any]]:
+    """Keep exchanges complete while scoping raw Skill pages to the active Turn."""
+    hidden = set()
+    for index, message in enumerate(messages):
+        if message["role"] == "tool":
+            if isinstance(call_id := message.get("tool_call_id"), str) and call_id in hidden:
+                messages[index] = {
+                    **message, "content": "Skill guidance unavailable in this Turn. Read the enabled Skill again if needed.",
+                }
+            continue
+        hidden.clear()
+        calls = message.get("tool_calls")
+        if message["role"] != "assistant" or not isinstance(calls, list):
+            continue
+        for call in calls:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict) or function.get("name") != "read_skill":
+                continue
+            arguments = function.get("arguments")
+            if skills is not None and since is not None and index >= since and isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                    if (
+                        isinstance(arguments, dict) and isinstance(skill_id := arguments.get("skill_id"), str)
+                        and skills.contains(skill_id)
+                    ):
+                        continue
+                except (ValueError, RecursionError):
+                    pass
+            if isinstance(call_id := call.get("id"), str):
+                hidden.add(call_id)
+    return messages
+
+
 class Context:
-    def __init__(self, *, system_prompt: str | None = None) -> None:
+    def __init__(
+        self, *, system_prompt: str | None = None, skills: "SkillSnapshot | None" = None,
+        skill_result_start: int | None = None,
+    ) -> None:
         if system_prompt is not None and not isinstance(system_prompt, str):
             raise TypeError("system_prompt must be a string or None.")
         self.system_prompt = system_prompt
+        self.skills = skills
+        self.skill_result_start = skill_result_start
+
+    @property
+    def skill_prompt(self) -> str:
+        return self.skills.instructions if self.skills else ""
 
     def build(
         self, working_messages: Messages, checkpoint: CompactionCheckpoint | None = None,
@@ -146,6 +194,7 @@ class Context:
         messages = working_messages.snapshot()
         if messages and len(messages) not in safe_boundaries(messages, prompt_groups):
             raise ValueError("Cannot request a model with an incomplete tool exchange.")
+        project_skill_results(messages, skills=self.skills, since=self.skill_result_start)
         messages = annotate_attachments(messages, attachment_notes)
         for index, images in active_images(messages, attachment_refs or {}, checkpoint.through if checkpoint else 0).items():
             messages[index] = {**messages[index], IMAGE_REFS: images}
@@ -159,6 +208,8 @@ class Context:
             prompt = f"{prompt}\n\n{SUMMARY_POLICY}" if prompt is not None else SUMMARY_POLICY
             if history_lookup:
                 prompt += "\n\n" + history_range_hint(checkpoint.through)
+        if self.skill_prompt:
+            prompt = f"{prompt}\n\n{self.skill_prompt}" if prompt else self.skill_prompt
         if prompt is not None:
             messages.insert(0, {"role": "system", "content": prompt})
         return project_turn_messages(messages if prompt_groups else project_terminated_turns(messages))

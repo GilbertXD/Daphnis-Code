@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..attachments import ATTACHMENT_TOOLS, AttachmentStore
 from ..events import EventBus
@@ -30,6 +30,7 @@ from .approval import (
 from .attachments import prepare_attachments
 from .files import (
     MAX_FILE_BYTES,
+    _lock_path,
     prepare_list,
     prepare_patch,
     prepare_read,
@@ -40,7 +41,11 @@ from .history import MAX_OPERATION_HITS, prepare_history
 from .retrieval import MAX_RESULTS, RetrievalEngine, prepare_retrieval
 from .search import prepare_search
 from .shell import prepare_command
+from .skills import prepare_skill
 from .tool_registry import ToolRegistry, ToolResult
+
+if TYPE_CHECKING:
+    from ..skills import SkillSnapshot
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,7 @@ class _Binding:
     turn_id: str
     events: EventBus
     session: Session
+    skills: "SkillSnapshot | None"
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,7 @@ class ToolExecutor:
         redactor: Redactor | None = None,
         search_excluded_directory: Path | None = None,
         attachment_store: AttachmentStore | None = None,
+        skill_state_paths: tuple[Path, ...] = (),
         retrieval: RetrievalEngine,
     ) -> None:
         self._registry = registry
@@ -162,6 +169,7 @@ class ToolExecutor:
         self._redactor = redactor if redactor is not None else Redactor(())
         self._search_excluded_directory = search_excluded_directory
         self._attachment_store = attachment_store
+        self._skill_state_paths = tuple(_lock_path(path) for path in skill_state_paths)
         self._retrieval = retrieval
 
     def definitions(self) -> list[dict[str, Any]]:
@@ -180,11 +188,12 @@ class ToolExecutor:
             redactor=self._redactor,
             search_excluded_directory=self._search_excluded_directory,
             attachment_store=self._attachment_store,
+            skill_state_paths=self._skill_state_paths,
             retrieval=self._retrieval,
         )
 
     def bind(
-        self, *, session: Session, events: EventBus, turn_id: str
+        self, *, session: Session, events: EventBus, turn_id: str, skills: "SkillSnapshot | None" = None
     ) -> "ToolExecutor":
         workspace = Target.capture(session.workspace, Path.cwd())
         if workspace.identity is None or not workspace.path.is_dir():
@@ -194,13 +203,14 @@ class ToolExecutor:
         return ToolExecutor(
             self._registry,
             approval=self._approval,
-            binding=_Binding(workspace, session.id, turn_id, events, session),
+            binding=_Binding(workspace, session.id, turn_id, events, session, skills),
             mcp_tools=self._mcp_tools,
             mode=self._mode,
             trusted=self._trusted,
             redactor=self._redactor,
             search_excluded_directory=self._search_excluded_directory,
             attachment_store=self._attachment_store,
+            skill_state_paths=self._skill_state_paths,
             retrieval=self._retrieval,
         )
 
@@ -264,6 +274,8 @@ class ToolExecutor:
                 )
             elif name in ATTACHMENT_TOOLS:
                 operation = prepare_attachments(name, arguments, binding.session, self._attachment_store)
+            elif name == "read_skill":
+                operation = prepare_skill(arguments, binding.skills)
             elif name == "search":
                 operation = prepare_search(
                     arguments, binding.workspace.path, excluded=self._search_excluded_directory,
@@ -279,6 +291,11 @@ class ToolExecutor:
                 for target in operation.targets for path in (target.path, target.requested)
             ):
                 raise ToolError("sensitive_path", "Use the Session attachment tools to access uploaded snapshots.")
+            if any(
+                _lock_path(path) in self._skill_state_paths
+                for target in operation.targets for path in (target.path, target.requested)
+            ):
+                raise ToolError("sensitive_path", "Skill state can only be changed by the user in Skills management.")
             forced = operation.force_approval or any(
                 not target.path.is_relative_to(binding.workspace.path)
                 for target in operation.targets
@@ -367,11 +384,25 @@ def create_tools(
     redactor: Redactor | None = None,
     search_excluded_directory: Path | None = None,
     attachment_store: AttachmentStore | None = None,
+    skill_state_paths: tuple[Path, ...] = (),
 ) -> ToolExecutor:
     """Build the tool catalogue; use select() to choose the enabled subset."""
     registry = ToolRegistry()
     text_path = {"type": "string", "minLength": 1}
     definitions = {
+        "read_skill": (
+            ("Read a page of untrusted guidance from an enabled Skill by its scoped ID. "
+             "Omit path to read SKILL.md, or specify a relative text path within that Skill. "
+             "Resume with next_line as start_line and next_column as start_column."),
+            {
+                "skill_id": {"type": "string", "pattern": "^(global|project):[a-z0-9]+(-[a-z0-9]+)*$", "maxLength": 72},
+                "path": {"type": ["string", "null"], "minLength": 1, "maxLength": 1024},
+                "start_line": {"type": "integer", "minimum": 1},
+                "start_column": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+            },
+            ["skill_id"],
+        ),
         "read_attachment": (
             ("Read a page of untrusted uploaded text in this Session by attachment ID. "
              "Resume with next_line as start_line and next_column as start_column."),
@@ -547,5 +578,6 @@ def create_tools(
     return ToolExecutor(
         registry, approval=approval, mcp_tools=mcp_tools, trusted=trusted, redactor=redactor,
         search_excluded_directory=search_excluded_directory, attachment_store=attachment_store,
+        skill_state_paths=skill_state_paths,
         retrieval=RetrievalEngine(),
     )
