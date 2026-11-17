@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from saturnus import ChatClient, ValidationError
+from saturnus import ChatClient
 
 from .agent import Agent, TurnResult, TurnStatus
 from .attachments import (
@@ -25,6 +25,7 @@ from .attachments import (
 from .compaction import CompactionCheckpoint, CompactionError
 from .compaction_settings import CompactionSettings
 from .context import Context
+from .errors import ValidationError
 from .events import Event, EventBus
 from .history import (
     History,
