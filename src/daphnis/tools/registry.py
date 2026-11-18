@@ -10,6 +10,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from mcp.types import Tool
+
 from ..attachments import ATTACHMENT_TOOLS, AttachmentStore
 from ..events import EventBus
 from ..mcp import MCPConnection
@@ -154,7 +156,10 @@ class ToolExecutor:
         approval: ApprovalCallback | None = None,
         question: QuestionCallback | None = None,
         binding: _Binding | None = None,
-        mcp_tools: dict[str, tuple[MCPConnection, str]] | None = None,
+        mcp_tools: dict[str, tuple[MCPConnection, Tool]] | None = None,
+        activate_mcp: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+        mcp_unverified: set[MCPConnection] | None = None,
+        mcp_state_paths: tuple[Path, ...] = (),
         mode: ApprovalMode = ApprovalMode.AUTO,
         trusted: set[tuple[str, str]] | None = None,
         redactor: Redactor | None = None,
@@ -168,6 +173,9 @@ class ToolExecutor:
         self._question = question
         self._binding = binding
         self._mcp_tools = mcp_tools if mcp_tools is not None else {}
+        self._activate_mcp = activate_mcp
+        self._mcp_unverified = mcp_unverified if mcp_unverified is not None else set()
+        self._mcp_state_paths = tuple(_lock_path(path) for path in mcp_state_paths)
         self._mode = mode
         self._trusted = trusted if trusted is not None else set()
         self._redactor = redactor if redactor is not None else Redactor(())
@@ -175,6 +183,9 @@ class ToolExecutor:
         self._attachment_store = attachment_store
         self._skill_state_paths = tuple(_lock_path(path) for path in skill_state_paths)
         self._retrieval = retrieval
+
+    def names(self) -> tuple[str, ...]:
+        return self._registry.names()
 
     def definitions(self) -> list[dict[str, Any]]:
         return self._registry.definitions()
@@ -188,6 +199,9 @@ class ToolExecutor:
             question=self._question,
             binding=self._binding,
             mcp_tools=self._mcp_tools,
+            activate_mcp=self._activate_mcp,
+            mcp_unverified=self._mcp_unverified,
+            mcp_state_paths=self._mcp_state_paths,
             mode=self._mode if mode is None else mode,
             trusted=self._trusted,
             redactor=self._redactor,
@@ -211,6 +225,9 @@ class ToolExecutor:
             question=self._question,
             binding=_Binding(workspace, session.id, turn_id, events, session, skills),
             mcp_tools=self._mcp_tools,
+            activate_mcp=self._activate_mcp,
+            mcp_unverified=self._mcp_unverified,
+            mcp_state_paths=self._mcp_state_paths,
             mode=self._mode,
             trusted=self._trusted,
             redactor=self._redactor,
@@ -250,14 +267,24 @@ class ToolExecutor:
             "tool_call_id": call["id"],
             "name": name,
         }
+        decision = None
         try:
             if name in self._mcp_tools:
-                connection, original_name = self._mcp_tools[name]
-                if not connection.available:
-                    raise ToolError("mcp_unavailable", "MCP 连接不可用。")
+                connection, tool = self._mcp_tools[name]
+
+                def usable() -> bool:
+                    return (connection.available and connection not in self._mcp_unverified
+                            and connection.tools.get(name) == tool)
+
+                if not usable():
+                    raise ToolError("mcp_unavailable", "MCP 工具目录已变化或连接不可用。")
 
                 async def run():
-                    return await connection.call(original_name, arguments)
+                    if not usable():
+                        return failure("mcp_unavailable", "MCP 工具目录已变化或连接不可用。")
+                    if decision is ApprovalDecision.TRUST_SESSION:
+                        self._trusted.add((binding.session_id, name))
+                    return await connection.call(tool.name, arguments)
 
                 operation = Operation(
                     decision=Decision.ASK,
@@ -265,7 +292,7 @@ class ToolExecutor:
                     targets=(),
                     details={
                         "server": connection.name,
-                        "tool": original_name,
+                        "tool": tool.name,
                         "arguments": arguments,
                     },
                     run=run,
@@ -280,6 +307,15 @@ class ToolExecutor:
                 )
             elif name in ATTACHMENT_TOOLS:
                 operation = prepare_attachments(name, arguments, binding.session, self._attachment_store)
+            elif name == "activate_mcp":
+                async def activate():
+                    try:
+                        return await self._activate_mcp(binding.session_id, arguments["server_id"])
+                    except ToolError as exc:
+                        return failure(exc.code, str(exc))
+
+                operation = Operation(decision=Decision.ALLOW, reason="Activate an authorized MCP server.",
+                                      targets=(), details={}, run=activate)
             elif name == "ask_user":
                 operation = prepare_question(arguments, binding.session_id, binding.turn_id, call["id"], self._question)
             elif name == "read_skill":
@@ -296,6 +332,7 @@ class ToolExecutor:
                     self._search_excluded_directory,
                     self._attachment_store.directory if self._attachment_store else None,
                     *self._skill_state_paths,
+                    *self._mcp_state_paths,
                     *(directory / name for directory in state_directories for name in ("skills", "mcp.json")),
                 ) if path is not None)
                 operation = prepare_code_search(name, arguments, binding.workspace.path, private=private)
@@ -313,13 +350,18 @@ class ToolExecutor:
                 for target in operation.targets for path in (target.path, target.requested)
             ):
                 raise ToolError("sensitive_path", "Skill state can only be changed by the user in Skills management.")
+            if any(
+                _lock_path(path) in self._mcp_state_paths
+                for target in operation.targets for path in (target.path, target.requested)
+            ):
+                raise ToolError("sensitive_path", "MCP 配置须通过用户管理界面修改。")
             forced = operation.force_approval or any(
                 not target.path.is_relative_to(binding.workspace.path)
                 for target in operation.targets
             )
             policy = _execution_decision(
                 operation,
-                ApprovalMode.AUTO if name == "ask_user" else self._mode,
+                ApprovalMode.AUTO if name in {"ask_user", "activate_mcp"} else self._mode,
                 trusted=(binding.session_id, name) in self._trusted,
                 forced=forced,
             )
@@ -398,6 +440,9 @@ def create_tools(
     approval: ApprovalCallback | None = None,
     question: QuestionCallback | None = None,
     connections: Iterable[MCPConnection] = (),
+    activate_mcp: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+    mcp_unverified: set[MCPConnection] | None = None,
+    mcp_state_paths: tuple[Path, ...] = (),
     trusted: set[tuple[str, str]] | None = None,
     redactor: Redactor | None = None,
     search_excluded_directory: Path | None = None,
@@ -616,6 +661,12 @@ def create_tools(
             ["argv"],
         ),
     }
+    if activate_mcp is not None:
+        definitions["activate_mcp"] = (
+            "Activate an available on-demand MCP server. Its native tools appear on the next request.",
+            {"server_id": {"type": "string", "pattern": "^(global|project):[A-Za-z0-9-]{1,20}$"}},
+            ["server_id"],
+        )
     for name, (description, properties, required) in definitions.items():
         registry.register(
             name=name,
@@ -637,9 +688,10 @@ def create_tools(
                 parameters=tool.input_schema,
                 handler=_guarded_handler(name),
             )
-            mcp_tools[name] = connection, tool.name
+            mcp_tools[name] = connection, tool
     return ToolExecutor(
         registry, approval=approval, question=question, mcp_tools=mcp_tools, trusted=trusted, redactor=redactor,
+        activate_mcp=activate_mcp, mcp_unverified=mcp_unverified, mcp_state_paths=mcp_state_paths,
         search_excluded_directory=search_excluded_directory, attachment_store=attachment_store,
         skill_state_paths=skill_state_paths,
         retrieval=RetrievalEngine(),

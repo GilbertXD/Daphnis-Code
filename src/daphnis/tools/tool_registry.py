@@ -98,6 +98,9 @@ class ToolRegistry:
             handler=handler,
         )
 
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._tools)
+
     def definitions(self) -> list[dict[str, Any]]:
         """Return independent tool definitions without local handlers."""
 

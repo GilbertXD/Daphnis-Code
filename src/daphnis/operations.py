@@ -22,7 +22,7 @@ from .compaction import CompactionCheckpoint
 from .config import load_mcp_config
 from .events import Callback
 from .history import SessionLease, finish_io
-from .mcp import MCPConnection, MCPStatus, validate_prompt_request
+from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
 from .mcp.resources import expand_resource_template
 from .mcp_store import MCPServerConfig
 from .models import ModelInfo, list_models
@@ -93,14 +93,16 @@ class Operations:
 
     @property
     def all_tools(self) -> tuple[str, ...]:
-        return self._app._all_tools
+        return self.available_tools(self.initial_session_id)
+
+    def available_tools(self, session_id: str) -> tuple[str, ...]:
+        return self._app._available_tools(self._runtime(session_id).session.workspace)
 
     def enabled_tools(self, session_id: str) -> tuple[str, ...]:
-        return self._runtime(session_id).session.enabled_tools
+        return self._app._selected_tools(self._runtime(session_id), effective=False)
 
     def effective_tools(self, session_id: str) -> tuple[str, ...]:
-        available = set(self.all_tools)
-        return tuple(name for name in self.enabled_tools(session_id) if name in available)
+        return self._app._selected_tools(self._runtime(session_id), effective=True)
 
     def running(self, session_id: str) -> bool:
         return self._runtime(session_id).running
@@ -233,15 +235,19 @@ class Operations:
         if isinstance(names, (str, bytes)):
             raise TypeError("names must be a sequence of tool names.")
         selected = tuple(names)
+        available = set(self.available_tools(session_id))
         if keep_unavailable:
-            available = set(self.all_tools)
             selected += tuple(
                 name
                 for name in runtime.session.enabled_tools
                 if name not in available and name not in selected
             )
-        app._validate_tools(self.model(session_id), selected, retained=runtime.session.enabled_tools)
-        updated = replace(runtime.session, enabled_tools=selected)
+        app._validate_tools(self.model(session_id), selected, retained=runtime.session.enabled_tools,
+                            workspace=runtime.session.workspace)
+        disabled = ((set(runtime.session.disabled_mcp_tools) | {
+            name for name in available.union(runtime.session.enabled_tools) if name.startswith(TOOL_PREFIX)
+        }) - set(selected))
+        updated = replace(runtime.session, enabled_tools=selected, disabled_mcp_tools=tuple(sorted(disabled)))
         await app._update_session(runtime, updated)
 
     def list_skills(self, session_id: str) -> tuple[SkillInfo, ...]:
@@ -312,11 +318,11 @@ class Operations:
             raise ValueError(f"MCP Server {name!r} 未连接。")
         await self._app._disconnect_mcp(name)
 
-    def list_mcp_servers(self) -> tuple[str, ...]:
-        return tuple(self._app._mcp)
+    def list_mcp_servers(self, session_id: str | None = None) -> tuple[str, ...]:
+        return tuple(server.name for server in self._workspace_mcp_connections(session_id))
 
-    def mcp_status(self) -> tuple[MCPStatus, ...]:
-        return tuple(server.status for server in self._app._mcp.values())
+    def mcp_status(self, session_id: str | None = None) -> tuple[MCPStatus, ...]:
+        return tuple(server.status for server in self._workspace_mcp_connections(session_id))
 
     def managed_mcp(self, session_id: str | None = None) -> tuple[MCPServerConfig, ...]:
         workspace = self._runtime(session_id or self.initial_session_id).session.workspace
@@ -418,13 +424,9 @@ class Operations:
                 store.write(configs)
             await finish_io(app._apply_mcp_config(key, None, connect=False, changed=True))
 
-    def list_mcp_tools(self) -> tuple[str, ...]:
-        return tuple(
-            tool
-            for server in self._app._mcp.values()
-            if server.available
-            for tool in server.tools
-        )
+    def list_mcp_tools(self, session_id: str | None = None) -> tuple[str, ...]:
+        return tuple(name for name in self.available_tools(session_id or self.initial_session_id)
+                     if name.startswith(TOOL_PREFIX))
 
     def _workspace_mcp_connections(self, session_id: str | None):
         app = self._app
@@ -544,6 +546,7 @@ class Operations:
             model_id=source.model_id,
             thinking=source.thinking,
             enabled_tools=source.enabled_tools,
+            disabled_mcp_tools=source.disabled_mcp_tools,
             project_id=project_id,
         )
         self._app._add_runtime(fresh)

@@ -53,6 +53,7 @@ class Session:
     attachment_refs: dict[int, AttachmentBatch] = field(default_factory=dict)
 
     prompt_groups: tuple[PromptGroup, ...] = ()
+    disabled_mcp_tools: tuple[str, ...] = ()
 
     @property
     def recovery(self) -> RecoveryState | None:
@@ -145,6 +146,11 @@ class Session:
             not isinstance(name, str) or not name.strip() for name in self.enabled_tools
         ):
             raise ValueError("enabled_tools must contain non-empty tool names.")
+        if (not isinstance(self.disabled_mcp_tools, tuple)
+            or any(not isinstance(name, str) or not name.startswith("mcp__") for name in self.disabled_mcp_tools)
+            or len(set(self.disabled_mcp_tools)) != len(self.disabled_mcp_tools)
+            or set(self.disabled_mcp_tools).intersection(self.enabled_tools)):
+            raise ValueError("Session disabled_mcp_tools must contain distinct, disabled MCP tool names.")
         if len(set(self.enabled_tools)) != len(self.enabled_tools):
             raise ValueError("enabled_tools must not contain duplicates.")
         if self.title is not None and (

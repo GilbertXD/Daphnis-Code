@@ -116,6 +116,105 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ToolError, "没有可按需激活"):
                     await app._activate_mcp(first, "global:lazy")
 
+    async def test_native_tools_appear_between_requests_and_respect_scope_and_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            sibling = root / "sibling"
+            sibling.mkdir()
+            native = "mcp__lazy__add"
+            requests, approvals, persisted = [], [], []
+
+            def model(request):
+                body = json.loads(request.content)
+                messages = body["messages"]
+                last = messages[-1]
+                tools = {item["function"]["name"]: item["function"] for item in body.get("tools", [])}
+                if messages[0]["content"] == TITLE_PROMPT:
+                    message = {"role": "assistant", "content": "Title"}
+                elif last.get("content") == "activate":
+                    requests.append((messages[0]["content"], tools))
+                    message = {"role": "assistant", "tool_calls": [
+                        tool_call("activate_mcp", "activation", server_id="global:lazy"),
+                        tool_call(native, "premature", a=1, b=4),
+                        tool_call("activate_mcp", "disabled", server_id="global:off"),
+                    ]}
+                elif last["role"] == "tool" and last.get("tool_call_id") == "disabled":
+                    requests.append((messages[0]["content"], tools))
+                    message = {"role": "assistant", "tool_calls": [tool_call(native, "native", a=20, b=22)]}
+                else:
+                    requests.append((messages[0]["content"], tools))
+                    message = {"role": "assistant", "content": "Done"}
+                return httpx.Response(200, json={"choices": [{"index": 0, "message": message,
+                    "finish_reason": "tool_calls" if "tool_calls" in message else "stop"}]})
+
+            app = Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash", interactive=True,
+                history=History(root / "sessions"),
+                connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(model)}},
+            )
+            self.addAsyncCleanup(app.close)
+            ops = Operations(app)
+            a = ops.initial_session_id
+            project = await ops.create_project("Sibling", sibling, session_id=a)
+            b = (await ops.open_project(project.id, session_id=a)).id
+            options = {"command": sys.executable, "args": [str(DEMO), directory]}
+            await ops.save_mcp("lazy", state="on_demand", description="Add two integers", options=options, create=True)
+            await ops.save_mcp("lazy", state="on_demand", scope="project", options=options, create=True, session_id=a)
+            await ops.save_mcp("off", state="disabled", options=options, create=True)
+            self.assertFalse((root / "pid").exists())
+            self.assertEqual({server.id for server in ops.managed_mcp(b)}, {"global:lazy", "global:off"})
+            with self.assertRaisesRegex(ValueError, "当前工作区"):
+                await ops.restart_mcp("project:lazy", session_id=b)
+            ops.set_approval_mode("ask", session_id=a)
+
+            async def approve(event):
+                approvals.append(event.data["name"])
+                ops.resolve_approval(event.data["request_id"], ApprovalDecision.ALLOW_ONCE, session_id=a)
+
+            def record(event):
+                snapshot = app._history.load(event.session_id).messages.snapshot()
+                result = next(item for item in snapshot if item.get("tool_call_id") == event.data["tool_call_id"])
+                persisted.append((event.data["name"], result.get(TOOL_STATE)))
+
+            ops.subscribe("tool.approval_requested", approve)
+            ops.subscribe("tool.executing", record)
+            result = await asyncio.wait_for(ops.send("activate", session_id=a, stream=False), 10)
+            self.assertEqual(result.status, TurnStatus.COMPLETED)
+            self.assertIn("global:lazy", requests[0][0])
+            self.assertIn("project:lazy", requests[0][0])
+            self.assertNotIn("global:off", requests[0][0])
+            self.assertIn("activate_mcp", requests[0][1])
+            self.assertNotIn(native, requests[0][1])
+            self.assertEqual(requests[1][1][native]["parameters"]["properties"]["a"]["type"], "integer")
+            self.assertEqual(approvals, [native])
+            self.assertEqual(persisted, [("activate_mcp", RUNNING), ("activate_mcp", RUNNING), (native, RUNNING)])
+            results = {item["tool_call_id"]: json.loads(item["content"]) for item in ops.message_snapshot(a)
+                       if item["role"] == "tool"}
+            self.assertEqual(results["activation"], {"ok": True, "server_id": "global:lazy", "tool_count": 2})
+            self.assertEqual(results["premature"]["error"]["code"], "unknown_tool")
+            self.assertEqual(results["disabled"]["error"]["code"], "mcp_not_available")
+            self.assertEqual(results["native"]["structured_content"], {"sum": 42})
+            self.assertNotIn(native, ops.effective_tools(b))
+            await ops.send("second", session_id=b, stream=False)
+            self.assertNotIn(native, requests[-1][1])
+            self.assertNotIn("project:lazy", requests[-1][0])
+            await ops.set_tools(tuple(name for name in ops.enabled_tools(a) if name != native), session_id=a)
+            self.assertIn(native, app._history.load(a).disabled_mcp_tools)
+            await ops.restart_mcp("global:lazy", session_id=a)
+            self.assertNotIn(native, ops.effective_tools(a))
+            await ops.save_mcp("global:lazy", state="disabled", session_id=a)
+            await ops.save_mcp("global:lazy", state="on_demand", session_id=a)
+            await app._activate_mcp(a, "global:lazy")
+            self.assertNotIn(native, ops.effective_tools(a))
+            await ops.save_mcp("auto", state="always", scope="project", options=options, create=True, session_id=b)
+            auto = next(name for name in ops.available_tools(b) if name.endswith("_auto__add"))
+            self.assertNotIn(auto, ops.available_tools(a))
+            await ops.set_tools((auto,), session_id=b)
+            await ops.send("always", session_id=b, stream=False)
+            self.assertIn(auto, requests[-1][1])
+            self.assertEqual(len(ops.list_mcp_servers(b)), 2)
+            self.assertEqual(ops.list_mcp_servers(a), ("lazy",))
+
     async def test_sessions_share_one_connection_and_select_their_own_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -520,7 +619,7 @@ asyncio.run(main())
             def model(request):
                 body = json.loads(request.content)
                 messages = body["messages"]
-                advertised.update(tool["function"]["name"] for tool in body["tools"])
+                advertised.update(tool["function"]["name"] for tool in body.get("tools", []))
                 if messages[-1]["role"] == "tool":
                     result_bytes[:] = [
                         len(item["content"].encode()) for item in messages
@@ -719,8 +818,9 @@ asyncio.run(main())
                     await ops.refresh_mcp("demo")
                 calls[:] = [tool_call(add, "unverified", a=1, b=3)]
                 send = asyncio.create_task(ops.send("unverified", stream=False, session_id=session_id))
-                await approve("unverified", ApprovalDecision.TRUST_SESSION)
                 self.assertEqual((await asyncio.wait_for(send, 5)).status, TurnStatus.COMPLETED)
+                self.assertEqual(outcomes[-1]["error"]["code"], "unknown_tool")
+                self.assertIsNone(ops.pending_approval(session_id))
                 self.assertNotIn((session_id, add), app._trusted_tools)
                 (root / "invalid").unlink()
                 (root / "changed").touch()
@@ -784,7 +884,8 @@ asyncio.run(main())
                 (root / "invalid").touch()
                 with self.assertRaisesRegex(RuntimeError, "保留上次目录"):
                     await ops.refresh_mcp("demo")
-                self.assertIn("mcp__demo__sum", ops.list_mcp_tools())
+                self.assertNotIn("mcp__demo__sum", ops.list_mcp_tools())
+                self.assertIn("mcp__demo__sum", app._mcp["demo"].tools)
                 self.assertEqual(ops.mcp_status()[0].state, "Connected")
             finally:
                 await ops.close()
@@ -889,7 +990,7 @@ asyncio.run(main())
         def model(request):
             body = json.loads(request.content)
             last = body["messages"][-1]
-            advertised.update(tool["function"]["name"] for tool in body["tools"])
+            advertised.update(tool["function"]["name"] for tool in body.get("tools", []))
             if last["role"] == "tool":
                 outcomes.append(json.loads(last["content"]))
                 message = {"role": "assistant", "content": "42"}

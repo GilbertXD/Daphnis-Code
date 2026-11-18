@@ -53,7 +53,8 @@ class MCPServerConfig:
         return self.workspace is None or self.workspace == workspace
 
     def connection(self, redactor: Redactor = _REDACTOR) -> MCPConnection:
-        if self.state not in ("disabled", "always", "on_demand") or self.options.keys() - _OPTIONS:
+        if (self.state not in ("disabled", "always", "on_demand")
+            or not isinstance(self.options, dict) or self.options.keys() - _OPTIONS):
             raise ValueError("MCP 服务配置字段无效。")
         if not isinstance(self.description, str) or len(self.description) > 500:
             raise ValueError("MCP 服务简介须为最多 500 字的文本。")

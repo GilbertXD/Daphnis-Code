@@ -292,6 +292,7 @@ class History:
             usage=session.usage,
             thinking=session.thinking,
             enabled_tools=session.enabled_tools,
+            disabled_mcp_tools=session.disabled_mcp_tools,
             title=session.title,
             compaction=session.compaction,
             system_prompt=session.system_prompt,
@@ -311,6 +312,8 @@ class History:
             "usage": asdict(validated.usage),
         }
         interrupted_tool_group(data["messages"])
+        if validated.disabled_mcp_tools:
+            data["disabled_mcp_tools"] = list(validated.disabled_mcp_tools)
         if validated.title is not None:
             data["title"] = validated.title
         if validated.compaction is not None:
@@ -373,6 +376,9 @@ class History:
         enabled_tools = data["enabled_tools"]
         if not isinstance(enabled_tools, list):
             raise TypeError("Session enabled_tools must be a JSON array.")
+        disabled_mcp_tools = data.get("disabled_mcp_tools", [])
+        if not isinstance(disabled_mcp_tools, list):
+            raise TypeError("Session disabled_mcp_tools must be a JSON array.")
         checkpoint = data.get("compaction")
         if checkpoint is not None:
             if not isinstance(checkpoint, dict) or checkpoint.keys() != {"through", "summary"}:
@@ -395,6 +401,7 @@ class History:
             model_id=data["model_id"],
             thinking=data["thinking"],
             enabled_tools=tuple(enabled_tools),
+            disabled_mcp_tools=tuple(disabled_mcp_tools),
             messages=messages,
             usage=UsageTotals.from_dict(data["usage"]),
             _saved_revision=(session_id, sha256(raw).hexdigest()),

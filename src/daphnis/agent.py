@@ -172,6 +172,7 @@ class Agent:
         catalog: Sequence[ModelInfo] = MODELS,
         custom_compatibility: bool = False,
         tools: ToolRegistry | ToolExecutor | None = None,
+        tool_catalog: Callable[[], ToolExecutor] | None = None,
         context: Context | None = None,
         events: EventBus | None = None,
         max_requests: int | None = None,
@@ -205,6 +206,7 @@ class Agent:
         validate_catalog(self._catalog)
         self._custom_compatibility = custom_compatibility
         self.tools = tools
+        self._tool_catalog = tool_catalog
         self.context = context if context is not None else Context()
         self.events = events if events is not None else EventBus()
         self.max_primary_requests = max_primary_requests
@@ -842,12 +844,26 @@ class Agent:
                     raise ValueError("当前模型接口无法续写 Assistant 结尾的消息组。请发送新消息。")
             turn_start = len(committed) if recovery_action is None else recovery.message_index
             interrupted = interrupted_tool_group(committed)
-            tools = None if recovery_action is RecoveryAction.TERMINATE else self.tools
-            if isinstance(tools, ToolExecutor):
-                tools = tools.bind(session=session, events=self.events, turn_id=turn_id, skills=self.context.skills)
-            definitions = tools.definitions() if tools is not None else []
-            if definitions:
-                require_tools(model)
+            tools = None
+            definitions = []
+            tool_snapshot = None
+
+            def update_tools() -> bool:
+                nonlocal tools, definitions, tool_snapshot
+                if recovery_action is RecoveryAction.TERMINATE:
+                    return False
+                snapshot = self._tool_catalog() if self._tool_catalog is not None else self.tools
+                if snapshot is tool_snapshot:
+                    return False
+                tool_snapshot = snapshot
+                tools = (snapshot.bind(session=session, events=self.events, turn_id=turn_id, skills=self.context.skills)
+                         if isinstance(snapshot, ToolExecutor) else snapshot)
+                definitions = tools.definitions() if tools is not None else []
+                if definitions:
+                    require_tools(model)
+                return True
+
+            update_tools()
             history_lookup = {"retrieval", "history_read"}.issubset(
                 item["function"]["name"] for item in definitions
             )
@@ -1205,6 +1221,8 @@ class Agent:
             warned_about_reserve = False
             while primary_remaining() > 0:
                 await _checkpoint()
+                if update_tools():
+                    body = request_options()
                 maintenance_limited = False
                 messages = self._model_context(
                     session.messages, checkpoint, history_lookup=history_lookup, attachment_notes=attachment_notes,

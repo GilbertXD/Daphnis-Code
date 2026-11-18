@@ -312,6 +312,8 @@ class MCPConnection:
 
     @property
     def status(self) -> MCPStatus:
+        if self.state == "Connected" and not self.credentials_current:
+            return MCPStatus(self.name, "Error", 0, "MCP 环境凭据已变更，请重新连接。")
         return MCPStatus(
             self.name,
             self.state,
