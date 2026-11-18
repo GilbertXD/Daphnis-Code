@@ -1,6 +1,6 @@
 # 公共 Operations 接口
 
-`Operations` 可从 `daphnis` 导入。每次会话操作都指定 `session_id`；多个 Operations 实例可以访问同一个 Application 中的会话和共享资源。自行构造 `Application` 时可注入模型连接、目录和 History。Web 使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装交互式运行环境并连接已启用的 MCP 服务。用 `ops.initial_session_id` 取得启动时创建或恢复的会话 ID。
+`Operations` 可从 `daphnis` 导入。每次会话操作都指定 `session_id`；多个 Operations 实例可以访问同一个 Application 中的会话和共享资源。自行构造 `Application` 时可注入模型连接、目录和 History。Web 使用 `daphnis.runtime.open_operations(workspace, *, session_id=None, observe_model_io=False)` 组装交互式运行环境并连接该工作区的 `always` MCP 服务。用 `ops.initial_session_id` 取得启动时创建或恢复的会话 ID。
 
 ## 最小示例
 
@@ -62,9 +62,10 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 系统提示词 | `get_system_prompt(session_id)` 返回生效文本。`await set_system_prompt(prompt, session_id=...)` 保存覆盖值，`await reset_system_prompt(session_id)` 恢复内置值。 |
 | 工具 | `all_tools` 是共享的可用目录。`enabled_tools(session_id)` 查询启用偏好，`effective_tools(session_id)` 查询实际可用项。`await set_tools(names, session_id=..., keep_unavailable=True)` 可以保留未列出的离线偏好。 |
 | Skills | `list_skills(session_id)` 返回全局和当前工作区的 `SkillInfo`，包括无效或缺失项。`await import_skill(source, scope, session_id=...)` 复制本地包并设为 `disabled`。`await set_skill_state(skill_id, state, session_id=...)` 和 `await remove_skill(skill_id, session_id=...)` 修改用户状态及受管理副本。 |
-| MCP | `managed_mcp()` 查看配置。`await save_mcp(name, enabled=..., options=..., create=...)` 创建或编辑；省略 `options` 可只切换启用状态。`restart_mcp()`、`delete_mcp()` 管理已保存的连接。直接管理运行时连接可用 `connect_mcp()`、`reconnect_mcp()`、`disconnect_mcp()` 和 `refresh_mcp()`。配置更新要求 Application 没有活动任务。 |
-| MCP Prompts | `list_mcp_prompt_servers()`、`await list_mcp_prompts(server)` 和 `await get_mcp_prompt(server, name, arguments)` 读取模板与预览。`await run_mcp_prompt(PromptInput(...), session_id=...)` 在指定会话运行已验证的 User / Assistant 消息。重试复用已保存的快照。 |
-| MCP Resources | `list_mcp_resource_servers()`、`await list_mcp_resources(server)` 和 `await list_mcp_resource_templates(server)` 读取资源目录。`await read_mcp_resource(server, uri, arguments=None)` 返回可作为 `send()` 附件的文本资源。 |
+| MCP | `managed_mcp(session_id)` 查看可用作用域的配置。`await save_mcp(name, state=..., scope=..., description=..., options=..., create=True, session_id=...)` 创建。编辑使用 `global:name` 或 `project:name` 和 `create=False`。可只传 `state` 切换加载方式。`await restart_mcp(server_id, session_id=...)` 和 `await delete_mcp(server_id, session_id=...)` 管理已保存配置；主动配置变更要求 Application 空闲。`connect_mcp()` 保留直接连接未托管全局服务的入口，`reconnect_mcp()`、`disconnect_mcp()` 和 `refresh_mcp()` 支持按会话定位托管服务。 |
+| MCP 工具 | `available_tools(session_id)` 返回当前工作区已发现且可供勾选的工具。`enabled_tools(session_id)` 返回工具选择，`effective_tools(session_id)` 过滤离线、未验证及该会话尚未激活的 MCP 工具。`set_tools()` 保存扁平工具名及明确停用的 MCP 工具。`start_mcp(session_id=...)` 可为自行组装的 Application 提前确保 `always` 连接。 |
+| MCP Prompts | `list_mcp_prompt_servers(session_id)`、`await list_mcp_prompts(server, session_id=...)` 和 `await get_mcp_prompt(server, name, arguments, session_id=...)` 读取当前工作区的已连接服务。`await run_mcp_prompt(PromptInput(...), session_id=...)` 运行已验证的 User / Assistant 消息。重试复用已保存的快照。 |
+| MCP Resources | `list_mcp_resource_servers(session_id)`、`await list_mcp_resources(server, session_id=...)` 和 `await list_mcp_resource_templates(server, session_id=...)` 读取当前工作区的资源目录。`await read_mcp_resource(server, uri, arguments=None, session_id=...)` 返回可作为 `send()` 附件的文本资源。 |
 | 执行与取消 | `await send(prompt, session_id=..., stream=True, attachments=...)` 返回 `TurnResult`。`running(session_id)` 查询活动任务；`await cancel(session_id)` 取消并等候该任务结束。 |
 | 恢复 | `recovery(session_id)` 返回恢复类型、原 User 的索引及键。把键和 `session_id` 传给 `retry_failed_user()`、`continue_interrupted_turn()` 或 `terminate_interrupted_turn()`。 |
 | 上下文 | `await compact(session_id)` 在会话空闲时请求手动压缩，返回检查点或 `None`。`context_budget(session_id)`、`compacting(session_id)` 和 `compacted_through(session_id)` 查询预算、压缩状态和已覆盖消息数。 |

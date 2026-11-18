@@ -15,9 +15,9 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接已配置的 MCP 服务。 |
+| [Web 入口](../src/daphnis/web/__main__.py)、[运行装配](../src/daphnis/runtime.py) | Web 入口配置回环服务、静态资源、访问令牌和脱敏，委托 `open_operations()` 读取服务端配置、创建交互式 Application、按需恢复会话并连接初始工作区的 always MCP 服务。 |
 | [Web Server](../src/daphnis/web/server.py)、[Bridge](../src/daphnis/web/bridge.py) | Server 校验 HTTP 命令和 WebSocket 连接。Bridge 按会话维护 Web Run、流式文本、提交确认和有界调试记录，通过 Operations 查询当前状态。每条 WebSocket 独立选择要显示的会话。 |
-| [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime，Skills 管理从会话取得工作区，MCP 连接和目录管理面向整个 Application。 |
+| [Operations](../src/daphnis/operations.py) | 提供命令、只读快照及订阅入口。会话操作通过显式会话 ID 定位 Runtime，Skills 和 MCP 管理从会话取得工作区，MCP 连接由 Application 共享。 |
 | [Application](../src/daphnis/app.py) | 按会话 ID 管理已加载的 Runtime，按厂商管理连接配置并缓存 ChatClient。共享 History、EventBus、模型目录、DocumentAdapter 缓存、工具目录与 MCP 连接。负责装配 Agent、提交事务、取消和释放资源。 |
 | [SessionRuntime](../src/daphnis/session_runtime.py) | 保存一个 Session 的活动任务、审批请求与模式、用量跟踪器、上下文预算和压缩状态。空闲 Runtime 保留在内存中；Runtime 本身不落盘。 |
 | [Agent](../src/daphnis/agent.py)、[Context](../src/daphnis/context.py) | Agent 推进 Turn，调度模型请求和工具调用，处理响应并提交消息。Context 从工作消息和检查点创建请求快照，并按需加入系统提示。 |
@@ -72,7 +72,9 @@ Agent 只在模型请求投影中加入附件。当前轮的附件按合计约 4
 
 History 租约覆盖模型请求、工具调用、人工审批、手动压缩和保存。同会话的租约已被其他进程占用时会抛出 `SessionBusyError`。旧快照会在请求模型前触发 `SessionConflictError`；在新的 Application 实例中加载该会话即可获取新快照。取消会等待已开始的写入完成。会话租约不协调不同会话对同一工作区文件的写入。
 
-MCP 目录与连接由会话共享。每轮根据已启用且在线的工具选取定义快照；执行时仍检查连接。连接或发现工具不修改任何会话的启用偏好。活动任务期间拒绝主动修改全局 MCP 配置。目录变化立即撤销相关的自动信任，等活动任务结束后更新目录；刷新失败时保留旧目录，重新验证前不会记住该连接的新信任决定。
+MCP 管理配置和连接归 Application 所有。它按规范化工作区筛选全局及项目配置，并为同一配置与凭据共享连接。并发连接使用同一个初始化任务。取消单个 Turn 只取消该会话的等待。修改配置时要求所有任务空闲，已授权的按需激活可在活动 Turn 内进行。激活记录在 SessionRuntime 中，随进程或会话关闭清除。会话工具选择保留扁平 `enabled_tools`，显式停用的 MCP 工具另存于 `disabled_mcp_tools`。
+
+Application 在主模型请求之间提供筛选后的 ToolExecutor 快照。Agent 将定义放入原生 `tools` 并对同一响应中的工具调用沿用对应快照。`activate_mcp` 经普通执行前持久化与结果提交路径，成功后才会在下一请求提供该会话的 MCP 工具。目录变化立即撤销自动信任并重新发现，已开始的远端调用可完成。后续执行在审批前及执行前重新核对连接和工具定义，未验证或已变化的工具返回普通工具错误。
 
 ## 事件订阅
 

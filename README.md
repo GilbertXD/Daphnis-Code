@@ -47,7 +47,7 @@ uv run --locked --extra web daphnis-web --workspace .
 - 通过会话菜单的「移动」可更改归属。移到其他项目后，后续工具操作使用目标项目的工作目录。移到「无项目」会保留原工作目录。
 - 在侧栏新建、恢复、重命名或删除会话，在输入框下方选择模型、思考档位和工具，或编辑、重置会话系统提示词。
 - 点击输入框旁的「Skills」导入本地 `SKILL.md` 目录并设置加载方式。项目 Skills 随会话工作区切换。[Skills 使用说明](docs/skills.md)
-- 点击顶部「MCP」管理共享服务，或用「发现」搜索官方 MCP Registry 并添加远程服务。等所有会话空闲后再更新连接，通过「工具」面板为各会话启用所需的工具。
+- 点击顶部「MCP」手动添加服务，或通过「发现」添加 Registry 中的远程服务。选择适用于所有工作区的 Global 或只适用于当前工作区的 Project，再选择禁用、始终加载或按需加载。按需服务在模型需要时才激活，工具调用仍按当前会话审批。工具勾选和配置迁移见 [MCP 配置与生命周期](docs/tools.md#mcp-配置与生命周期)。
 - 点击输入框旁的「Prompts」，选择 MCP Prompt、填写参数并编辑预览，点击「运行」直接开始任务。[MCP Prompts 使用说明](docs/tools.md#mcp-prompts)
 - 从「MCP → Resources」浏览和读取资源，预览后点击「添加到消息」，再像普通附件一样发送。[MCP Resources 使用说明](docs/tools.md#mcp-resources)
 - 在输入框左下角点「+」或拖入文件。支持图片的模型还可以接收粘贴的截图。图片支持 PNG、JPEG 和 WebP，每轮最多 4 张、单张 5 MiB。UTF-8 文本附件每轮最多 10 个、单个 128 KiB、总计 256 KiB。[文本附件](docs/tools.md#文本附件)
