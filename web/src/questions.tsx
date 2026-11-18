@@ -22,7 +22,8 @@ export function QuestionForm({ request, disabled, submit }: {
   const question = request.questions[step]
   const draft = drafts[step]
   const last = step + 1 === request.questions.length
-  const ready = answerFor(question, draft).length > 0
+  const answers = request.questions.map((item, i) => [item.id, answerFor(item, drafts[i])] as const)
+  const ready = answers.every(([, answer]) => answer.length > 0)
   const multi = question.type === 'multi_select'
 
   function update(changes: Partial<Draft>) {
@@ -40,13 +41,12 @@ export function QuestionForm({ request, disabled, submit }: {
 
   return <form className="question-form" aria-label="Agent 提问" onSubmit={async (event) => {
     event.preventDefault()
-    if (!ready || disabled || submitted) return
+    if (disabled || submitted) return
     if (!last) {
       setStep(step + 1)
       return
     }
-    const answers = request.questions.map((item, i) => [item.id, answerFor(item, drafts[i])] as const)
-    if (answers.every(([, answer]) => answer.length > 0)) setSubmitted(await submit(Object.fromEntries(answers)))
+    if (ready) setSubmitted(await submit(Object.fromEntries(answers)))
   }}>
     <div className="approval-heading">
       <strong>Agent 提问</strong>
@@ -67,13 +67,16 @@ export function QuestionForm({ request, disabled, submit }: {
         </label>
       </>}
       {(question.type === 'text' || draft.custom) && <label className="field">
-        {question.type === 'text' ? '回答' : '自定义回答'}
-        <textarea rows={2} maxLength={2000} value={draft.text} onChange={(event) => update({ text: event.target.value })} />
+        {question.type === 'text' && '回答'}
+        <textarea className="question-answer" aria-label={question.type === 'text' ? undefined : '其他'}
+          rows={2} maxLength={2000} value={draft.text} onChange={(event) => update({ text: event.target.value })} />
       </label>}
     </fieldset>
     <div className="actions">
       {step > 0 && <button type="button" disabled={disabled || submitted} onClick={() => setStep(step - 1)}>上一步</button>}
-      <button type="submit" className="primary" disabled={!ready || disabled || submitted}>{last ? '提交回答' : '下一步'}</button>
+      <button type="submit" className="primary" disabled={disabled || submitted || (last && !ready)}>
+        {last ? '提交回答' : '下一步'}
+      </button>
     </div>
   </form>
 }

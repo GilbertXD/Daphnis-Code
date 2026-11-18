@@ -1,14 +1,16 @@
-import { memo } from 'react'
+import { memo, useLayoutEffect, useRef } from 'react'
+import type { ReactNode } from 'react'
 import { clock } from './protocol'
 import type { AgentEvent, Usage, View } from './protocol'
 import { DataBlock, ToolRow } from './transcript'
 import type { TraceTool } from './transcript'
 
-export type Tab = 'events' | 'tools' | 'context' | 'requests'
+export type Tab = 'events' | 'tools' | 'context' | 'requests' | 'status'
 
 const tabs: { id: Tab; title: string }[] = [
   { id: 'events', title: '事件' }, { id: 'tools', title: '工具' },
   { id: 'context', title: '上下文' }, { id: 'requests', title: '请求 / 响应' },
+  { id: 'status', title: '运行状态' },
 ]
 
 const names: Record<string, string> = {
@@ -58,10 +60,10 @@ function Tokens({ title, usage }: { title: string; usage: Usage | null }) {
 
 function StatusPanel({ view }: { view: View }) {
   const { status, state } = view
-  return <details className="debug-status">
-    <summary>运行状态 <span className="muted">
+  return <section aria-label="运行状态">
+    <p className="muted">
       {status.approval ? '等待审批' : status.compacting ? '压缩上下文' : status.running ? '运行中' : '空闲'} · {status.session_usage.total_tokens.toLocaleString()} Tokens
-    </span></summary>
+    </p>
     <dl className="facts">
       <div><dt>会话</dt><dd>{state.session.id}</dd></div>
       <div><dt>工作区</dt><dd>{state.session.workspace}</dd></div>
@@ -82,7 +84,7 @@ function StatusPanel({ view }: { view: View }) {
     </dl>
     <Tokens title="本轮 Token" usage={status.turn_usage} />
     <Tokens title="会话 Token" usage={status.session_usage} />
-  </details>
+  </section>
 }
 
 const Timeline = memo(function Timeline({ events }: { events: AgentEvent[] }) {
@@ -111,7 +113,7 @@ const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
     requests.set(key, items)
   }
   if (!requests.size) return <p className="muted">运行一轮后可查看模型请求和响应。</p>
-  return <div className="request-list">{[...requests].reverse().map(([key, items]) => {
+  return <div className="request-list">{[...requests].map(([key, items]) => {
     const request = items.find((event) => event.name === 'model.request')
     const response = items.find((event) => event.name === 'model.finished' || event.name === 'model.response_error')
     const first = items[0]
@@ -132,6 +134,19 @@ const Requests = memo(function Requests({ events }: { events: AgentEvent[] }) {
   })}</div>
 })
 
+function DebugBody({ followLatest, children }: { followLatest: boolean; children: ReactNode }) {
+  const scroll = useRef<HTMLDivElement>(null)
+  const atBottom = useRef(true)
+  useLayoutEffect(() => {
+    const element = scroll.current
+    if (followLatest && atBottom.current && element) element.scrollTop = element.scrollHeight
+  }, [children, followLatest])
+  return <div ref={scroll} className="debug-body" onScroll={(event) => {
+    const { scrollHeight, scrollTop, clientHeight } = event.currentTarget
+    atBottom.current = scrollHeight - scrollTop - clientHeight <= 1
+  }}>{children}</div>
+}
+
 export function Debug({ view, tools, tab, select, close }: {
   view: View
   tools: TraceTool[]
@@ -148,7 +163,7 @@ export function Debug({ view, tools, tab, select, close }: {
     <div className="tabs" role="group" aria-label="调试页签">{tabs.map(({ id, title }) =>
       <button key={id} type="button" aria-pressed={tab === id} onClick={() => select(id)}>{title}</button>)}
     </div>
-    <div className="debug-body" key={tab}>
+    <DebugBody key={tab} followLatest={tab === 'events' || tab === 'tools' || tab === 'requests'}>
       {tab === 'events' && <Timeline events={view.events} />}
       {tab === 'tools' && (tools.length ? tools.map((tool) => <ToolRow key={tool.key} tool={tool}
         inspect={document.getElementById(`tool-${tool.key}`) ? () => {
@@ -173,8 +188,8 @@ export function Debug({ view, tools, tab, select, close }: {
         </details>
       </>}
       {tab === 'requests' && <Requests events={view.events} />}
-      <StatusPanel view={view} />
+      {tab === 'status' && <StatusPanel view={view} />}
       <p className="debug-note">调试数据保留在当前服务进程中，按会话有限缓存。浏览器收到的内容已执行凭据脱敏。</p>
-    </div>
+    </DebugBody>
   </aside>
 }

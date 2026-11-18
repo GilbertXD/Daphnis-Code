@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { FormEvent } from 'react'
+import type { FormEvent, ReactNode } from 'react'
 import type { Command, MCPLoading, MCPOptions, MCPScope, MCPServer, RegistryPage, RegistryRemote, RegistryServer, ResourceDraft } from './protocol'
 import { ResourceBrowser } from './resources'
 
@@ -124,39 +124,51 @@ const retryBlockText = {
   quota_storage: '无法读取或保存会话连接额度，请检查本地状态文件。',
 }
 
-export function MCPManager({ servers, disabled, connected, error, notice, perform, command, resourceServers, addResources }: {
+export function MCPManager({ servers, disabled, connected, error, notice, perform, command, resourceServers, addResources, prompts }: {
   servers: MCPServer[]
   disabled: boolean
   connected: boolean
   resourceServers: string[]
   addResources: (resources: ResourceDraft[]) => string | null
+  prompts: ReactNode
   error: string | null
   notice: string
   perform: Perform
   command: Command
 }) {
   const [editing, setEditing] = useState<MCPServer | 'new' | null>(null)
-  const [page, setPage] = useState<'servers' | 'discover' | 'resources'>('servers')
+  const [page, setPage] = useState<'servers' | 'discover' | 'resources' | 'prompts'>('servers')
   const blocked = disabled || !!error
   return <>
     <div className="mcp-tabs" aria-label="MCP 页面">
-      <button type="button" aria-pressed={page === 'servers'} onClick={() => setPage('servers')}>已配置</button>
+      <button type="button" aria-pressed={page === 'servers'} onClick={() => { setEditing(null); setPage('servers') }}>已配置</button>
       <button type="button" aria-pressed={page === 'discover'} onClick={() => { setEditing(null); setPage('discover') }}>发现</button>
       <button type="button" aria-pressed={page === 'resources'} onClick={() => {
         setEditing(null)
         setPage('resources')
       }}>Resources</button>
+      <button type="button" aria-pressed={page === 'prompts'} disabled={!connected} onClick={() => {
+        setEditing(null)
+        setPage('prompts')
+      }}>Prompts</button>
     </div>
     {error && <p role="alert">{error}</p>}
-    {notice && (page === 'discover' || editing || !servers.some((server) => server.error === notice)) && <p role="status">{notice}</p>}
-    {page === 'resources' ? <ResourceBrowser servers={resourceServers} command={command} connected={connected}
-      disabled={disabled} add={addResources} /> : page === 'discover' ? <RegistryPanel command={command} servers={servers} disabled={blocked} add={async (fields) => {
-      const saved = await perform('mcp_add_registry', fields)
-      if (saved) setPage('servers')
-      return saved
-    }} /> : editing ? <MCPEditor initial={editing === 'new' ? undefined : editing} disabled={blocked}
+    {notice && (page === 'prompts' || page === 'discover' || editing || !servers.some((server) => server.error === notice)) &&
+      <p role={page === 'prompts' ? 'alert' : 'status'}>{notice}</p>}
+    {page === 'prompts' ? prompts : page === 'resources' ? <ResourceBrowser servers={resourceServers} command={command} connected={connected}
+      disabled={disabled} add={addResources} /> : editing ? <MCPEditor initial={editing === 'new' ? undefined : editing} disabled={blocked}
       cancel={() => setEditing(null)}
-      save={(fields) => perform('mcp_save', { ...fields, create: editing === 'new' })} /> : <>
+      save={async (fields) => {
+        const create = editing === 'new'
+        const saved = await perform('mcp_save', { ...fields, create })
+        if (saved && create) setPage('servers')
+        return saved
+      }} /> : page === 'discover' ? <RegistryPanel command={command} servers={servers} disabled={blocked}
+      addManually={() => setEditing('new')} add={async (fields) => {
+        const saved = await perform('mcp_add_registry', fields)
+        if (saved) setPage('servers')
+        return saved
+      }} /> : <>
       {!servers.length && !error && <p className="muted">尚未配置 MCP 服务。</p>}
       <ul className="mcp-list">{servers.map((server) => <li key={server.id}>
         <div className="mcp-summary">
@@ -192,7 +204,6 @@ export function MCPManager({ servers, disabled, connected, error, notice, perfor
           </details>
         </div>
       </li>)}</ul>
-      <div className="actions"><button className="primary" disabled={blocked} onClick={() => setEditing('new')}>添加 MCP 服务</button></div>
     </>}
   </>
 }
@@ -243,11 +254,12 @@ function CopyableAddress({ address }: { address: string }) {
   </div>
 }
 
-function RegistryPanel({ command, servers, disabled, add }: {
+function RegistryPanel({ command, servers, disabled, add, addManually }: {
   command: Command
   servers: MCPServer[]
   disabled: boolean
   add: (fields: Record<string, unknown>) => Promise<boolean>
+  addManually: () => void
 }) {
   const [query, setQuery] = useState('')
   const [submitted, setSubmitted] = useState('')
@@ -407,6 +419,8 @@ function RegistryPanel({ command, servers, disabled, add }: {
       </p>
     </li>)}</ul>
     {page?.cursor && <div className="actions"><button disabled={busy} onClick={() => void search(submitted, page.cursor)}>加载更多</button></div>}
+    <div className="actions"><button className="primary" type="button" disabled={disabled}
+      onClick={addManually}>手动添加</button></div>
   </section>
 }
 

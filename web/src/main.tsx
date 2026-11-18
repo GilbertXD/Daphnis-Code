@@ -160,7 +160,7 @@ function ApprovalCard({ request, disabled, choose }: {
   </section>
 }
 
-function ToolsDialog({ view, close, apply, disabled, notice }: {
+function ToolsPanel({ view, close, apply, disabled, notice }: {
   view: View
   close: () => void
   apply: (names: string[]) => Promise<boolean>
@@ -207,7 +207,7 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
     </label>)
   }
 
-  return <Dialog title="工具配置" close={close}>
+  return <>
     <p className="muted">选择仅应用于当前会话，工具调用仍遵循审批规则。</p>
     <div className="tool-options">
       <section>
@@ -254,7 +254,7 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
         if (await apply(tools.filter((name) => selected.has(name)))) close()
       }}>应用</button>
     </div>
-  </Dialog>
+  </>
 }
 
 type SettingOption = { value: string; label: string; unavailable?: boolean }
@@ -296,7 +296,7 @@ function SettingsDialog({ title, value, groups, close, apply, disabled, notice }
   </Dialog>
 }
 
-function SystemPromptDialog({ initial, close, apply, disabled, notice }: {
+function SystemPromptPanel({ initial, close, apply, disabled, notice }: {
   initial: string
   close: () => void
   apply: (prompt: string | null) => Promise<boolean>
@@ -304,21 +304,41 @@ function SystemPromptDialog({ initial, close, apply, disabled, notice }: {
   notice: string
 }) {
   const [prompt, setPrompt] = useState(initial)
-  return <Dialog title="会话系统提示词" close={close}>
-    <form onSubmit={async (event) => {
-      event.preventDefault()
-      if (await apply(prompt)) close()
-    }}>
-      <label className="field">系统提示词<textarea rows={8} value={prompt}
-        onChange={(event) => setPrompt(event.currentTarget.value)} /></label>
-      {notice && <p role="status">{notice}</p>}
-      <div className="actions">
-        <button type="button" disabled={disabled} onClick={async () => {
-          if (await apply(null)) close()
-        }}>恢复默认</button>
-        <button className="primary" disabled={disabled || !prompt.trim()} type="submit">保存</button>
-      </div>
-    </form>
+  return <form onSubmit={async (event) => {
+    event.preventDefault()
+    if (!disabled && prompt.trim() && await apply(prompt)) close()
+  }}>
+    <label className="field">系统提示词<textarea rows={8} value={prompt} disabled={disabled}
+      onChange={(event) => setPrompt(event.currentTarget.value)} /></label>
+    {notice && <p role="status">{notice}</p>}
+    <div className="actions">
+      <button type="button" disabled={disabled} onClick={async () => {
+        if (await apply(null)) close()
+      }}>恢复默认</button>
+      <button className="primary" disabled={disabled || !prompt.trim()} type="submit">保存</button>
+    </div>
+  </form>
+}
+
+const optionsTabs = [
+  ['tools', '工具'], ['skills', 'Skills'], ['mcp', 'MCP'], ['system', '系统提示词'],
+] as const
+
+function OptionsDialog({ panels, close, clearNotice }: {
+  panels: Record<(typeof optionsTabs)[number][0], ReactNode>
+  close: () => void
+  clearNotice: () => void
+}) {
+  const [tab, setTab] = useState<(typeof optionsTabs)[number][0]>('tools')
+  return <Dialog title="Options" close={close} className="mcp-dialog">
+    <div className="mcp-tabs" role="group" aria-label="Options 页签">
+      {optionsTabs.map(([id, label]) =>
+        <button key={id} type="button" aria-pressed={tab === id} onClick={() => {
+          if (tab !== id) clearNotice()
+          setTab(id)
+        }}>{label}</button>)}
+    </div>
+    {optionsTabs.map(([id]) => <div key={id} hidden={tab !== id}>{panels[id]}</div>)}
   </Dialog>
 }
 
@@ -384,8 +404,7 @@ function MoveSessionDialog({ session, projects, close, move, disabled, notice }:
 }
 
 type SettingAction = 'model' | 'thinking' | 'approval'
-type Modal = { action: 'tools' | 'project' | 'mcp' } | { action: 'system' | 'skills' | SettingAction; sessionId: string }
-  | { action: 'prompts'; sessionId: string }
+type Modal = { action: 'project' } | { action: 'options' | SettingAction; sessionId: string }
   | { action: 'confirm_full'; sessionId: string }
   | { action: 'rename' | 'delete'; session: Session }
   | { action: 'move'; session: Session }
@@ -638,14 +657,18 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       <Transcript key={id} view={view} tools={tools} loadImage={loadImage} loadDocument={loadDocument} retry={recovery?.kind === 'FAILED_USER'
         ? { index: recovery.message_index, disabled, run: () => void perform('retry', { key: recovery.key }) }
         : undefined} />
+      {status.question && <div className="question-zone">
+        <div className="question-inner">
+          <QuestionForm key={status.question.request_id} request={status.question}
+            disabled={busy || !connected} submit={(answers) => perform('answer_question', {
+              request_id: status.question?.request_id, turn_id: status.question?.turn_id, answers,
+            })} />
+        </div>
+      </div>}
       <div className="composer-zone">
         {status.approval && <ApprovalCard key={status.approval.request_id} request={status.approval}
           disabled={busy || !connected} choose={(decision) => void perform('approve', {
             request_id: status.approval?.request_id, decision,
-          })} />}
-        {status.question && <QuestionForm key={status.question.request_id} request={status.question}
-          disabled={busy || !connected} submit={(answers) => perform('answer_question', {
-            request_id: status.question?.request_id, turn_id: status.question?.turn_id, answers,
           })} />}
         {interrupted && !status.running && <div className="recovery" role="group" aria-label="未完成任务">
           <span>未完成任务</span>
@@ -716,29 +739,10 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
                 disabled={disabled} onClick={() => openSetting('model')}>{state.model.id}</button>
               <button type="button" aria-haspopup="dialog" disabled={disabled || !state.model.thinking_modes?.length}
                 onClick={() => openSetting('thinking')}>Thinking · {thinkingLabel(state.thinking)}</button>
-              <button type="button" className="tool-control" title="选择启用的工具"
-                disabled={disabled || state.model.supports_tools !== true} onClick={() => {
-                  setNotice('')
-                  setModal({ action: 'tools' })
-                }}>
-                工具 {state.effective_tools.length ? `· ${state.effective_tools.length} 已启用` : '· 停用'}
-              </button>
-              <button type="button" aria-haspopup="dialog" title="管理全局和当前工作区 Skills" onClick={() => {
+              <button type="button" aria-haspopup="dialog" onClick={() => {
                 setNotice('')
-                setModal({ action: 'skills', sessionId: id })
-              }}>Skills</button>
-              <button type="button" aria-haspopup="dialog" title="管理 MCP 服务和资源" onClick={() => {
-                setNotice('')
-                setModal({ action: 'mcp' })
-              }}>MCP</button>
-              <button type="button" title="选择 MCP 提示词" disabled={!connected} onClick={() => {
-                setNotice('')
-                setModal({ action: 'prompts', sessionId: id })
-              }}>Prompts</button>
-              <button type="button" title="编辑当前会话的系统提示词" disabled={disabled} onClick={() => {
-                setNotice('')
-                setModal({ action: 'system', sessionId: id })
-              }}>系统提示词</button>
+                setModal({ action: 'options', sessionId: id })
+              }}>Options</button>
               <button type="button" title="将较早的会话内容压缩为摘要"
                 disabled={disabled || interrupted} onClick={() => void perform('compact')}>
                 {compacting ? '压缩中' : '压缩上下文'}
@@ -760,31 +764,25 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
       ? <Debug key={id} view={view} tools={tools} tab={tab} select={setTab} close={() => setOpen(false)} />
       : <button className="debug-rail" type="button" aria-label="展开调试面板" title="展开调试面板"
         onClick={() => setOpen(true)}><span aria-hidden="true">‹</span></button>}
-    {modal?.action === 'tools' && <ToolsDialog key={id} view={view} close={() => setModal(null)}
-      disabled={disabled || state.model.supports_tools !== true}
-      notice={notice} apply={(names) => perform('tools', { names })} />}
-    {modal?.action === 'skills' && modal.sessionId === id &&
-      <Dialog title="Skills" close={() => setModal(null)} className="mcp-dialog">
-        <SkillsManager skills={state.skills} notice={notice} perform={perform}
-          disabled={!connected || busy || navigationDisabled || view.revision < (acknowledged[id] ?? 0)} />
-      </Dialog>}
-    {modal?.action === 'mcp' && <Dialog title="MCP 服务" close={() => setModal(null)} className="mcp-dialog">
-      <MCPManager key={id} servers={state.mcp_servers} disabled={disabled} connected={connected} error={state.mcp_error}
-        notice={notice} perform={perform} command={command}
-        resourceServers={state.mcp_resource_servers} addResources={addResources} />
-    </Dialog>}
-    {modal?.action === 'prompts' && modal.sessionId === id &&
-      <Dialog title="MCP Prompts" close={() => setModal(null)} className="mcp-dialog">
-        <PromptPicker servers={state.mcp_prompt_servers} connected={connected} command={command}
-          runDisabled={disabled || interrupted} run={async (previewId, texts) => {
-            if (await perform('mcp_run_prompt', { session_id: modal.sessionId, preview_id: previewId, texts })) {
-              setModal((current) => current === modal ? null : current)
-            }
-          }} />
-        {notice && <p role="alert">{notice}</p>}
-      </Dialog>}
-    {modal?.action === 'system' && modal.sessionId === id && <SystemPromptDialog initial={state.system_prompt} close={() => setModal(null)}
-      disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />}
+    {modal?.action === 'options' && modal.sessionId === id &&
+      <OptionsDialog close={() => setModal(null)} clearNotice={() => setNotice('')} panels={{
+        tools: <ToolsPanel view={view} close={() => setModal((current) => current === modal ? null : current)}
+          disabled={disabled || state.model.supports_tools !== true} notice={notice}
+          apply={(names) => perform('tools', { names })} />,
+        skills: <SkillsManager skills={state.skills} notice={notice} perform={perform} clearNotice={() => setNotice('')}
+          disabled={!connected || busy || navigationDisabled || view.revision < (acknowledged[id] ?? 0)} />,
+        mcp: <MCPManager servers={state.mcp_servers} disabled={disabled} connected={connected} error={state.mcp_error}
+          notice={notice} perform={perform} command={command}
+          resourceServers={state.mcp_resource_servers} addResources={addResources}
+          prompts={<PromptPicker servers={state.mcp_prompt_servers} connected={connected} command={command}
+            runDisabled={disabled || interrupted} run={async (previewId, texts) => {
+              if (await perform('mcp_run_prompt', { session_id: id, preview_id: previewId, texts })) {
+                setModal((current) => current === modal ? null : current)
+              }
+            }} />} />,
+        system: <SystemPromptPanel initial={state.system_prompt} close={() => setModal((current) => current === modal ? null : current)}
+          disabled={disabled} notice={notice} apply={(prompt) => perform('system', { prompt })} />,
+      }} />}
     {modal?.action === 'model' && modal.sessionId === id && <SettingsDialog title="选择模型" value={modelKey(state.model)}
       close={() => setModal(null)} disabled={disabled} notice={notice}
       groups={[...new Set(state.models.map((model) => model.provider))].map((provider) => ({

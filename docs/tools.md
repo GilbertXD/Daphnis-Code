@@ -51,7 +51,7 @@ Web 在输入框旁切换审批模式。启用 FULL 需要确认风险，取消�
 
 ## MCP 配置与生命周期
 
-在 Web 顶部打开「MCP」，可手动添加 stdio 或 Streamable HTTP 服务，并编辑、重连或删除。创建时选择 Global 或 Project。Global 适用于所有工作区。Project 绑定创建时会话的规范化工作区路径，同一目录的无项目会话也可使用。两种作用域可以有同名服务，目录中的标识分别为 `global:name` 和 `project:name`。Global 沿用旧工具名，Project 的工具名含工作区标识以避免冲突。
+在「Options → MCP → 发现」右下角点击「手动添加」，可添加 stdio 或 Streamable HTTP 服务。在「已配置」中可以编辑、重连或删除服务。创建时选择 Global 或 Project。Global 适用于所有工作区。Project 绑定创建时会话的规范化工作区路径，同一目录的无项目会话也可使用。两种作用域可以有同名服务，目录中的标识分别为 `global:name` 和 `project:name`。Global 沿用旧工具名，Project 的工具名含工作区标识以避免冲突。
 
 | 加载策略 | 行为 |
 | --- | --- |
@@ -98,13 +98,13 @@ MCP 工具的文本和结构化结果共用 64 KiB 的 UTF-8 JSON 预算，预�
 
 ### 在线发现
 
-在「MCP → 发现」输入至少 3 个字符，搜索[官方 MCP Registry](https://registry.modelcontextprotocol.io)。结果显示各服务的最新版本。选择一项可查看来源、连接地址和本地软件包信息。选择支持的远程地址，按需填写 Bearer Token 的环境变量名，再确认添加。
+在「Options → MCP → 发现」输入至少 3 个字符，搜索[官方 MCP Registry](https://registry.modelcontextprotocol.io)。结果显示各服务的最新版本。选择一项可查看来源、连接地址和本地软件包信息。选择支持的远程地址，按需填写 Bearer Token 的环境变量名，再确认添加。
 
 在线发现可添加使用默认 HTTPS 端口的公网 Streamable HTTP 服务，连接会校验 DNS 解析结果并阻止重定向。支持无认证或 Bearer Token。OAuth、自定义认证头、地址模板和 SSE 服务不能通过发现添加。npm、PyPI 等软件包只展示安装信息，需自行安装后再配置 stdio。Registry 查询失败时，已配置的 MCP 服务仍可使用。
 
 ### MCP Prompts
 
-在输入框旁点击「Prompts」，展开提供 [MCP Prompts](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts) 的已连接服务。选择模板并填写参数，点击「生成预览」后，参数会发给所选服务。逐条核对或编辑正文，再点击「运行」。普通输入框及待发送附件独立保留。
+打开「Options → MCP → Prompts」，展开提供 [MCP Prompts](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts) 的已连接服务。选择模板并填写参数，点击「生成预览」后，参数会发给所选服务。逐条核对或编辑正文，再点击「运行」。普通输入框及待发送附件独立保留。
 
 一次运行对应一轮任务。模型按预览顺序收到原生 User 或 Assistant 文本消息，工具调用遵循当前审批模式。当前模型接口要求最后一条消息为 User。预览以 Assistant 结尾时，可点击「补充 User 消息」再运行。内嵌文本资源保留原角色和位置，预览中可查看只读全文。含图片、Blob 等不支持的内容时，整个 Prompt 暂时无法运行。
 
@@ -112,7 +112,7 @@ Web 会在预览中隐藏检测到的凭据。运行使用预览中确认的文�
 
 ### MCP Resources
 
-打开「MCP → Resources」，展开已连接服务，选择目录中的资源。URI 模板需要先填写参数，参数会编码后交给所选 MCP 服务读取。点击「读取资源」后，可查看标题、URI、MIME 类型、大小和只读全文。有多项结果时，可勾选其中需要的资源。点击「添加到消息」，资源会出现在当前会话的待发送附件中，可分别移除，也可与本地文件一起发送。
+打开「Options → MCP → Resources」，展开已连接服务，选择目录中的资源。URI 模板需要先填写参数，参数会编码后交给所选 MCP 服务读取。点击「读取资源」后，可查看标题、URI、MIME 类型、大小和只读全文。有多项结果时，可勾选其中需要的资源。点击「添加到消息」，资源会出现在当前会话的待发送附件中，可分别移除，也可与本地文件一起发送。
 
 支持 UTF-8 文本，常见 MIME 类型包括 `text/*`、`application/json` 和 `application/xml`。每份上限为 128 KiB，每次最多 10 份、总计 256 KiB。普通发送时，本地文件和独立资源共用该上限。图片、PDF 和 Blob 暂不支持。
 

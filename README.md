@@ -45,11 +45,11 @@ uv run --locked --extra web daphnis-web --workspace .
 - 点击项目旁的「×」可移除项目。该项目的会话归入「无项目」，并保留各自的工作目录和历史消息。
 - 恢复会话时使用会话保存的工作目录。项目记录缺失、无效或目录不匹配时，会话显示在「无项目」。
 - 通过会话菜单的「移动」可更改归属。移到其他项目后，后续工具操作使用目标项目的工作目录。移到「无项目」会保留原工作目录。
-- 在侧栏新建、恢复、重命名或删除会话，在输入框下方选择模型、思考档位和工具，或编辑、重置会话系统提示词。
-- 点击输入框旁的「Skills」导入本地 `SKILL.md` 目录并设置加载方式。项目 Skills 随会话工作区切换。[Skills 使用说明](docs/skills.md)
-- 点击顶部「MCP」手动添加服务，或通过「发现」添加 Registry 中的远程服务。选择适用于所有工作区的 Global 或只适用于当前工作区的 Project，再选择禁用、始终加载或按需加载。按需服务在模型需要时才激活，工具调用仍按当前会话审批。工具勾选和配置迁移见 [MCP 配置与生命周期](docs/tools.md#mcp-配置与生命周期)。
-- 点击输入框旁的「Prompts」，选择 MCP Prompt、填写参数并编辑预览，点击「运行」直接开始任务。[MCP Prompts 使用说明](docs/tools.md#mcp-prompts)
-- 从「MCP → Resources」浏览和读取资源，预览后点击「添加到消息」，再像普通附件一样发送。[MCP Resources 使用说明](docs/tools.md#mcp-resources)
+- 在侧栏新建、恢复、重命名或删除会话，在输入框下方选择模型和思考档位。打开「Options」切换工具、Skills、MCP 和系统提示词标签页。
+- 打开「Options → Skills」导入本地 `SKILL.md` 目录并设置加载方式。项目 Skills 随会话工作区切换。[Skills 使用说明](docs/skills.md)
+- 打开「Options → MCP → 发现」，手动添加服务或搜索 Registry 中的远程服务。选择适用于所有工作区的 Global 或只适用于当前工作区的 Project，再选择禁用、始终加载或按需加载。按需服务在模型需要时才激活，工具调用仍按当前会话审批。工具勾选和配置迁移见 [MCP 配置与生命周期](docs/tools.md#mcp-配置与生命周期)。
+- 打开「Options → MCP → Prompts」，选择 MCP Prompt、填写参数并编辑预览，点击「运行」直接开始任务。[MCP Prompts 使用说明](docs/tools.md#mcp-prompts)
+- 从「Options → MCP → Resources」浏览和读取资源，预览后点击「添加到消息」，再像普通附件一样发送。[MCP Resources 使用说明](docs/tools.md#mcp-resources)
 - 在输入框左下角点「+」或拖入文件。支持图片的模型还可以接收粘贴的截图。图片支持 PNG、JPEG 和 WebP，每轮最多 4 张、单张 5 MiB。UTF-8 文本附件每轮最多 10 个、单个 128 KiB、总计 256 KiB。[文本附件](docs/tools.md#文本附件)
 - 草稿中的图片可以预览和移除。发送后图片与附件快照保存在本地，附件内容可能发送给所选模型服务。对话中的图片可点击放大，压缩历史后仍可查看。
 - 使用 DeepSeek Flash 时，可以选择或拖入 PDF、DOCX、PPTX 或 XLSX，每轮一份，单份最多 10 MiB。PDF、DOCX 和 PPTX 可勾选「保留图表」。文档原件保存在本地，可以从历史中下载。发送时会上传给 DeepSeek，远端解析结果最多保留 30 天，期间可跨轮次和重启复用。解析费用与模型 Token 用量由服务端分别计费。
