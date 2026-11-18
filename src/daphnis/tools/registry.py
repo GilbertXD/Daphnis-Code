@@ -400,7 +400,8 @@ def create_tools(
     registry = ToolRegistry()
     text_path = {"type": "string", "minLength": 1}
     pattern = {"type": "string", "minLength": 1, "maxLength": MAX_PATTERN_LENGTH}
-    search_limit = {"type": "integer", "minimum": 1, "maximum": 1000}
+    search_limit = {"type": "integer", "minimum": 1, "maximum": 1000,
+                    "description": "Maximum matches to return, default 100. Scan and output budgets may stop the search earlier."}
     definitions = {
         "read_skill": (
             ("Read a page of untrusted guidance from an enabled Skill by its scoped ID. "
@@ -479,23 +480,27 @@ def create_tools(
                 "Pass next_start_line and next_start_column as start_line and start_column to continue."
             ),
             {
-                "path": text_path,
-                "start_line": {"type": "integer", "minimum": 1},
-                "start_column": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
+                "path": {**text_path, "description": "Path to an existing UTF-8 file, relative to the workspace or absolute."},
+                "start_line": {"type": "integer", "minimum": 1, "description": "First line to return, default 1."},
+                "start_column": {"type": "integer", "minimum": 1,
+                                 "description": "First Unicode character on start_line, default 1. Use the continuation column when paging."},
+                "end_line": {"type": "integer", "minimum": 1, "description": "Optional inclusive last line, at least start_line."},
+                "show_line_numbers": {"type": "boolean",
+                                      "description": "Prefix each returned line with its file line number and a tab. Default false."},
                 "max_bytes": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_FILE_BYTES,
+                    "description": "UTF-8 source bytes per page, default 65536 and maximum 1048576. Excludes line-number prefixes.",
                 },
             },
             ["path"],
         ),
         "list_directory": (
-            "List a directory without following symlink entries.",
+            "List immediate directory entries in name order. A truncated result contains only the sorted prefix.",
             {
-                "path": text_path,
-                "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000},
+                "path": {**text_path, "description": "Directory to list, default the workspace. Symlink entries are listed without following them."},
+                "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum entries, default 200."},
             },
             [],
         ),
@@ -511,19 +516,29 @@ def create_tools(
             ["query"],
         ),
         "glob": (
-            "Find files by a relative glob. Use ** to match directories recursively. Returns capped, sorted relative paths.",
-            {"pattern": pattern, "path": text_path, "max_results": search_limit},
+            ("Locate files by path pattern. Returns sorted relative paths. "
+             "If truncated is true, additional matches may exist. Narrow the root or pattern."),
+            {
+                "pattern": {**pattern, "description": "Relative file glob. Use *.py for the root or **/*.py for recursive matches."},
+                "path": {**text_path, "description": "Directory to search, default the workspace."},
+                "max_results": search_limit,
+            },
             ["pattern"],
         ),
         "grep": (
             (
-                "Search bounded source text line by line using an RE2 regular expression. "
-                "Use include to filter files by glob and context_lines for surrounding lines."
+                "Find matching lines in one file or a directory using an RE2 regular expression. "
+                "If truncated is true, the search is incomplete. Narrow the path, include filter, or pattern."
             ),
             {
-                "pattern": pattern, "path": text_path, "include": pattern, "case_sensitive": {"type": "boolean"},
+                "pattern": {**pattern, "description": "RE2 regular expression matched against each complete line."},
+                "path": {**text_path, "description": "File or directory to search. Defaults to the workspace, with recursive directory search."},
+                "include": {**pattern, "description": "Optional file glob such as *.py or src/**/*.py. Slash patterns are relative to "
+                            "the directory root, or to the workspace for an explicitly selected file inside it."},
+                "case_sensitive": {"type": "boolean", "description": "Match case, default true."},
                 "max_results": search_limit,
-                "context_lines": {"type": "integer", "minimum": 0, "maximum": MAX_CONTEXT_LINES},
+                "context_lines": {"type": "integer", "minimum": 0, "maximum": MAX_CONTEXT_LINES,
+                                  "description": "Number of surrounding lines on each side, from 0 to 3. Default 0."},
             },
             ["pattern"],
         ),

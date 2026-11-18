@@ -27,6 +27,35 @@ class CodeSearchTests(unittest.IsolatedAsyncioTestCase):
     async def execute(self, name, **arguments):
         return (await self.tools.execute(call(name, **arguments))).value
 
+    async def test_grep_single_file_respects_filters_and_file_protection(self):
+        file = self.write("src/module.py", "first\nneedle\n")
+        self.write("src/other.py", "needle\n")
+        self.write(".env", "needle\n")
+        (self.workspace / "alias.py").symlink_to(file)
+        for include in ("*.py", "src/**/*.py"):
+            found = await self.execute("grep", path="src/module.py", pattern="needle", include=include)
+            self.assertEqual([(item["path"], item["line"]) for item in found["matches"]], [("module.py", 2)])
+            self.assertEqual(found["scanned_files"], 1)
+        excluded = await self.execute("grep", path="src/module.py", pattern="needle", include="*.txt")
+        self.assertEqual(excluded["matches"], [])
+        for path, code in ((".env", "sensitive_path"), ("alias.py", "invalid_path"), ("missing", "file_not_found")):
+            error = await self.execute("grep", path=path, pattern="needle")
+            self.assertEqual(error["error"]["code"], code)
+
+    async def test_read_numbering_keeps_source_pagination(self):
+        self.write("sample.txt", "first\r\n界🙂\r\nlast")
+        args = {"path": "sample.txt", "start_line": 2, "max_bytes": 5}
+        plain = await self.execute("read_file", **args)
+        numbered = await self.execute("read_file", **args, show_line_numbers=True)
+        self.assertEqual(numbered, {**plain, "content": "2\t界"})
+        resumed = await self.execute("read_file", path="sample.txt", start_line=numbered["next_start_line"],
+                                     start_column=numbered["next_start_column"], show_line_numbers=True)
+        self.assertEqual(resumed["content"], "2\t🙂\r\n3\tlast")
+        schemas = {item["function"]["name"]: item["function"]["parameters"]["properties"] for item in self.tools.definitions()}
+        for name in ("glob", "grep", "read_file", "list_directory"):
+            self.assertTrue(all(field.get("description") for field in schemas[name].values()))
+        self.assertEqual(schemas["grep"]["context_lines"]["maximum"], 3)
+
     async def test_read_lines_beyond_the_first_megabyte_and_preserve_newlines(self):
         prefix = (b"a" * 1023 + b"\n") * 1300
         path = self.workspace / "large.txt"

@@ -156,7 +156,7 @@ def prepare_code_search(
     root = Target.capture(arguments.get("path", "."), workspace)
     private = tuple(_lock_path(path) for path in (*private, _lock_directory()))
     if _protected(root.path, private) or _protected(root.requested, private):
-        raise ToolError("sensitive_path", "This directory is excluded from code search.")
+        raise ToolError("sensitive_path", "This path is excluded from code search.")
     if root.path != Path(os.path.abspath(root.requested)):
         raise ToolError("invalid_path", "Code search roots cannot traverse symbolic links.")
 
@@ -175,14 +175,19 @@ def prepare_code_search(
         pattern = _glob_parts(arguments["pattern"])
 
     def search(cancelled: Event) -> dict[str, Any]:
-        if root.identity is not None and not stat.S_ISDIR(root.identity[2]):
+        if root.identity is None:
+            raise ToolError("file_not_found", "The search path does not exist.")
+        single_file = expression is not None and stat.S_ISREG(root.identity[2])
+        if not single_file and not stat.S_ISDIR(root.identity[2]):
             raise ToolError("not_directory", "The search path must be a directory.")
         deadline = monotonic() + _SEARCH_SECONDS
 
         def stopped():
             return cancelled.is_set() or monotonic() >= deadline
 
-        files, entries, skipped, truncated = _scan_files(root, private, stopped)
+        files, entries, skipped, truncated = (
+            ([root], 1, 0, False) if single_file else _scan_files(root, private, stopped)
+        )
         matches = []
         scanned_files = scanned_bytes = result_bytes = 0
         limit = arguments.get("max_results", 100)
@@ -201,8 +206,10 @@ def prepare_code_search(
             if stopped():
                 truncated = True
                 break
-            relative = file.path.relative_to(root.path)
+            relative = Path(file.path.name) if single_file else file.path.relative_to(root.path)
             parts = relative.parts[-1:] if expression is not None and pattern and len(pattern) == 1 else relative.parts
+            if single_file and pattern and len(pattern) > 1 and file.path.is_relative_to(workspace):
+                parts = file.path.relative_to(workspace).parts
             if pattern and not _matches_glob(parts, pattern):
                 continue
             if expression is None:
@@ -223,7 +230,12 @@ def prepare_code_search(
                     skipped += 1
                     continue
                 text = decode_text(data, shortened)
-            except (OSError, UnicodeError, ToolError):
+            except UnicodeError:
+                skipped += 1
+                continue
+            except (OSError, ToolError):
+                if single_file:
+                    raise
                 skipped += 1
                 continue
             if not all(add(item) for item in _matching_lines(text, relative.as_posix(), expression, context, shortened, stopped)):

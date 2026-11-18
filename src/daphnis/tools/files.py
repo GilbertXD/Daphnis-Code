@@ -216,8 +216,11 @@ def _read_page(source: TextIO, arguments: dict[str, Any], cancelled: Event) -> d
             column += length
     if start_column > 1 and last_line is None and not cancelled.is_set():
         raise ToolError("invalid_range", "start_column is outside start_line.")
+    body = "".join(content)
+    if arguments.get("show_line_numbers", False):
+        body = "".join(f"{number}\t{row}" for number, row in enumerate(body.splitlines(keepends=True), start))
     return {
-        "content": "".join(content), "start_line": start, "start_column": start_column,
+        "content": body, "start_line": start, "start_column": start_column,
         "end_line": last_line, "truncated": next_line is not None,
         "next_start_line": next_line, "next_start_column": next_column, "scanned_bytes": scanned,
     }
