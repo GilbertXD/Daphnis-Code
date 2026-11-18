@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 from dotenv import load_dotenv
 
 from daphnis import History, Operations, TurnStatus
+from daphnis.agent import TurnResult
 from daphnis.app import Application
 from daphnis.compaction_settings import CompactionSettings
 from daphnis.config import environment_connections
@@ -21,7 +22,7 @@ from daphnis.usage import _reported_usage
 
 MODELS = {"mimo": "mimo-v2.6-flash", "deepseek": "deepseek-flash"}
 SERVER = "https://learn.microsoft.com/api/mcp"
-SERVER_ID = "global:learn"
+MAX_MODEL_REQUESTS = 7  # Includes primary and compaction, plus one separate title budget.
 READ_ONLY_TOOLS = {"microsoft_docs_search", "microsoft_docs_fetch", "microsoft_code_sample_search"}
 TASKS = {
     "T1": (
@@ -205,7 +206,7 @@ async def trajectory(root, connection, provider, mode, task_id, stage, repeat):
         workspace=root / "workspace", provider=provider, model_id=model, interactive=True,
         connections={provider: connection}, history=History(root / "state" / "sessions"),
         compaction_settings=CompactionSettings(auto_enabled=False),
-        output_limits={(provider, model): 768}, max_primary_requests=6, max_total_requests=7,
+        output_limits={(provider, model): 768}, max_primary_requests=6, max_total_requests=MAX_MODEL_REQUESTS,
         **options,
     )
     ops = Operations(app)
@@ -223,7 +224,7 @@ async def trajectory(root, connection, provider, mode, task_id, stage, repeat):
         for name in EVENTS:
             ops.subscribe(name, trace.observe)
 
-        def approve(event):
+        async def approve(event):
             tool = event.data["request"]["tool_name"]
             decision = ApprovalDecision.ALLOW_ONCE if tool in {
                 f"mcp__learn__{name}" for name in READ_ONLY_TOOLS
@@ -234,23 +235,22 @@ async def trajectory(root, connection, provider, mode, task_id, stage, repeat):
         http = app._client(provider)._http  # Test instrumentation only, after compatibility mapping.
         http.event_hooks["request"].append(trace.request)
         http.event_hooks["response"].append(trace.response)
-        result = await ops.send(TASKS[task_id][0], session_id=sid, stream=False)
+        timed_out = False
+        try:
+            async with asyncio.timeout(120):
+                result = await ops.send(TASKS[task_id][0], session_id=sid, stream=False)
+        except TimeoutError:
+            timed_out = True
+            primary = [row for row in trace.requests.values() if row["purpose"] == "primary"]
+            result = TurnResult(sid, primary[-1]["turn_id"] if primary else "", TurnStatus.CANCELLED,
+                                primary_requests=len(primary))
         await app.events.drain()
         summary = trace.result(result, ops.session_usage(sid))
-        if summary["status"] == "FAILED" or not all(
-            row["sent"] and row["finished"] for row in trace.requests.values() if row["purpose"] == "primary"
-        ):
-            summary["request_failures"] = sum(
-                not row["finished"] for row in trace.requests.values() if row["purpose"] == "primary"
-            )
-        else:
-            summary["request_failures"] = 0
-        # The experiment makes no explicit retries. The Agent can retry in-place if
-        # a context error is recoverable; annotate failures so repeated phases are visible.
-        summary["retries"] = sum(
-            not first["finished"] and second["purpose"] == first["purpose"] == "primary"
-            for first, second in zip(list(trace.requests.values()), list(trace.requests.values())[1:])
-        )
+        primary = [row for row in trace.requests.values() if row["purpose"] == "primary"]
+        summary["request_failures"] = sum(not row["finished"] for row in primary)
+        summary["retries"] = sum(not row["finished"] for row in primary[:-1])
+        if timed_out:
+            summary["timed_out"] = True
         return [*trace.requests.values(), summary]
     finally:
         await ops.close()
@@ -275,14 +275,16 @@ async def run(args):
                 for repeat in range(1, repeats + 1):
                     modes = (args.mode,) if args.mode else (("native", "gateway") if repeat % 2 else ("gateway", "native"))
                     for mode in modes:
-                        if attempts + 7 > args.request_budget or failures >= 2:
+                        if attempts + MAX_MODEL_REQUESTS + 1 > args.request_budget or failures >= 2:
                             raise SystemExit(f"Stopped at {attempts} requests after {failures} failed trajectories.")
                         rows = await trajectory(root, connections[provider], provider, mode, task, args.stage, repeat)
                         output.writelines(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
                         output.flush()
                         summary = rows[-1]
                         attempts += len(rows) - 1
-                        failures = failures + 1 if summary["request_failures"] or not summary["distinct_successful_mcp_calls"] else 0
+                        failed = (summary["status"] != "COMPLETED" or summary["request_failures"]
+                                  or not summary["distinct_successful_mcp_calls"])
+                        failures = failures + 1 if failed else 0
                         print(provider, task, repeat, mode, summary["status"], summary["success"], len(rows) - 1,
                               flush=True)
 

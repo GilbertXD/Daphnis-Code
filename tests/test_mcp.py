@@ -184,6 +184,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("project:lazy", requests[0][0])
             self.assertNotIn("global:off", requests[0][0])
             self.assertIn("activate_mcp", requests[0][1])
+            self.assertNotIn("call_mcp_tool", requests[0][1])
             self.assertNotIn(native, requests[0][1])
             self.assertEqual(requests[1][1][native]["parameters"]["properties"]["a"]["type"], "integer")
             self.assertEqual(approvals, [native])
@@ -214,6 +215,144 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(auto, requests[-1][1])
             self.assertEqual(len(ops.list_mcp_servers(b)), 2)
             self.assertEqual(ops.list_mcp_servers(a), ("lazy",))
+
+    async def test_gateway_keeps_models_tools_fixed_and_applies_target_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = []
+            approvals = []
+            running = []
+
+            def gateway(call_id, tool="add", **arguments):
+                return tool_call(
+                    "call_mcp_tool", call_id, server_id="global:lazy", tool_name=tool, arguments=arguments,
+                )
+
+            def model(request):
+                body = json.loads(request.content)
+                messages = body["messages"]
+                last = messages[-1]
+                calls = []
+                if messages[0]["content"] == TITLE_PROMPT:
+                    pass
+                else:
+                    primary.append(body["tools"])
+                    if last["content"] == "first":
+                        calls = [
+                            tool_call("activate_mcp", "activate", server_id="global:lazy"),
+                            gateway("same_batch", a=1, b=2),
+                            tool_call("activate_mcp", "disabled", server_id="global:off"),
+                        ]
+                    elif last.get("tool_call_id") == "disabled":
+                        calls = [
+                            gateway("invalid", a="20", b=22),
+                            gateway("unknown", "missing", a=20, b=22),
+                            tool_call("mcp__lazy__add", "hidden", a=20, b=22),
+                            gateway("good", a=20, b=22),
+                            gateway("trusted", a=1, b=2),
+                            gateway("other", "math.add", a=2, b=3),
+                        ]
+                    elif last["content"] == "new session":
+                        calls = [gateway("isolated", a=20, b=22)]
+                    elif last["content"] == "disabled tool":
+                        calls = [gateway("disabled_tool", a=20, b=22), gateway("ask", "math.add", a=4, b=6)]
+                    elif last["content"] == "cancel tool":
+                        calls = [gateway("cancelled", "math.add", a=-1, b=0)]
+                message = {"role": "assistant", "tool_calls": calls} if calls else {
+                    "role": "assistant", "content": "Done",
+                }
+                return httpx.Response(200, json={"choices": [{"index": 0, "message": message,
+                    "finish_reason": "tool_calls" if calls else "stop"}]})
+
+            app = Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash", interactive=True,
+                mcp_tool_loading="gateway", history=History(root / "sessions"),
+                connections={"deepseek": {"base_url": "https://model.test", "transport": httpx.MockTransport(model)}},
+            )
+            self.addAsyncCleanup(app.close)
+            ops = Operations(app)
+            first = ops.initial_session_id
+            options = {"command": sys.executable, "args": [str(DEMO), directory]}
+            await ops.save_mcp("lazy", state="on_demand", options=options, create=True)
+            await ops.save_mcp("off", state="disabled", options=options, create=True)
+            self.assertFalse((root / "pid").exists())
+
+            async def approve(event):
+                request = event.data["request"]
+                approvals.append((request["tool_name"], request["tool_call_id"], request["can_trust"]))
+                decision = (
+                    ApprovalDecision.TRUST_SESSION if request["tool_call_id"] == "good" else
+                    ApprovalDecision.DENY if request["tool_call_id"] == "other" else ApprovalDecision.ALLOW_ONCE
+                )
+                self.assertTrue(ops.resolve_approval(event.data["request_id"], decision, session_id=event.session_id))
+
+            def record(event):
+                call_id = event.data["tool_call_id"]
+                messages = app._history.load(event.session_id).messages.snapshot()
+                result = next(item for item in messages if item.get("tool_call_id") == call_id)
+                running.append((call_id, result.get(TOOL_STATE)))
+
+            def results(session_id):
+                return {item["tool_call_id"]: json.loads(item["content"])
+                        for item in ops.message_snapshot(session_id) if item["role"] == "tool"}
+
+            ops.subscribe("tool.approval_requested", approve)
+            ops.subscribe("tool.executing", record)
+            outcome = await asyncio.wait_for(ops.send("first", session_id=first, stream=False), 10)
+            self.assertEqual(outcome.status, TurnStatus.COMPLETED, outcome.error)
+            self.assertEqual(len(primary), 3)
+            self.assertEqual(primary[0], primary[1])
+            self.assertEqual(primary[1], primary[2])
+            names = {item["function"]["name"] for item in primary[0]}
+            self.assertTrue({"activate_mcp", "call_mcp_tool"}.issubset(names))
+            self.assertFalse(any(name.startswith("mcp__") for name in names))
+            data = results(first)
+            self.assertEqual([tool["name"] for tool in data["activate"]["tools"]], ["add", "math.add"])
+            self.assertEqual(data["activate"]["tools"][0]["parameters"], app._mcp["lazy"].tools["mcp__lazy__add"].input_schema)
+            for call_id, code in (
+                ("same_batch", "mcp_tool_not_available"), ("disabled", "mcp_not_available"),
+                ("invalid", "arguments_schema_mismatch"), ("unknown", "mcp_tool_not_available"),
+                ("hidden", "unknown_tool"), ("other", "permission_denied"),
+            ):
+                self.assertEqual(data[call_id]["error"]["code"], code)
+            self.assertEqual(data["good"]["structured_content"], {"sum": 42})
+            self.assertEqual(data["trusted"]["structured_content"], {"sum": 3})
+            self.assertEqual([(call_id, can_trust) for _, call_id, can_trust in approvals], [("good", True), ("other", True)])
+            self.assertTrue(all(name.startswith("mcp__lazy__") for name, _, _ in approvals))
+            self.assertEqual(running, [(call_id, RUNNING) for call_id in ("activate", "disabled", "good", "trusted")])
+
+            second = (await ops.new_session(session_id=first)).id
+            ops.set_approval_mode("full", session_id=second)
+            await ops.send("new session", session_id=second, stream=False)
+            self.assertEqual(results(second)["isolated"]["error"]["code"], "mcp_tool_not_available")
+            await ops.set_tools(tuple(name for name in ops.enabled_tools(first) if name != "mcp__lazy__add"), session_id=first)
+            ops.set_approval_mode("ask", session_id=first)
+            await ops.send("disabled tool", session_id=first, stream=False)
+            self.assertEqual(results(first)["disabled_tool"]["error"]["code"], "mcp_tool_not_available")
+            self.assertEqual(results(first)["ask"]["structured_content"], {"sum": 10})
+            self.assertEqual(approvals[-1][1:], ("ask", False))
+
+            ops.set_approval_mode("full", session_id=first)
+            entered = asyncio.Event()
+            original_call = MCPConnection.call
+
+            async def observe_call(connection, name, arguments):
+                if arguments["a"] == -1:
+                    entered.set()
+                return await original_call(connection, name, arguments)
+
+            with patch.object(MCPConnection, "call", observe_call):
+                pending = asyncio.create_task(ops.send("cancel tool", session_id=first, stream=False))
+                await asyncio.wait_for(entered.wait(), 5)
+                await ops.cancel(first)
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                self.assertEqual(running[-1], ("cancelled", RUNNING))
+                self.assertEqual(approvals[-1][1], "ask")
+                recovery = ops.recovery(first)
+                resumed = await ops.continue_interrupted_turn(recovery.key, session_id=first, stream=False)
+                self.assertEqual(resumed.status, TurnStatus.COMPLETED, resumed.error)
+                self.assertEqual(running.count(("cancelled", RUNNING)), 1)
 
     async def test_sessions_share_one_connection_and_select_their_own_tools(self):
         with tempfile.TemporaryDirectory() as directory:
