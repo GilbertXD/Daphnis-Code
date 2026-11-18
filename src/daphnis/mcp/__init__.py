@@ -247,6 +247,7 @@ class MCPConnection:
         url: str | None = None,
         auth: Mapping[str, str] | None = None,
         public_only: bool = False,
+        key: str | None = None,
     ) -> None:
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,20}", name):
             raise ValueError("MCP Server 名称须为 1–20 位字母、数字或连字符。")
@@ -279,8 +280,8 @@ class MCPConnection:
             )
         ):
             raise ValueError("MCP env 必须将子进程变量名映射到本地变量名。")
-        self.name = name
-        self.prefix = f"{TOOL_PREFIX}{name}__"
+        self.name = key if key is not None else name
+        self.prefix = f"{TOOL_PREFIX}{self.name}__"
         self._command, self._args, self._cwd = command, tuple(args), cwd
         self._env = dict(env or {})
         self._url = _http_url(url) if transport == "streamable_http" else None
@@ -512,7 +513,7 @@ class MCPConnection:
                     or not re.fullmatch(r"[A-Za-z0-9_-]+", tool.name)
                 ):
                     alias = (
-                        self.prefix + "__" + sha256(tool.name.encode()).hexdigest()[:32]
+                        self.prefix + "__" + sha256(tool.name.encode()).hexdigest()[:min(32, 62 - len(self.prefix))]
                     )
                 if alias in tools or tool.name in original_names:
                     raise ValueError("MCP Server 返回了重复的工具名称。")

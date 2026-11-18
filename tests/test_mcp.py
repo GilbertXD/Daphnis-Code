@@ -15,6 +15,7 @@ from daphnis import History, Operations, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.mcp import MCPConnection, MCPPromptError, MCPResourceError
+from daphnis.mcp_store import MCPServerConfig, MCPStore
 from daphnis.runtime import open_operations
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
@@ -28,6 +29,34 @@ def tool_call(name, call_id, **arguments):
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(arguments)},
     }
+
+
+class MCPStoreTests(unittest.TestCase):
+    def test_old_config_migrates_without_changing_options_and_scopes_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve()
+            store = MCPStore(workspace / "mcp.json")
+            local = {"command": "example", "args": ["a b"], "env": {"TOKEN": "EXAMPLE_TOKEN"}}
+            remote = {"transport": "streamable_http", "url": "https://example.com/mcp",
+                      "auth": {"type": "bearer", "env": "REMOTE_TOKEN"}}
+            old = {"version": 1, "servers": {
+                "same": {"enabled": True, "options": local},
+                "remote": {"enabled": False, "options": remote},
+            }}
+            store.path.write_text(json.dumps(old))
+            configs = store.read()
+            self.assertEqual(configs["same"], MCPServerConfig("same", "always", local))
+            self.assertEqual(configs["remote"], MCPServerConfig("remote", "disabled", remote))
+            self.assertEqual(json.loads(store.path.read_text()), old)
+            project = MCPServerConfig("same", "on_demand", local, workspace, "Local example")
+            configs[project.key] = project
+            store.write(configs)
+            self.assertEqual(store.read(), configs)
+            self.assertEqual(project.id, "project:same")
+            self.assertEqual(configs["same"].id, "global:same")
+            self.assertTrue(configs["same"].applies_to(workspace / "another"))
+            self.assertFalse(project.applies_to(workspace / "another"))
+            self.assertNotEqual(project.connection().prefix, configs["same"].connection().prefix)
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):

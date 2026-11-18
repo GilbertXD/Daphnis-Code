@@ -328,9 +328,9 @@ class Operations:
                 for name, options in load_mcp_config(path).items():
                     if isinstance(options.get("cwd"), Path):
                         options["cwd"] = str(options["cwd"])
-                    configs[name] = MCPServerConfig.from_json(
-                        name, {"enabled": True, "options": options}, app._history_redactor,
-                    )
+                    config = MCPServerConfig(name, "always", options)
+                    config.connection(app._history_redactor)
+                    configs[name] = config
                 store.write(configs)
 
     async def save_mcp(
@@ -352,7 +352,7 @@ class Operations:
                 options = deepcopy(options if options is not None else current.options)
                 if current and current.options.get("public_only"):
                     options["public_only"] = True
-                config = MCPServerConfig(name, enabled, options)
+                config = MCPServerConfig(name, "always" if enabled else "disabled", options)
                 connection = config.connection(app._history_redactor)
                 if config == current:
                     return None
