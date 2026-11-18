@@ -304,6 +304,13 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 await ops.reset_system_prompt(ops.initial_session_id)
                 self.assertIsNone(history.load(ops.initial_session_id).system_prompt)
                 self.assertEqual(ops.get_system_prompt(ops.initial_session_id), default)
+                result = await ops.send("Inspect the workspace", stream=False, session_id=ops.initial_session_id)
+                self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                prompt = seen[-1][0]["content"]
+                self.assertIn("ask_user", prompt)
+                self.assertIn("glob", prompt)
+                self.assertIn("grep", prompt)
+                self.assertEqual(prompt.count(json.dumps(str(root.resolve()), ensure_ascii=False)), 1)
             finally:
                 await ops.close()
 

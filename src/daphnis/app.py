@@ -1,6 +1,7 @@
 """Own Daphnis runtime resources and supervise Turn execution."""
 
 import asyncio
+import json
 import logging
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import AsyncExitStack, contextmanager
@@ -558,6 +559,9 @@ class Application:
         custom_compatibility = (
             self._connection(provider).get("compatibility") is not None
         )
+        system_prompt = session.effective_system_prompt
+        if session.system_prompt is None:
+            system_prompt += "\n\n当前会话工作区：" + json.dumps(str(session.workspace), ensure_ascii=False)
         agent = Agent(
             client=self._client(provider),
             provider=provider,
@@ -565,7 +569,7 @@ class Application:
             custom_compatibility=custom_compatibility,
             tools=self._tools.select(enabled_tools, mode=runtime.approval_mode),
             events=self.events,
-            context=Context(system_prompt=session.effective_system_prompt, skills=skills, skill_result_start=skill_result_start),
+            context=Context(system_prompt=system_prompt, skills=skills, skill_result_start=skill_result_start),
             compaction_settings=self._model_compaction_settings.get(
                 (provider, session.model_id), self._compaction_settings,
             ),
