@@ -20,7 +20,7 @@ from .redaction import Redactor
 _EVENT_NAMES = (
     "turn.started", "turn.finished", "attachments.committed", "prompt.committed", "model.started", "model.request",
     "model.delta", "model.usage", "model.finished", "model.response_error",
-    "tool.started", "tool.approval_requested", "tool.blocked", "tool.executing", "tool.finished",
+    "tool.started", "tool.approval_requested", "tool.question_requested", "tool.blocked", "tool.executing", "tool.finished",
     "mcp.error", "mcp.tools_changed",
     "context.budget", "context.overflow",
     "compaction.started", "compaction.finished", "compaction.committed", "compaction.discarded",
@@ -284,6 +284,7 @@ class Bridge:
         journal = self.journals.get(session)
         reset = previous_session != session or (journal is not None and cursor < journal.floor)
         approval = ops.pending_approval(session)
+        question = ops.pending_question(session)
         usage = ops.turn_usage(session)
         budget = ops.context_budget(session)
         frame = {
@@ -295,6 +296,7 @@ class Bridge:
             "status": self.redactor.json({
                 "running": ops.running(session) or run is not None,
                 "approval": asdict(approval) if approval else None,
+                "question": asdict(question) if question else None,
                 "session_usage": asdict(ops.session_usage(session)),
                 "turn_usage": asdict(usage) if usage else None,
                 "context_budget": {

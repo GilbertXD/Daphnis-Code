@@ -166,9 +166,24 @@ export type ContextBudget = {
   unknown_documents?: number
 }
 
+export type Question = {
+  id: string
+  question: string
+} & ({ type: 'text' } | { type: 'single_select' | 'multi_select'; options: string[] })
+
+export type QuestionRequest = {
+  request_id: string
+  session_id: string
+  turn_id: string
+  tool_call_id: string
+  questions: Question[]
+}
+export type QuestionAnswers = Record<string, string | string[]>
+
 export type Status = {
   running: boolean
   approval: Approval | null
+  question: QuestionRequest | null
   session_usage: Usage
   turn_usage: Usage | null
   context_budget: ContextBudget | null

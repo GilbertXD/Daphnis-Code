@@ -83,6 +83,7 @@ _FIELDS = {
     "terminate": {"key": str},
     "cancel": {"run_id": str},
     "approve": {"request_id": str, "decision": str},
+    "answer_question": {"request_id": str, "turn_id": str, "answers": dict},
 }
 _RUN_ACTIONS = {"send", "retry", "continue", "terminate", "compact"}
 _PROMPT_ACTIONS = {"mcp_list_prompts", "mcp_get_prompt"}
@@ -334,6 +335,10 @@ async def _execute(bridge, action, session, args, discovery):
     if action == "cancel":
         if not await bridge.cancel(session, args["run_id"]):
             raise RequestError("该轮已结束。", 409)
+        return None, None
+    if action == "answer_question":
+        if not ops.answer_question(args["request_id"], args["turn_id"], args["answers"], session_id=session):
+            raise RequestError("问题已回答或不再属于当前任务。", 409)
         return None, None
     if action == "approve":
         pending = ops.pending_approval(session)

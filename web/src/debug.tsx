@@ -23,6 +23,7 @@ const names: Record<string, string> = {
   'tool.started': '开始调用工具',
   'tool.executing': '执行工具',
   'tool.approval_requested': '需要确认工具权限',
+  'tool.question_requested': '等待用户回答',
   'tool.blocked': '工具调用已拦截',
   'tool.finished': '工具调用结束',
   'web.send_finished': 'Operation 返回',

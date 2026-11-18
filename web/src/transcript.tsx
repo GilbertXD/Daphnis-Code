@@ -336,7 +336,9 @@ export function Transcript({ view, tools, retry, loadImage, loadDocument }: {
               transcriptTool(tool, shownSkills))}
           </div>
         })}
-        <p className="muted live-status" role="status">{view.status.approval ? '等待工具审批' : 'Agent 运行中…'}</p>
+        <p className="muted live-status" role="status">
+          {view.status.question ? '等待回答' : view.status.approval ? '等待工具审批' : 'Agent 运行中…'}
+        </p>
       </>}
       {!run && outcome && outcome.data.status !== 'COMPLETED' && <div className="outcome" role="status">
         <strong>{states[outcome.data.status ?? ''] ?? '未完成'}</strong>

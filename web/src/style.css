@@ -189,6 +189,12 @@ dialog.image-viewer { width: max-content; max-width: 94vw; padding: 10px; }
 .approval p, .approval details { font-size: .87rem; margin-top: 6px; }
 .approval .data-block { margin-top: 6px; }
 .approval pre { max-height: 115px; }
+.question-form { padding: 10px 12px; margin-bottom: 8px; max-height: min(40dvh, 320px); overflow: auto; }
+.question-form fieldset { min-width: 0; margin: 6px 0 0; padding: 0; border: 0; font-size: .87rem; }
+.question-form legend { max-width: 100%; margin-bottom: 6px; padding: 0; overflow-wrap: anywhere; }
+.question-option { display: flex; align-items: baseline; gap: 6px; margin-top: 6px; overflow-wrap: anywhere; }
+.question-option input { flex: none; accent-color: var(--ink); }
+.question-form .field { margin-bottom: 0; }
 
 .debug-rail { grid-area: debug; border: 0; border-left: 1px solid var(--ink); display: flex; justify-content: center; align-items: flex-start; padding: 12px 0; font-size: 1.6rem; }
 .debug { grid-area: debug; display: flex; flex-direction: column; border-left: 1px solid var(--ink); min-width: 0; min-height: 0; }

@@ -9,6 +9,7 @@ import { MCPManager } from './mcp'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
 import type { Approval, Command, LoadAttachment, Model, Project, ResourceDraft, Session, View } from './protocol'
+import { QuestionForm } from './questions'
 import { SkillsManager } from './skills'
 import { collectTools, DataBlock, Transcript } from './transcript'
 import './style.css'
@@ -641,6 +642,10 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
         {status.approval && <ApprovalCard key={status.approval.request_id} request={status.approval}
           disabled={busy || !connected} choose={(decision) => void perform('approve', {
             request_id: status.approval?.request_id, decision,
+          })} />}
+        {status.question && <QuestionForm key={status.question.request_id} request={status.question}
+          disabled={busy || !connected} submit={(answers) => perform('answer_question', {
+            request_id: status.question?.request_id, turn_id: status.question?.turn_id, answers,
           })} />}
         {interrupted && !status.running && <div className="recovery" role="group" aria-label="未完成任务">
           <span>未完成任务</span>

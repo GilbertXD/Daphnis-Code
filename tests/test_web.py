@@ -153,6 +153,18 @@ class WebTests(unittest.TestCase):
                 return httpx.Response(400, json={"error": {"message": "Fixture first resource turn fails.", "echo": body}})
             if last.get("content") == "force-error":
                 return httpx.Response(429, json={"error": {"api_key": API_KEY, "message": "Rate limit"}})
+            if content == "exercise user questions":
+                return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunk({
+                    "role": "assistant", "tool_calls": [{
+                        "index": 0, "id": "ask-fixture", "type": "function", "function": {
+                            "name": "ask_user", "arguments": json.dumps({"questions": [
+                                {"id": "scope", "type": "single_select", "question": "Which scope?", "options": ["A", "B"]},
+                                {"id": "checks", "type": "multi_select", "question": "Which checks?", "options": ["C", "D"]},
+                                {"id": "note", "type": "text", "question": "Any note?"},
+                            ]}),
+                        },
+                    }],
+                }, "tool_calls") + b"data: [DONE]\n\n")
             if content == "exercise skill loading":
                 self.resume = asyncio.Event()
                 calls = [
@@ -259,6 +271,46 @@ class WebTests(unittest.TestCase):
         names = {event["name"] for event in frame["events"]}
         self.assertNotIn("model.request", names)
         self.assertNotIn("model.response_error", names)
+
+    def test_questions_survive_reconnect_and_only_accept_current_batch_answers(self):
+        session = self.snapshot()["session_id"]
+        self.command("set_approval_mode", session, mode="ask")
+        self.command("send", session, 202, prompt="exercise user questions")
+        frame = self.wait_for(lambda item: item["status"]["question"], session)
+        question = frame["status"]["question"]
+        self.assertEqual([item["type"] for item in question["questions"]], ["single_select", "multi_select", "text"])
+        self.assertIsNone(frame["status"]["approval"])
+        self.assertIn("tool.question_requested", {event["name"] for event in frame["events"]})
+        self.assertEqual(self.snapshot(session)["status"]["question"], question)
+
+        other = self.command("new", session)["session_id"]
+        self.assertIsNone(self.snapshot(other)["status"]["question"])
+        self.command("send", other, 202, prompt="Independent turn")
+        self.wait_for(lambda item: item["events"] and item["events"][-1]["name"] == "web.send_finished", other)
+        self.assertEqual(self.snapshot(session)["status"]["question"], question)
+        answers = {"scope": "Other scope", "checks": ["C", "D", "Other check"], "note": "不回答"}
+        fields = {"request_id": question["request_id"], "turn_id": question["turn_id"], "answers": answers}
+        self.command("answer_question", other, 409, **fields)
+        self.command("answer_question", session, 409, **{**fields, "answers": {"scope": "A"}})
+        self.command("answer_question", session, **fields)
+        self.command("answer_question", session, 409, **fields)
+        done = self.wait_for(lambda item: item["run"] is None, session)
+        self.assertIsNone(done["status"]["question"])
+        self.assertEqual(done["events"][-1]["data"]["status"], "COMPLETED")
+        tool = next(message for message in done["state"]["messages"] if message["role"] == "tool")
+        self.assertEqual(json.loads(tool["content"]), {"ok": True, "answers": answers})
+
+    def test_stopping_a_question_turn_invalidates_its_web_request(self):
+        session = self.snapshot()["session_id"]
+        self.command("send", session, 202, prompt="exercise user questions")
+        frame = self.wait_for(lambda item: item["status"]["question"], session)
+        question = frame["status"]["question"]
+        self.command("cancel", session, run_id=frame["run"]["id"])
+        stopped = self.wait_for(lambda item: item["run"] is None, session)
+        self.assertIsNone(stopped["status"]["question"])
+        self.assertEqual(stopped["state"]["recovery"]["kind"], "INTERRUPTED_TURN")
+        self.command("answer_question", session, 409, request_id=question["request_id"],
+                     turn_id=question["turn_id"], answers={})
 
     def test_skills_management_shares_global_and_scopes_project_state(self):
         session = self.snapshot()["session_id"]
