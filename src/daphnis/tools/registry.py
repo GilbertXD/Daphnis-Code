@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from mcp.types import Tool
 
 from ..attachments import ATTACHMENT_TOOLS, AttachmentStore
+from ..errors import ToolCallValidationError
 from ..events import EventBus
 from ..mcp import MCPConnection
 from ..redaction import Redactor
@@ -158,6 +159,7 @@ class ToolExecutor:
         binding: _Binding | None = None,
         mcp_tools: dict[str, tuple[MCPConnection, Tool]] | None = None,
         activate_mcp: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+        mcp_routes: dict[tuple[str, str], str] | None = None,
         mcp_unverified: set[MCPConnection] | None = None,
         mcp_state_paths: tuple[Path, ...] = (),
         mode: ApprovalMode = ApprovalMode.AUTO,
@@ -174,6 +176,8 @@ class ToolExecutor:
         self._binding = binding
         self._mcp_tools = mcp_tools if mcp_tools is not None else {}
         self._activate_mcp = activate_mcp
+        self._mcp_routes = mcp_routes or {}
+        self._gateway_only = frozenset(self._mcp_routes.values())
         self._mcp_unverified = mcp_unverified if mcp_unverified is not None else set()
         self._mcp_state_paths = tuple(_lock_path(path) for path in mcp_state_paths)
         self._mode = mode
@@ -188,10 +192,14 @@ class ToolExecutor:
         return self._registry.names()
 
     def definitions(self) -> list[dict[str, Any]]:
-        return self._registry.definitions()
+        return [
+            definition for definition in self._registry.definitions()
+            if definition["function"]["name"] not in self._gateway_only
+        ]
 
     def select(
-        self, names: list[str], *, mode: ApprovalMode | None = None
+        self, names: list[str], *, mode: ApprovalMode | None = None,
+        mcp_routes: dict[tuple[str, str], str] | None = None,
     ) -> "ToolExecutor":
         return ToolExecutor(
             self._registry.select(names),
@@ -200,6 +208,7 @@ class ToolExecutor:
             binding=self._binding,
             mcp_tools=self._mcp_tools,
             activate_mcp=self._activate_mcp,
+            mcp_routes=self._mcp_routes if mcp_routes is None else mcp_routes,
             mcp_unverified=self._mcp_unverified,
             mcp_state_paths=self._mcp_state_paths,
             mode=self._mode if mode is None else mode,
@@ -226,6 +235,7 @@ class ToolExecutor:
             binding=_Binding(workspace, session.id, turn_id, events, session, skills),
             mcp_tools=self._mcp_tools,
             activate_mcp=self._activate_mcp,
+            mcp_routes=self._mcp_routes,
             mcp_unverified=self._mcp_unverified,
             mcp_state_paths=self._mcp_state_paths,
             mode=self._mode,
@@ -269,6 +279,25 @@ class ToolExecutor:
         }
         decision = None
         try:
+            if name in self._gateway_only:
+                raise ToolError("unknown_tool", "Use call_mcp_tool for this on-demand MCP tool.")
+            if name == "call_mcp_tool":
+                target = self._mcp_routes.get((arguments["server_id"], arguments["tool_name"]))
+                if target is None:
+                    raise ToolError(
+                        "mcp_tool_not_available",
+                        "Activate the server first and use an enabled tool name from its activation result.",
+                    )
+                # Keep the original call ID for the approval and RUNNING barrier.
+                call["function"] = {
+                    "name": target, "arguments": json.dumps(arguments["arguments"], ensure_ascii=False),
+                }
+                try:
+                    arguments = self._registry.validate_call(call)
+                except ToolCallValidationError as exc:
+                    raise ToolError(exc.code, str(exc), argument_path=exc.argument_path) from exc
+                name = target
+                fields["mcp_tool"] = target
             if name in self._mcp_tools:
                 connection, tool = self._mcp_tools[name]
 
@@ -441,6 +470,7 @@ def create_tools(
     question: QuestionCallback | None = None,
     connections: Iterable[MCPConnection] = (),
     activate_mcp: Callable[[str, str], Awaitable[dict[str, Any]]] | None = None,
+    mcp_gateway: bool = False,
     mcp_unverified: set[MCPConnection] | None = None,
     mcp_state_paths: tuple[Path, ...] = (),
     trusted: set[tuple[str, str]] | None = None,
@@ -662,11 +692,23 @@ def create_tools(
         ),
     }
     if activate_mcp is not None:
+        server_id = {"type": "string", "pattern": "^(global|project):[A-Za-z0-9-]{1,20}$"}
         definitions["activate_mcp"] = (
+            "Activate an available on-demand MCP server and return its enabled tools." if mcp_gateway else
             "Activate an available on-demand MCP server. Its native tools appear on the next request.",
-            {"server_id": {"type": "string", "pattern": "^(global|project):[A-Za-z0-9-]{1,20}$"}},
+            {"server_id": server_id},
             ["server_id"],
         )
+        if mcp_gateway:
+            definitions["call_mcp_tool"] = (
+                "Call an enabled tool on an activated on-demand MCP server using its reported parameter schema.",
+                {
+                    "server_id": server_id,
+                    "tool_name": {"type": "string", "minLength": 1},
+                    "arguments": {"type": "object"},
+                },
+                ["server_id", "tool_name", "arguments"],
+            )
     for name, (description, properties, required) in definitions.items():
         registry.register(
             name=name,
