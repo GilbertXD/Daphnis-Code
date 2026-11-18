@@ -1030,6 +1030,34 @@ class WebTests(unittest.TestCase):
         self.command("mcp_delete", sid, name="demo")
         self.assertEqual(self.snapshot()["state"]["mcp_servers"], [])
 
+    def test_mcp_restart_clears_reported_model_retry_block(self):
+        sid = self.snapshot()["session_id"]
+        options = {
+            "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+            "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
+        }
+        failure = self.workspace / "stderr-exit"
+        failure.touch()
+        self.command("mcp_save", sid, name="demo", state="always", scope="global",
+                     description="", options=options, create=True)
+        (server,) = self.snapshot()["state"]["mcp_servers"]
+        self.assertEqual(server["state"], "Error")
+        self.assertTrue(server["error"])
+        self.assertIsNone(server["retry_block"])
+
+        from daphnis.mcp_store import MCPStore
+
+        store = MCPStore(self.history.directory.parent / "mcp.json")
+        for _ in range(10):
+            self.assertTrue(store.reserve_attempt("demo", sid, 10))
+        (server,) = self.snapshot()["state"]["mcp_servers"]
+        self.assertEqual(server["retry_block"], "session_limit")
+        failure.unlink()
+        self.command("mcp_restart", sid, name="global:demo")
+        (server,) = self.snapshot()["state"]["mcp_servers"]
+        self.assertEqual((server["state"], server["error"], server["retry_block"]), ("Connected", None, None))
+        self.assertEqual(store.attempts("demo"), {})
+
     def test_mcp_project_management_keeps_loading_and_connection_state_separate(self):
         sid = self.snapshot()["session_id"]
         sibling = self.workspace / "sibling"

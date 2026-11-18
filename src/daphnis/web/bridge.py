@@ -225,6 +225,7 @@ class Bridge:
             servers = ()
             mcp_error = "无法读取已保存的 MCP 配置，请检查 mcp.json。"
         statuses = {status.name: status for status in ops.mcp_status(session)}
+        retry_blocks = ops.mcp_retry_blocks(session)
         sessions = [asdict(item) for item in history.sessions]
         saved = {item.id for item in history.sessions}
         sessions.extend(asdict(ops.session(item)) for item in self.runs if item not in saved)
@@ -257,6 +258,7 @@ class Bridge:
                 "state": status.state if status and server.enabled else "Disconnected",
                 "tool_count": status.tool_count if status and server.enabled else 0,
                 "error": self.redactor.text(status.error) if status and server.enabled and status.error else None,
+                "retry_block": retry_blocks.get(server.key),
             })
         return state
 

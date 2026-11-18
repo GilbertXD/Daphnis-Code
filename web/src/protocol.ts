@@ -53,6 +53,7 @@ export type MCPServer = {
   state: string
   tool_count: number
   error: string | null
+  retry_block: 'fault_cycle' | 'time_window' | 'session_limit' | 'configuration' | 'quota_storage' | null
 }
 
 export type MCPPrompt = {

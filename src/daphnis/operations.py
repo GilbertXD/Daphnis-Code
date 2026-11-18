@@ -328,6 +328,9 @@ class Operations:
         workspace = self._runtime(session_id or self.initial_session_id).session.workspace
         return tuple(config for config in self._app._mcp_store.read().values() if config.applies_to(workspace))
 
+    def mcp_retry_blocks(self, session_id: str) -> dict[str, str]:
+        return self._app._mcp_retry_blocks(self._runtime(session_id).session)
+
     async def start_mcp(self, *, session_id: str) -> None:
         await self._app._ensure_always_mcp(self._runtime(session_id).session.workspace)
 

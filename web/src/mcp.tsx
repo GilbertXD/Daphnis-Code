@@ -116,6 +116,14 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
   </form>
 }
 
+const retryBlockText = {
+  fault_cycle: '连接故障重试额度已用完，请手动重试。',
+  time_window: '近期连接尝试过多，稍后可再次尝试，也可手动重试。',
+  session_limit: '当前会话的连接额度已用完，请手动重试。',
+  configuration: '连接配置或认证有误，请检查后重试。',
+  quota_storage: '无法读取或保存会话连接额度，请检查本地状态文件。',
+}
+
 export function MCPManager({ servers, disabled, connected, error, notice, perform, command, resourceServers, addResources }: {
   servers: MCPServer[]
   disabled: boolean
@@ -167,13 +175,14 @@ export function MCPManager({ servers, disabled, connected, error, notice, perfor
         {server.workspace && <p className="muted">{server.workspace}</p>}
         {server.description && <p className="muted">{server.description}</p>}
         {server.error && <p role="status">{server.error}</p>}
+        {server.retry_block && <p className="muted">{retryBlockText[server.retry_block]}</p>}
         <div className="mcp-row-actions">
-          {server.loading !== 'disabled' && server.state === 'Error' && <button className="mcp-text-button" disabled={blocked}
+          {server.loading !== 'disabled' && (server.state === 'Error' || server.retry_block) && <button className="mcp-text-button" disabled={blocked}
             onClick={() => void perform('mcp_restart', { name: server.id })}>重试连接</button>}
           <details className="mcp-operations">
             <summary>更多操作<span className="mcp-sr-only"> · {server.name}</span></summary>
             <div className="mcp-row-actions">
-              {server.state !== 'Error' && <button className="mcp-text-button" disabled={blocked || server.loading === 'disabled'}
+              {server.state !== 'Error' && !server.retry_block && <button className="mcp-text-button" disabled={blocked || server.loading === 'disabled'}
                 onClick={() => void perform('mcp_restart', { name: server.id })}>重连</button>}
               <button className="mcp-text-button" disabled={blocked} onClick={() => setEditing(server)}>编辑</button>
               <button className="mcp-text-button" disabled={blocked} onClick={() => {
