@@ -38,11 +38,20 @@ const names: Record<string, string> = {
 }
 
 function Tokens({ title, usage }: { title: string; usage: Usage | null }) {
+  const cachedTokens = usage?.cached_prompt_tokens ?? 0
+  const cacheInput = usage?.cache_reported_prompt_tokens ?? 0
+  const cacheRequests = usage?.cache_reported_requests ?? 0
+  const rate = cacheInput > 0 ? cachedTokens / cacheInput : null
   return <div><strong>{title}</strong>{usage ? <dl className="facts">
     <div><dt>输入</dt><dd>{usage.prompt_tokens.toLocaleString()}</dd></div>
     <div><dt>输出</dt><dd>{usage.completion_tokens.toLocaleString()}</dd></div>
     <div><dt>合计</dt><dd>{usage.total_tokens.toLocaleString()}</dd></div>
     <div><dt>报告用量的请求</dt><dd>{usage.reported_requests} / {usage.requests}</dd></div>
+    <div><dt>缓存命中</dt><dd>{cacheRequests > 0 ? `${cachedTokens.toLocaleString()} Tokens` : '未知'}</dd></div>
+    <div><dt>缓存命中率</dt><dd>{rate === null ? '未知' : `${(rate * 100).toFixed(1)}%`}
+      {rate !== null && (cacheRequests < usage.requests || usage.unrecorded) && <small className="muted">（仅基于已报告缓存信息的请求）</small>}
+    </dd></div>
+    <div><dt>缓存统计覆盖</dt><dd>{cacheRequests} / {usage.requests} 次请求</dd></div>
     {usage.unrecorded && <div><dt>历史用量</dt><dd>记录不完整</dd></div>}
   </dl> : <p className="muted">暂无</p>}</div>
 }

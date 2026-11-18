@@ -158,6 +158,9 @@ export type Usage = {
   requests: number
   reported_requests: number
   unrecorded: boolean
+  cached_prompt_tokens: number
+  cache_reported_prompt_tokens: number
+  cache_reported_requests: number
 }
 
 export type ContextBudget = {
