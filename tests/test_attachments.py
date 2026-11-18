@@ -282,7 +282,9 @@ class AttachmentTests(unittest.IsolatedAsyncioTestCase):
                 "path": "source.txt", "max_bytes": 4,
             })
             self.assertEqual(workspace_capped.value["content"], "页")
-            self.assertEqual(workspace_capped.value["scanned_bytes"], 4)
+            self.assertEqual(workspace_capped.value["scanned_bytes"], len((rows[1] + "\n").encode("utf-8")))
+            self.assertEqual(workspace_capped.value["next_start_line"], 1)
+            self.assertEqual(workspace_capped.value["next_start_column"], 2)
             self.assertTrue(workspace_capped.value["truncated"])
             search = await call(ApprovalMode.AUTO, "search_attachment", {"query": "needle", "limit": 2})
             self.assertEqual([hit["line"] for hit in search.value["matches"]], [1, 2])

@@ -189,7 +189,10 @@ class ImageOperationsTests(unittest.IsolatedAsyncioTestCase):
         system = ops.get_system_prompt(ops.initial_session_id)
         result = await ops.send("Inspect old", attachments=[self.red], stream=False, session_id=ops.initial_session_id)
         self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
-        self.assertEqual(primary[-1][0], {"role": "system", "content": system})
+        workspace = json.dumps(str(self.root.resolve()), ensure_ascii=False)
+        self.assertEqual(primary[-1][0], {
+            "role": "system", "content": f"{system}\n\n当前会话工作区：{workspace}",
+        })
         self.assertEqual(primary[-1][1], {"role": "user", "content": [
             {"type": "text", "text": "Inspect old"},
             {"type": "image_url", "image_url": {"url": image_url(self.red)}},
