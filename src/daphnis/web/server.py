@@ -61,8 +61,8 @@ _FIELDS = {
     "skill_import": {"source": str, "scope": str},
     "skill_set_state": {"skill_id": str, "state": str},
     "skill_remove": {"skill_id": str},
-    "mcp_save": {"name": str, "enabled": bool, "options": dict, "create": bool},
-    "mcp_enable": {"name": str, "enabled": bool},
+    "mcp_save": {"name": str, "state": str, "scope": str, "description": str, "options": dict, "create": bool},
+    "mcp_set_state": {"name": str, "state": str},
     "mcp_restart": {"name": str},
     "mcp_delete": {"name": str},
     "mcp_list_prompts": {"server": str},
@@ -72,7 +72,8 @@ _FIELDS = {
     "mcp_read_resource": {"server": str, "uri": str, "arguments": (dict, type(None))},
     "registry_search": {"query": str, "cursor": (str, type(None))},
     "registry_detail": {"registry_name": str, "version": str},
-    "mcp_add_registry": {"name": str, "registry_name": str, "version": str, "url": str, "auth_env": (str, type(None))},
+    "mcp_add_registry": {"name": str, "scope": str, "state": str, "registry_name": str,
+                         "version": str, "url": str, "auth_env": (str, type(None))},
     "set_approval_mode": {"mode": str},
     "confirm_full": {},
     "send": {"prompt": str},
@@ -91,7 +92,7 @@ _SESSION_SWITCHES = {"new", "project_open", "restore"}
 _SESSION_EDITS = {"rename", "move", "delete"}
 _SESSION_SETTINGS = {"model", "thinking", "system", "tools", "set_approval_mode", "confirm_full"}
 _SHARED_EDITS = {
-    "project_create", "project_remove", "mcp_save", "mcp_enable", "mcp_restart", "mcp_delete", "mcp_add_registry",
+    "project_create", "project_remove", "mcp_save", "mcp_set_state", "mcp_restart", "mcp_delete", "mcp_add_registry",
     "skill_import", "skill_set_state", "skill_remove",
 }
 
@@ -410,12 +411,12 @@ async def _execute(bridge, action, session, args, discovery):
             await ops.set_skill_state(args["skill_id"], args["state"], session_id=session)
         case "skill_remove":
             await ops.remove_skill(args["skill_id"], session_id=session)
-        case "mcp_save" | "mcp_enable":
-            return await ops.save_mcp(**args), None
+        case "mcp_save" | "mcp_set_state":
+            return await ops.save_mcp(**args, session_id=session), None
         case "mcp_restart":
-            return await ops.restart_mcp(args["name"]), None
+            return await ops.restart_mcp(args["name"], session_id=session), None
         case "mcp_delete":
-            await ops.delete_mcp(args["name"])
+            await ops.delete_mcp(args["name"], session_id=session)
         case "mcp_add_registry":
             server = await discovery.detail(args["registry_name"], args["version"])
             remote = next((item for item in server["remotes"] if (
@@ -431,7 +432,10 @@ async def _execute(bridge, action, session, args, discovery):
             }
             if auth_env:
                 options["auth"] = {"type": "bearer", "env": auth_env}
-            return await ops.save_mcp(args["name"], enabled=True, options=options, create=True), None
+            return await ops.save_mcp(
+                args["name"], scope=args["scope"], state=args["state"],
+                description=(server.get("description") or "")[:500], options=options, create=True, session_id=session,
+            ), None
         case "set_approval_mode":
             ops.set_approval_mode(args["mode"], session_id=session)
         case "confirm_full":
@@ -474,7 +478,7 @@ async def _resource_response(bridge, action, session, args):
     server = args["server"]
     redactor = bridge.redactor
     if action == "mcp_read_resource":
-        resources = await ops.read_mcp_resource(server, args["uri"], args["arguments"])
+        resources = await ops.read_mcp_resource(server, args["uri"], args["arguments"], session_id=session)
         bridge.ops.session(session)
         previews = [_resource_preview(item, redactor) for item in resources]
         return JSONResponse({"mcp_resource_preview": [
@@ -484,7 +488,7 @@ async def _resource_response(bridge, action, session, args):
     response = {"entries": [], "errors": []}
     for templates, load in ((False, ops.list_mcp_resources), (True, ops.list_mcp_resource_templates)):
         try:
-            entries = await load(server)
+            entries = await load(server, session_id=session)
         except (RuntimeError, ValueError) as exc:
             response["errors"].append(redactor.text(str(exc)))
             continue
@@ -512,7 +516,7 @@ async def _prompt_response(bridge, action, session, args):
     bridge.ops.session(session)
     redactor = bridge.redactor
     if action == "mcp_list_prompts":
-        prompts = await bridge.ops.list_mcp_prompts(args["server"])
+        prompts = await bridge.ops.list_mcp_prompts(args["server"], session_id=session)
         response = {"mcp_prompts": [{
             "name": prompt.name,
             "title": redactor.text(prompt.title or ""),
@@ -525,7 +529,7 @@ async def _prompt_response(bridge, action, session, args):
             redactor.text(field.name) == field.name for field in (prompt.arguments or ())
         )]}
     else:
-        result = await bridge.ops.get_mcp_prompt(args["server"], args["name"], args["arguments"])
+        result = await bridge.ops.get_mcp_prompt(args["server"], args["name"], args["arguments"], session_id=session)
         messages = []
         original = []
         redacted = False

@@ -1001,39 +1001,67 @@ class WebTests(unittest.TestCase):
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
             "env": {"DEMO_TOKEN": "PATH"},
         }
-        self.command("mcp_save", sid, 409, name="demo", enabled=False, create=True,
+        self.command("mcp_save", sid, 409, name="demo", state="disabled", scope="global", description="", create=True,
                      options={"transport": "streamable_http", "url": f"https://mcp.example/{API_KEY}"})
-        self.command("mcp_save", sid, name="demo", enabled=False, options=options, create=True)
+        self.command("mcp_save", sid, name="demo", state="disabled", scope="global", description="", options=options, create=True)
         (server,) = self.snapshot()["state"]["mcp_servers"]
-        self.assertFalse(server["enabled"])
+        self.assertEqual(server["loading"], "disabled")
         self.assertEqual(server["options"]["env"], options["env"])
         self.assertEqual(server["state"], "Disconnected")
-        self.command("mcp_enable", sid, name="demo", enabled=True)
+        self.command("mcp_set_state", sid, name="global:demo", state="always")
         state = self.snapshot()["state"]
         self.assertEqual(state["mcp_servers"][0]["tool_count"], 2)
         self.assertIn("mcp__demo__add", state["all_tools"])
         self.command("tools", sid, names=["mcp__demo__add"])
         self.command("send", sid, 202, prompt="test mcp")
         approval = self.wait_for(lambda frame: frame["status"]["approval"])["status"]["approval"]
-        self.command("mcp_enable", sid, 409, name="demo", enabled=False)
+        self.command("mcp_set_state", sid, 409, name="global:demo", state="disabled")
         self.command("approve", sid, request_id=approval["request_id"], decision="allow_once")
         self.wait_for(lambda frame: not frame["status"]["running"])
         self.assertEqual((self.workspace / "calls").read_text(), "add 2 3\n")
         self.command("mcp_restart", sid, name="demo")
-        self.command("mcp_enable", sid, name="demo", enabled=False)
+        self.command("mcp_set_state", sid, name="global:demo", state="disabled")
         state = self.snapshot()["state"]
         self.assertIn("mcp__demo__add", state["enabled_tools"])
         self.assertNotIn("mcp__demo__add", state["all_tools"])
-        self.command("mcp_save", sid, name="demo", enabled=False, create=False,
+        self.command("mcp_save", sid, name="demo", state="disabled", scope="global", description="", create=False,
                      options={"transport": "streamable_http", "url": "https://mcp.example/mcp"})
         self.assertEqual(self.snapshot()["state"]["mcp_servers"][0]["options"]["transport"], "streamable_http")
         self.command("mcp_delete", sid, name="demo")
         self.assertEqual(self.snapshot()["state"]["mcp_servers"], [])
 
+    def test_mcp_project_management_keeps_loading_and_connection_state_separate(self):
+        sid = self.snapshot()["session_id"]
+        sibling = self.workspace / "sibling"
+        sibling.mkdir()
+        options = {"transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
+                   "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."]}
+        self.command("mcp_save", sid, name="demo", state="on_demand", scope="project",
+                     description="Local demo", create=True, options=options)
+        self.command("mcp_save", sid, name="demo", state="disabled", scope="global",
+                     description="Global demo", create=True, options=options)
+        by_id = {item["id"]: item for item in self.snapshot()["state"]["mcp_servers"]}
+        project = by_id["project:demo"]
+        self.assertEqual((project["loading"], project["state"]), ("on_demand", "Disconnected"))
+        self.assertEqual(project["workspace"], str(self.workspace.resolve()))
+        self.assertNotEqual(project["tool_prefix"], by_id["global:demo"]["tool_prefix"])
+        self.assertFalse((self.workspace / "pid").exists())
+        self.command("project_create", sid, name="Other", workspace=str(sibling))
+        other = next(item["id"] for item in self.snapshot()["state"]["projects"] if item["name"] == "Other")
+        opened = self.command("project_open", sid, project_id=other)["session_id"]
+        self.assertEqual([item["id"] for item in self.snapshot(opened)["state"]["mcp_servers"]], ["global:demo"])
+        self.command("mcp_restart", opened, 409, name="project:demo")
+        self.command("mcp_list_prompts", opened, 409, server="project:demo")
+        catalog = self.command("mcp_list_resources", opened, server="project:demo")["mcp_resource_catalog"]
+        self.assertEqual(catalog["entries"], [])
+        self.assertTrue(all("当前工作区" in error for error in catalog["errors"]))
+        self.assertTrue(catalog["errors"])
+        self.command("mcp_read_resource", opened, 409, server="project:demo", uri="demo://only", arguments=None)
+
     def test_mcp_prompt_preview_preserves_message_order_without_changing_session(self):
         sid = self.snapshot()["session_id"]
         (self.workspace / "prompts").touch()
-        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+        self.command("mcp_save", sid, name="demo", state="always", scope="global", description="", create=True, options={
             "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
         })
@@ -1097,7 +1125,7 @@ class WebTests(unittest.TestCase):
             (self.workspace / name).touch()
         text = self.workspace / "resource-text"
         text.write_text("original material " + API_KEY)
-        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+        self.command("mcp_save", sid, name="demo", state="always", scope="global", description="", create=True, options={
             "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
         })
@@ -1139,7 +1167,7 @@ class WebTests(unittest.TestCase):
         (self.workspace / "resources").touch()
         remote = self.workspace / "resource-text"
         remote.write_text("standalone material")
-        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+        self.command("mcp_save", sid, name="demo", state="always", scope="global", description="", create=True, options={
             "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
         })
@@ -1580,7 +1608,7 @@ class WebTests(unittest.TestCase):
         sid = self.snapshot()["session_id"]
         (self.workspace / "prompts").touch()
         (self.workspace / "resource-text").write_text("small private resource excerpt")
-        self.command("mcp_save", sid, name="demo", enabled=True, create=True, options={
+        self.command("mcp_save", sid, name="demo", state="always", scope="global", description="", create=True, options={
             "transport": "stdio", "command": sys.executable, "cwd": str(self.workspace),
             "args": [str(Path(__file__).with_name("mcp_demo_server.py").resolve()), "."],
         })

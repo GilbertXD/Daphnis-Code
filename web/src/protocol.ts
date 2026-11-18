@@ -38,10 +38,18 @@ export type MCPOptions = {
   public_only?: boolean
 }
 
+export type MCPScope = 'global' | 'project'
+export type MCPLoading = 'disabled' | 'always' | 'on_demand'
+
 export type MCPServer = {
+  id: string
+  scope: MCPScope
+  loading: MCPLoading
+  workspace: string | null
+  description: string
+  tool_prefix: string
   name: string
   options: MCPOptions
-  enabled: boolean
   state: string
   tool_count: number
   error: string | null

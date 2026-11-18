@@ -220,11 +220,11 @@ class Bridge:
             projects_error = f"无法读取项目目录（{type(exc).__name__}）。"
         mcp_error = None
         try:
-            servers = ops.managed_mcp()
+            servers = ops.managed_mcp(session)
         except (OSError, TypeError, ValueError):
             servers = ()
             mcp_error = "无法读取已保存的 MCP 配置，请检查 mcp.json。"
-        statuses = {status.name: status for status in ops.mcp_status()}
+        statuses = {status.name: status for status in ops.mcp_status(session)}
         sessions = [asdict(item) for item in history.sessions]
         saved = {item.id for item in history.sessions}
         sessions.extend(asdict(ops.session(item)) for item in self.runs if item not in saved)
@@ -235,22 +235,25 @@ class Bridge:
             "projects_error": projects_error,
             "history_issues": [asdict(issue) for issue in history.issues],
             "history_error": history_error,
-            "all_tools": ops.all_tools,
+            "all_tools": ops.available_tools(session),
             "effective_tools": ops.effective_tools(session),
             "skills": [asdict(skill) for skill in ops.list_skills(session)],
         })
         state["mcp_error"] = mcp_error
-        state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers()
-        state["mcp_resource_servers"] = ops.list_mcp_resource_servers()
+        state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers(session)
+        state["mcp_resource_servers"] = ops.list_mcp_resource_servers(session)
         state["mcp_servers"] = []
         for server in servers:
-            status = statuses.get(server.name)
+            status = statuses.get(server.key)
             options = self.redactor.json(server.options)
             if "env" in options:
                 # These are variable names, not the resolved process environment.
                 options["env"] = server.options["env"]
             state["mcp_servers"].append({
-                "name": server.name, "enabled": server.enabled, "options": options,
+                "name": server.name, "id": server.id, "scope": server.scope, "loading": server.state,
+                "workspace": self.redactor.text(str(server.workspace)) if server.workspace is not None else None,
+                "description": self.redactor.text(server.description), "options": options,
+                "tool_prefix": f"mcp__{server.key}__",
                 "state": status.state if status and server.enabled else "Disconnected",
                 "tool_count": status.tool_count if status and server.enabled else 0,
                 "error": self.redactor.text(status.error) if status and server.enabled and status.error else None,

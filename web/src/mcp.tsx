@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
-import type { Command, MCPOptions, MCPServer, RegistryPage, RegistryRemote, RegistryServer, ResourceDraft } from './protocol'
+import type { Command, MCPLoading, MCPOptions, MCPScope, MCPServer, RegistryPage, RegistryRemote, RegistryServer, ResourceDraft } from './protocol'
 import { ResourceBrowser } from './resources'
 
 type Perform = (action: string, fields: Record<string, unknown>) => Promise<boolean>
@@ -11,14 +11,28 @@ const statusText: Record<string, string> = {
 const serviceName = /^[A-Za-z0-9-]{1,20}$/
 const environmentName = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+const loadingText: Record<MCPLoading, string> = {
+  disabled: '禁用', always: '始终加载', on_demand: '按需加载',
+}
+
+function LoadingOptions() {
+  return <>{Object.entries(loadingText).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</>
+}
+
+function ScopeOptions() {
+  return <><option value="global">Global</option><option value="project">Project</option></>
+}
+
 export function MCPEditor({ initial, disabled, save, cancel }: {
   initial?: MCPServer
   disabled: boolean
-  save: (name: string, enabled: boolean, options: MCPOptions) => Promise<boolean>
+  save: (fields: Record<string, unknown>) => Promise<boolean>
   cancel: () => void
 }) {
   const [name, setName] = useState(initial?.name ?? '')
-  const [enabled, setEnabled] = useState(initial?.enabled ?? true)
+  const [state, setState] = useState<MCPLoading>(initial?.loading ?? 'disabled')
+  const [scope, setScope] = useState<MCPScope>(initial?.scope ?? 'global')
+  const [description, setDescription] = useState(initial?.description ?? '')
   const [transport, setTransport] = useState(initial?.options.transport ?? 'stdio')
   const [command, setCommand] = useState(initial?.options.command ?? '')
   const [args, setArgs] = useState(JSON.stringify(initial?.options.args ?? []))
@@ -51,7 +65,7 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
       options = { transport, url: url.trim() }
       if (auth.trim()) options.auth = { type: 'bearer', env: auth.trim() }
     }
-    if (await save(name.trim(), enabled, options)) cancel()
+    if (await save({ name: initial?.id ?? name.trim(), state, scope, description: description.trim(), options })) cancel()
   }
 
   return <form onSubmit={(event) => void submit(event)}>
@@ -59,6 +73,11 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
       <label className="field">服务标识<input value={name} readOnly={!!initial} required
         maxLength={20} pattern="(?:[A-Za-z0-9]|-){1,20}" placeholder="字母、数字或连字符"
         onChange={(event) => setName(event.target.value)} /></label>
+      <label className="field">作用域<select value={scope} disabled={!!initial}
+        onChange={(event) => setScope(event.target.value as MCPScope)}><ScopeOptions /></select></label>
+      {initial?.workspace && <p className="muted">{initial.workspace}</p>}
+      <label className="field">服务简介<input value={description} maxLength={500}
+        onChange={(event) => setDescription(event.target.value)} /></label>
       <label className="field">连接方式<select value={transport} disabled={initial?.options.public_only}
         onChange={(event) => setTransport(event.target.value as MCPOptions['transport'])}>
         <option value="stdio">本地程序（stdio）</option>
@@ -66,7 +85,7 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
       </select></label>
       {transport === 'stdio' ? <>
         <label className="field">启动程序<input required value={command} onChange={(event) => setCommand(event.target.value)} /></label>
-        <p className="muted">启用后会以当前用户权限运行已安装的程序。</p>
+        <p className="muted">始终加载或按需激活时，程序将以当前用户权限运行。</p>
         <details className="mcp-details" open={!!error || undefined}>
           <summary>高级设置</summary>
           <label className="field">参数（JSON 数组）<textarea rows={2} value={args}
@@ -78,6 +97,7 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
         </details>
       </> : <>
         <label className="field">服务地址<input type="url" required value={url} onChange={(event) => setUrl(event.target.value)} /></label>
+        <p className="muted">调用工具时，参数可能发送给此远程服务。</p>
         <details className="mcp-details">
           <summary>高级设置</summary>
           <label className="field">Bearer Token 环境变量名（可选）<input value={auth}
@@ -85,11 +105,12 @@ export function MCPEditor({ initial, disabled, save, cancel }: {
           <p className="muted">在 Daphnis 服务端设置凭据，这里只填写环境变量名。</p>
         </details>
       </>}
-      <label><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> 启用服务</label>
+      <label className="field">加载策略<select value={state}
+        onChange={(event) => setState(event.target.value as MCPLoading)}><LoadingOptions /></select></label>
       {error && <p role="alert">{error}</p>}
       <div className="actions">
         <button type="button" onClick={cancel}>取消</button>
-        <button className="primary" type="submit">{enabled ? '保存并连接' : '保存'}</button>
+        <button className="primary" type="submit">{state === 'always' ? '保存并连接' : '保存'}</button>
       </div>
     </fieldset>
   </form>
@@ -127,31 +148,36 @@ export function MCPManager({ servers, disabled, connected, error, notice, perfor
       return saved
     }} /> : editing ? <MCPEditor initial={editing === 'new' ? undefined : editing} disabled={blocked}
       cancel={() => setEditing(null)}
-      save={(name, enabled, options) => perform('mcp_save', { name, enabled, options, create: editing === 'new' })} /> : <>
+      save={(fields) => perform('mcp_save', { ...fields, create: editing === 'new' })} /> : <>
       {!servers.length && !error && <p className="muted">尚未配置 MCP 服务。</p>}
-      <ul className="mcp-list">{servers.map((server) => <li key={server.name}>
+      <ul className="mcp-list">{servers.map((server) => <li key={server.id}>
         <div className="mcp-summary">
           <strong>{server.name}</strong>
-          <span className="muted">{server.enabled ? statusText[server.state] ?? server.state : '已禁用'} · {server.tool_count} 个工具</span>
-          <label><input type="checkbox" checked={server.enabled} disabled={blocked}
+          <span className="muted">{server.scope === 'global' ? 'Global' : 'Project'} · {
+            server.loading === 'on_demand' && server.state === 'Disconnected' ? '待激活' : statusText[server.state] ?? server.state
+          } · {server.tool_count} 个工具</span>
+          <label><select aria-label={`${server.id} 加载策略`} value={server.loading} disabled={blocked}
             onChange={(event) => {
-              const enabled = event.target.checked
-              if (enabled && server.options.transport === 'stdio' && !window.confirm(`允许启动本地程序 ${server.options.command}？`)) return
-              void perform('mcp_enable', { name: server.name, enabled })
-            }} /> 启用</label>
+              const state = event.target.value as MCPLoading
+              if (state !== 'disabled' && server.options.transport === 'stdio' &&
+                !window.confirm(`允许以当前用户权限启动本地程序 ${server.options.command}？`)) return
+              void perform('mcp_set_state', { name: server.id, state })
+            }}><LoadingOptions /></select></label>
         </div>
+        {server.workspace && <p className="muted">{server.workspace}</p>}
+        {server.description && <p className="muted">{server.description}</p>}
         {server.error && <p role="status">{server.error}</p>}
         <div className="mcp-row-actions">
-          {server.enabled && server.state === 'Error' && <button className="mcp-text-button" disabled={blocked}
-            onClick={() => void perform('mcp_restart', { name: server.name })}>重试连接</button>}
+          {server.loading !== 'disabled' && server.state === 'Error' && <button className="mcp-text-button" disabled={blocked}
+            onClick={() => void perform('mcp_restart', { name: server.id })}>重试连接</button>}
           <details className="mcp-operations">
             <summary>更多操作<span className="mcp-sr-only"> · {server.name}</span></summary>
             <div className="mcp-row-actions">
-              {server.state !== 'Error' && <button className="mcp-text-button" disabled={blocked || !server.enabled}
-                onClick={() => void perform('mcp_restart', { name: server.name })}>重连</button>}
+              {server.state !== 'Error' && <button className="mcp-text-button" disabled={blocked || server.loading === 'disabled'}
+                onClick={() => void perform('mcp_restart', { name: server.id })}>重连</button>}
               <button className="mcp-text-button" disabled={blocked} onClick={() => setEditing(server)}>编辑</button>
               <button className="mcp-text-button" disabled={blocked} onClick={() => {
-                if (window.confirm(`删除 MCP 服务「${server.name}」？`)) void perform('mcp_delete', { name: server.name })
+                if (window.confirm(`删除 MCP 服务「${server.name}」？`)) void perform('mcp_delete', { name: server.id })
               }}>删除</button>
             </div>
           </details>
@@ -222,13 +248,16 @@ function RegistryPanel({ command, servers, disabled, add }: {
   const [customName, setCustomName] = useState('')
   const [auth, setAuth] = useState('')
   const [confirming, setConfirming] = useState(false)
+  const [scope, setScope] = useState<MCPScope>('global')
+  const [state, setState] = useState<MCPLoading>('on_demand')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const remotes = detail ? compatibleRemotes(detail) : []
   const remote = remotes.length === 1 ? remotes[0] : remoteIndex !== '' ? remotes[Number(remoteIndex)] : undefined
-  const autoName = detail ? suggestedName(detail.name, servers) : ''
+  const scopeServers = servers.filter((server) => server.scope === scope)
+  const autoName = detail ? suggestedName(detail.name, scopeServers) : ''
   const name = customName.trim() || autoName
-  const invalidName = !!detail && (!serviceName.test(name) || servers.some((server) => server.name === name))
+  const invalidName = !!detail && (!serviceName.test(name) || scopeServers.some((server) => server.name === name))
   const needsToken = remote?.auth === 'bearer'
   const canAdd = !!remote && !invalidName && (!needsToken || environmentName.test(auth.trim())) && !disabled
 
@@ -273,13 +302,17 @@ function RegistryPanel({ command, servers, disabled, add }: {
     <p>连接目标 <strong>{addressHost(remote.url)}</strong></p>
     <CopyableAddress key={remote.url} address={remote.url} />
     <p className="muted">调用工具时，参数会发送到此地址，并遵循当前会话的审批设置。</p>
-    {invalidName && <p role="alert">服务标识已被占用，请返回修改。</p>}
+    <label className="field">作用域<select value={scope}
+      onChange={(event) => setScope(event.target.value as MCPScope)}><ScopeOptions /></select></label>
+    <label className="field">加载策略<select value={state}
+      onChange={(event) => setState(event.target.value as MCPLoading)}><LoadingOptions /></select></label>
+    {invalidName && <p role="alert">该作用域的服务标识已被占用，请返回修改。</p>}
     <div className="actions">
       <button type="button" onClick={() => setConfirming(false)} disabled={disabled}>返回详情</button>
       <button className="primary" type="button" disabled={!canAdd} onClick={() => void add({
-        name, registry_name: detail.name, version: detail.version, url: remote.url,
+        name, scope, state, registry_name: detail.name, version: detail.version, url: remote.url,
         auth_env: needsToken ? auth.trim() : null,
-      })}>添加并连接</button>
+      })}>{state === 'always' ? '添加并连接' : '添加'}</button>
     </div>
   </section>
 

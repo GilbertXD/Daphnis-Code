@@ -173,8 +173,8 @@ function ToolsDialog({ view, close, apply, disabled, notice }: {
   const builtIn: string[] = []
   const otherMcp: string[] = []
   const offlineMcp: string[] = []
-  const groups = view.state.mcp_servers.map(({ name }) => ({
-    name, prefix: `mcp__${name}__`, tools: [] as string[],
+  const groups = view.state.mcp_servers.map(({ id, tool_prefix }) => ({
+    name: id, prefix: tool_prefix, tools: [] as string[],
   }))
   for (const tool of tools) {
     if (!tool.startsWith('mcp__')) {

@@ -236,6 +236,7 @@ dialog::backdrop { background: rgb(0 0 0 / 18%); }
 .mcp-list li { border-bottom: 1px solid var(--line); padding: 12px 0; }
 .mcp-summary, .mcp-row-actions { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
 .mcp-summary label { margin-left: auto; white-space: nowrap; }
+.mcp-summary select { border: 1px solid var(--line); padding: 4px 6px; background: #fff; font-size: .87rem; }
 .mcp-row-actions { margin-top: 6px; font-size: .87rem; }
 .mcp-operations summary { width: fit-content; color: var(--muted); }
 .mcp-tabs { display: flex; gap: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
