@@ -14,6 +14,9 @@ class UsageTotals:
     requests: int = 0
     reported_requests: int = 0
     unrecorded: bool = False
+    cached_prompt_tokens: int = 0
+    cache_reported_prompt_tokens: int = 0
+    cache_reported_requests: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -22,14 +25,27 @@ class UsageTotals:
             "total_tokens",
             "requests",
             "reported_requests",
+            "cached_prompt_tokens",
+            "cache_reported_prompt_tokens",
+            "cache_reported_requests",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"usage.{name} must be a non-negative integer.")
         if self.reported_requests > self.requests:
             raise ValueError("Reported requests cannot exceed total requests.")
+        if self.cached_prompt_tokens > self.cache_reported_prompt_tokens:
+            raise ValueError("Cached tokens cannot exceed cache-reported prompt tokens.")
+        if self.cache_reported_requests > self.reported_requests:
+            raise ValueError("Cache-reported requests cannot exceed reported requests.")
         if type(self.unrecorded) is not bool:
             raise ValueError("usage.unrecorded must be a boolean.")
+
+    @property
+    def cache_hit_rate(self) -> float | None:
+        if self.cache_reported_prompt_tokens == 0:
+            return None
+        return self.cached_prompt_tokens / self.cache_reported_prompt_tokens
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "UsageTotals":
@@ -48,7 +64,34 @@ class UsageTotals:
             requests=self.requests + other.requests,
             reported_requests=self.reported_requests + other.reported_requests,
             unrecorded=self.unrecorded or other.unrecorded,
+            cached_prompt_tokens=self.cached_prompt_tokens + other.cached_prompt_tokens,
+            cache_reported_prompt_tokens=(
+                self.cache_reported_prompt_tokens + other.cache_reported_prompt_tokens
+            ),
+            cache_reported_requests=self.cache_reported_requests + other.cache_reported_requests,
         )
+
+
+def _cached_tokens(value: dict[str, Any], prompt: int) -> int | None:
+    counts = {
+        key: value[key]
+        for key in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
+        if key in value
+    }
+    details = value.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        counts["cached_tokens"] = details["cached_tokens"]
+    if any(type(count) is not int or not 0 <= count <= prompt for count in counts.values()):
+        return None
+
+    cached = counts.get("cached_tokens")
+    hit = counts.get("prompt_cache_hit_tokens")
+    miss = counts.get("prompt_cache_miss_tokens")
+    if hit is not None and miss is not None and hit + miss != prompt:
+        return None
+    if cached is not None and hit is not None and cached != hit:
+        return None
+    return cached if cached is not None else hit
 
 
 def _reported_usage(value: Any) -> UsageTotals | None:
@@ -60,7 +103,15 @@ def _reported_usage(value: Any) -> UsageTotals | None:
     total = value.get("total_tokens", prompt + completion)
     if type(total) is not int or total < 0:
         return None
-    return UsageTotals(prompt, completion, total, requests=1, reported_requests=1)
+    cached = _cached_tokens(value, prompt)
+    return UsageTotals(
+        prompt, completion, total,
+        requests=1,
+        reported_requests=1,
+        cached_prompt_tokens=cached if cached is not None else 0,
+        cache_reported_prompt_tokens=prompt if cached is not None else 0,
+        cache_reported_requests=int(cached is not None),
+    )
 
 
 class UsageTracker:

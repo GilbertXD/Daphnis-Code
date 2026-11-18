@@ -73,6 +73,8 @@ Application 默认以非交互模式运行。需要人工审批的客户端可�
 | 用量与事件 | `session_usage(session_id)` 和 `turn_usage(session_id)` 返回快照。`subscribe(name, callback)` 订阅共享 EventBus，监听方按 `event.session_id` 和 `event.turn_id` 区分事件。 |
 | 关闭 | `await close()` 关闭 Application，停止所有会话的任务后释放共享资源。并发关闭共享一次清理。 |
 
+`UsageTotals.cache_hit_rate` 等于 `cached_prompt_tokens / cache_reported_prompt_tokens`，即有效报告缓存数据的请求中，缓存命中输入 Token 占这部分输入 Token 的比例。`cache_reported_requests / requests` 表示缓存统计覆盖。缺失或无效的缓存数据既不计入命中率分母，也不影响普通 Token 用量。统计分母为零时，命中率为 `None`，Web 显示「未知」；有效分母上的零命中显示 `0.0%`。此数据来自 API 的 Usage 上报，命中 Token 已包含在输入 Token 中，命中率不代表费用节省比例。旧历史中缺失的缓存统计保持未知。
+
 同一会话的 Turn、恢复、手动压缩和设置写入互斥。该会话忙碌时，仍可查看它或操作其他会话。新建会话沿用来源的工作区、模型、思考档位与工具偏好，使用默认系统提示词和 AUTO 审批，消息与用量从零开始。首次恢复使用磁盘上的工作区和设置，校验模型与工具能力，并保留离线 MCP 工具偏好。已加载的会话复用其 Runtime。持久化规则见[本地历史与并发](architecture.md#本地历史与并发)。
 
 `send()` 的普通 Turn 失败由 `TurnResult.status` 与 `error` 表示，锁冲突、状态校验和保存失败等可直接抛出异常。取消时会等待已开始的磁盘写入。若最终回复已保存，返回 `COMPLETED`，否则等待该轮的调用会收到 `asyncio.CancelledError`。
