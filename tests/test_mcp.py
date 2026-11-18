@@ -19,6 +19,7 @@ from daphnis.mcp_store import MCPServerConfig, MCPStore
 from daphnis.runtime import open_operations
 from daphnis.tool_state import RUNNING, TOOL_STATE
 from daphnis.tools import ApprovalDecision
+from daphnis.tools.approval import ToolError
 
 DEMO = Path(__file__).with_name("mcp_demo_server.py").resolve()
 
@@ -60,6 +61,61 @@ class MCPStoreTests(unittest.TestCase):
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lazy_connection_shares_initialization_and_retries_with_current_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = Application(
+                workspace=root, provider="deepseek", model_id="deepseek-flash",
+                history=History(root / "sessions"), connections={"deepseek": {"base_url": "https://model.test"}},
+            )
+            self.addAsyncCleanup(app.close)
+            ops = Operations(app)
+            first = ops.initial_session_id
+            second = (await ops.new_session(session_id=first)).id
+            options = {"command": sys.executable, "args": [str(DEMO), directory],
+                       "env": {"DEMO_CREDENTIAL": "DAPHNIS_TEST_MCP_CREDENTIAL"}}
+            await ops.save_mcp("lazy", state="on_demand", options=options, create=True)
+            self.assertEqual(ops.mcp_status(), ())
+            self.assertFalse((root / "pid").exists())
+            with (
+                patch.dict(os.environ, {"DAPHNIS_TEST_MCP_CREDENTIAL": ""}),
+                self.assertRaisesRegex(ToolError, "缺少 MCP 环境变量"),
+            ):
+                await app._activate_mcp(first, "global:lazy")
+
+            start = MCPConnection.start
+            entered, proceed = asyncio.Event(), asyncio.Event()
+            starts = []
+
+            async def delayed(connection, *args):
+                starts.append(connection)
+                entered.set()
+                await proceed.wait()
+                return await start(connection, *args)
+
+            with patch.dict(os.environ, {"DAPHNIS_TEST_MCP_CREDENTIAL": "first"}):
+                with patch.object(MCPConnection, "start", delayed):
+                    a = asyncio.create_task(app._activate_mcp(first, "global:lazy"))
+                    await asyncio.wait_for(entered.wait(), 5)
+                    b = asyncio.create_task(app._activate_mcp(second, "global:lazy"))
+                    await asyncio.sleep(0)
+                    a.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await a
+                    proceed.set()
+                    self.assertEqual((await asyncio.wait_for(b, 5))["tool_count"], 2)
+                self.assertEqual(starts, [app._mcp["lazy"]])
+                self.assertEqual(app._load_runtime(first).activated_mcp, set())
+                self.assertEqual(app._load_runtime(second).activated_mcp, {"lazy"})
+            with patch.dict(os.environ, {"DAPHNIS_TEST_MCP_CREDENTIAL": "rotated"}):
+                self.assertFalse(starts[0].available)
+                await app._activate_mcp(first, "global:lazy")
+                self.assertIsNot(app._mcp["lazy"], starts[0])
+                await ops.save_mcp("global:lazy", state="disabled")
+                self.assertFalse(app._load_runtime(second).activated_mcp)
+                with self.assertRaisesRegex(ToolError, "没有可按需激活"):
+                    await app._activate_mcp(first, "global:lazy")
+
     async def test_sessions_share_one_connection_and_select_their_own_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -285,7 +341,7 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     await ops.close()
 
                 (good / "pid").unlink()
-                with self.assertLogs("daphnis.runtime", "WARNING"):
+                with self.assertLogs("daphnis.app", "WARNING"):
                     ops = await open_operations(root)
                 try:
                     self.assertIn("mcp__good__add", ops.list_mcp_tools())
@@ -925,51 +981,53 @@ asyncio.run(main())
                         url=address + "/mcp",
                         auth=bearer,
                     )
-                self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
-                connection = app._mcp["remote"]
-                self.assertEqual([prompt.name for prompt in await connection.list_prompts()], ["greeting"])
-                with self.assertRaisesRegex(MCPPromptError, "响应无效"):
-                    await connection.get_prompt("greeting", {})
-                self.assertTrue(connection.available)
-                self.assertNotIn("/unexpected", received)
-                await ops.set_tools(("mcp__remote__add",), session_id=ops.initial_session_id)
-                await asyncio.wait_for(subscribed.wait(), 5)
-                send = asyncio.create_task(ops.send("add", stream=False, session_id=ops.initial_session_id))
-                async with asyncio.timeout(5):
-                    await changed.wait()
-                    while not app._mcp_unverified:
-                        await asyncio.sleep(0.01)
-                self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
-                with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
-                    await ops.refresh_mcp("remote")
-                finish_call.set()
-                turn = await asyncio.wait_for(send, 5)
-                self.assertEqual(turn.status, TurnStatus.COMPLETED)
-                self.assertEqual(outcomes[-1]["structured_content"], {"sum": 42})
-                self.assertEqual(advertised, {"mcp__remote__add"})
-                target = "mcp__remote__double"
-                async with asyncio.timeout(5):
-                    while target not in ops.list_mcp_tools():
-                        await asyncio.sleep(0.01)
-                self.assertEqual(ops.enabled_tools(ops.initial_session_id), ("mcp__remote__add",))
-                self.assertEqual(ops.effective_tools(ops.initial_session_id), ())
-                await ops.set_tools((target,), keep_unavailable=True, session_id=ops.initial_session_id)
-                advertised.clear()
-                self.assertEqual(
-                    (
-                        await asyncio.wait_for(ops.send("double", stream=False, session_id=ops.initial_session_id), 5)
-                    ).status,
-                    TurnStatus.COMPLETED,
-                )
-                self.assertEqual(advertised, {target})
-                self.assertEqual(outcomes[-1]["structured_content"], {"sum": 84})
-                http_server.should_exit = True
-                await asyncio.wait_for(serving, 5)
-                async with asyncio.timeout(5):
-                    while ops.mcp_status()[-1].state != "Error":
-                        await asyncio.sleep(0.02)
-                self.assertNotIn(target, ops.effective_tools(ops.initial_session_id))
-                self.assertIn(target, ops.enabled_tools(ops.initial_session_id))
+                with patch.dict(os.environ, {"MCP_TEST_TOKEN": token}):
+                    self.assertEqual(ops.list_mcp_tools(), ("mcp__remote__add",))
+                    connection = app._mcp["remote"]
+                    self.assertEqual([prompt.name for prompt in await connection.list_prompts()], ["greeting"])
+                    with self.assertRaisesRegex(MCPPromptError, "响应无效"):
+                        await connection.get_prompt("greeting", {})
+                    self.assertTrue(connection.available)
+                    self.assertNotIn("/unexpected", received)
+                    await ops.set_tools(("mcp__remote__add",), session_id=ops.initial_session_id)
+                    await asyncio.wait_for(subscribed.wait(), 5)
+                    send = asyncio.create_task(ops.send("add", stream=False, session_id=ops.initial_session_id))
+                    replacement = "mcp__remote__double"
+                    async with asyncio.timeout(5):
+                        while not changed.is_set():
+                            self.assertFalse(send.done(), (outcomes, advertised, received))
+                            await asyncio.sleep(0.01)
+                        while replacement not in ops.list_mcp_tools():
+                            await asyncio.sleep(0.01)
+                    self.assertFalse(send.done())
+                    self.assertEqual(ops.list_mcp_tools(), (replacement,))
+                    with self.assertRaisesRegex(RuntimeError, "当前 Turn"):
+                        await ops.refresh_mcp("remote")
+                    finish_call.set()
+                    turn = await asyncio.wait_for(send, 5)
+                    self.assertEqual(turn.status, TurnStatus.COMPLETED)
+                    self.assertEqual(outcomes[-1]["structured_content"], {"sum": 42})
+                    self.assertEqual(advertised, {"mcp__remote__add"})
+                    self.assertEqual(ops.enabled_tools(ops.initial_session_id), ("mcp__remote__add",))
+                    self.assertEqual(ops.effective_tools(ops.initial_session_id), ())
+                    target = replacement
+                    await ops.set_tools((target,), keep_unavailable=True, session_id=ops.initial_session_id)
+                    advertised.clear()
+                    self.assertEqual(
+                        (
+                            await asyncio.wait_for(ops.send("double", stream=False, session_id=ops.initial_session_id), 5)
+                        ).status,
+                        TurnStatus.COMPLETED,
+                    )
+                    self.assertEqual(advertised, {target})
+                    self.assertEqual(outcomes[-1]["structured_content"], {"sum": 84})
+                    http_server.should_exit = True
+                    await asyncio.wait_for(serving, 5)
+                    async with asyncio.timeout(5):
+                        while ops.mcp_status()[-1].state != "Error":
+                            await asyncio.sleep(0.02)
+                    self.assertNotIn(target, ops.effective_tools(ops.initial_session_id))
+                    self.assertIn(target, ops.enabled_tools(ops.initial_session_id))
             finally:
                 finish_call.set()
                 await ops.close()

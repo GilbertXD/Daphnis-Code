@@ -41,18 +41,7 @@ async def open_operations(
                 ops.import_mcp(Path(config).expanduser())
             except (OSError, RuntimeError, TypeError, ValueError):
                 logger.warning("无法导入 DAPHNIS_MCP_CONFIG，请检查路径及 MCP JSON 配置格式。")
-        try:
-            servers = ops.managed_mcp()
-        except (OSError, TypeError, ValueError):
-            logger.warning("无法读取已保存的 MCP 配置，请检查 mcp.json。")
-            servers = ()
-        for server in servers:
-            if not server.enabled:
-                continue
-            try:
-                await ops.connect_mcp(server.name, **server.options)
-            except (OSError, RuntimeError, TypeError, ValueError):
-                logger.warning("无法恢复 MCP 服务 %s，可在管理界面重试。", server.name)
+        await ops.start_mcp(session_id=ops.initial_session_id)
     except BaseException:
         await app.close()
         raise

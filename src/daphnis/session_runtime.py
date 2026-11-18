@@ -27,6 +27,7 @@ class SessionRuntime:
     usage: UsageTracker = field(init=False)
     last_budget: tuple[str, str, "TokenBudget"] | None = None
     compacting: bool = False
+    activated_mcp: set[str] = field(default_factory=set)
     state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:

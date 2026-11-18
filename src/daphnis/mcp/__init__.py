@@ -299,6 +299,8 @@ class MCPConnection:
         ):
             raise ValueError("MCP auth 只支持 bearer，env 须为本地变量名。")
         self._bearer_env = auth["env"] if auth is not None else None
+        self._credential_names = (*self._env.values(), *((self._bearer_env,) if self._bearer_env else ()))
+        self._credentials: dict[str, str | None] = {}
         self._http_error: tuple[str, str] | None = None
         self._client: Client | None = None
         self.tools: dict[str, Tool] = {}
@@ -328,7 +330,11 @@ class MCPConnection:
 
     @property
     def available(self) -> bool:
-        return self.state == "Connected" and self._live
+        return self.state == "Connected" and self._live and self.credentials_current
+
+    @property
+    def credentials_current(self) -> bool:
+        return all(self._credentials.get(name) == os.getenv(name) for name in self._credential_names)
 
     @property
     def supports_prompts(self) -> bool:
@@ -341,7 +347,7 @@ class MCPConnection:
         return self.available and client is not None and client.server_capabilities.resources is not None
 
     def _can_publish(self) -> bool:
-        return self.state == "Connecting" and self._live
+        return self.state == "Connecting" and self._live and self.credentials_current
 
     async def start(
         self,
@@ -350,6 +356,7 @@ class MCPConnection:
     ) -> dict[str, Tool]:
         self.state, self.error = "Connecting", None
         self._http_error = None
+        self._credentials = {name: os.getenv(name) for name in self._credential_names}
         self._stop.clear()
         self._tools_changed.clear()
         ready = asyncio.get_running_loop().create_future()
@@ -391,7 +398,7 @@ class MCPConnection:
             raise _MCPConfigError("MCP 工作目录不存在。")
         env = {}
         for target, source in self._env.items():
-            value = os.getenv(source)
+            value = self._credentials[source]
             if not value:
                 raise _MCPConfigError(f"缺少 MCP 环境变量 {source}。")
             env[target] = value
@@ -413,7 +420,7 @@ class MCPConnection:
 
         token = None
         if self._bearer_env is not None:
-            token = os.getenv(self._bearer_env)
+            token = self._credentials[self._bearer_env]
             if not token:
                 raise _MCPConfigError(f"缺少 MCP 环境变量 {self._bearer_env}。")
             if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", token):
@@ -768,6 +775,7 @@ class MCPConnection:
 
     async def aclose(self) -> None:
         self.state, self.error = "Disconnected", None
+        self._credentials.clear()
         if self._task is not None:
             self._stop.set()
             settled = asyncio.gather(self._task, return_exceptions=True)

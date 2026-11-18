@@ -33,7 +33,7 @@ from .history import (
 )
 from .llm.client import ChatClient
 from .mcp import TOOL_PREFIX, MCPConnection, MCPPromptError, MCPResourceError
-from .mcp_store import MCPStore
+from .mcp_store import MCPServerConfig, MCPStore
 from .models import (
     MODELS,
     CapabilityError,
@@ -131,6 +131,13 @@ class Application:
         self._output_limits = dict(output_limits or {})
         self._trusted_tools: set[tuple[str, str]] = set()
         self._mcp: dict[str, MCPConnection] = {}
+        try:
+            self._mcp_configs = self._mcp_store.read()
+        except (OSError, TypeError, ValueError):
+            self._mcp_configs = {}
+            logger.warning("无法读取已保存的 MCP 配置，请检查 mcp.json。")
+        self._mcp_starts: dict[str, asyncio.Task[MCPConnection]] = {}
+        self._mcp_suspended: set[str] = set()
         self._mcp_update: asyncio.Future[None] | None = None
         self._mcp_unverified: set[MCPConnection] = set()
         self._tools = self._mcp_catalog()
@@ -307,6 +314,91 @@ class Application:
             if (name := item["function"]["name"]) != "read_skill" and not name.startswith(offline)
         )
 
+    def _workspace_mcp(self, workspace: Path) -> tuple[MCPServerConfig, ...]:
+        return tuple(config for config in self._mcp_configs.values() if config.applies_to(workspace))
+
+    def _revoke_mcp_activation(self, key: str) -> None:
+        for runtime in self._runtimes.values():
+            runtime.activated_mcp.discard(key)
+
+    async def _ensure_mcp_connection(self, config: MCPServerConfig) -> MCPConnection:
+        self._ensure_open()
+        key = config.key
+        if self._mcp_configs.get(key) != config or not config.enabled or key in self._mcp_suspended:
+            raise RuntimeError("MCP 服务当前未授权连接。")
+        if (connection := self._mcp.get(key)) is not None and connection.available:
+            return connection
+        if (task := self._mcp_starts.get(key)) is None:
+            async def connect() -> MCPConnection:
+                try:
+                    connection = config.connection(self._history_redactor)
+                    await self._start_mcp(connection)
+                    await self.events.emit("mcp.tools_changed", session_id="", turn_id="", server=key)
+                    return connection
+                finally:
+                    self._mcp_starts.pop(key)
+
+            task = self._mcp_starts[key] = asyncio.create_task(connect(), name=f"mcp-start:{key}")
+            # A cancelled waiter can leave this shared task without an awaiting Session.
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        return await asyncio.shield(task)
+
+    async def _stop_mcp_start(self, key: str) -> None:
+        if task := self._mcp_starts.get(key):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._mcp_starts.pop(key, None)
+
+    async def _ensure_always_mcp(self, workspace: Path) -> None:
+        if self._mcp_update is not None:
+            await asyncio.shield(self._mcp_update)
+        for config in self._workspace_mcp(workspace):
+            if config.state != "always" or config.key in self._mcp_suspended:
+                continue
+            try:
+                await self._ensure_mcp_connection(config)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                logger.warning("无法连接 MCP 服务 %s，可在管理界面重试。", config.id)
+
+    async def _activate_mcp(self, session_id: str, server_id: str) -> dict[str, Any]:
+        runtime = self._runtimes.get(session_id)
+        config = next((item for item in self._workspace_mcp(runtime.session.workspace)
+                       if item.id == server_id and item.state == "on_demand"), None) if runtime else None
+        if config is None:
+            raise ToolError("mcp_not_available", "当前会话没有可按需激活的此 MCP 服务。")
+        try:
+            connection = await self._ensure_mcp_connection(config)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            connection = self._mcp.get(config.key)
+            raise ToolError("mcp_connection_failed", connection.error if connection and connection.error
+                            else "无法初始化 MCP 连接。") from None
+        runtime.activated_mcp.add(config.key)
+        return {"ok": True, "server_id": server_id, "tool_count": len(connection.tools)}
+
+    async def _apply_mcp_config(
+        self, key: str, config: MCPServerConfig | None, *, connect: bool, changed: bool,
+    ) -> str | None:
+        if changed:
+            self._revoke_mcp_activation(key)
+            if config is None:
+                self._mcp_configs.pop(key, None)
+            else:
+                self._mcp_configs[key] = config
+        self._mcp_suspended.discard(key)
+        await self._stop_mcp_start(key)
+        if previous := self._mcp.pop(key, None):
+            self._revoke_mcp_trust(key)
+            self._mcp_unverified.discard(previous)
+            await previous.aclose()
+            self._tools = self._mcp_catalog()
+        if connect and config is not None:
+            try:
+                await self._ensure_mcp_connection(config)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                failed = self._mcp.get(key)
+                return (failed.error if failed else None) or "无法初始化 MCP 连接。"
+        return None
+
     async def _mcp_error(self, name: str, error: str) -> None:
         self._revoke_mcp_trust(name)
         if (connection := self._mcp.get(name)) and not connection.available:
@@ -361,11 +453,14 @@ class Application:
 
     async def _connect_mcp(self, connection: MCPConnection) -> None:
         with self._changing_mcp():
+            if connection.name in self._mcp_configs:
+                raise ValueError("请通过 MCP 管理配置连接此服务。")
+            self._mcp_suspended.discard(connection.name)
             await self._start_mcp(connection)
 
     async def _start_mcp(self, connection: MCPConnection) -> None:
         previous = self._mcp.get(connection.name)
-        if previous and previous.state == "Connected":
+        if previous and previous.available:
             raise ValueError(f"MCP Server {connection.name!r} 已连接。")
         self._revoke_mcp_trust(connection.name)
         if previous:
@@ -395,6 +490,9 @@ class Application:
 
     async def _disconnect_mcp(self, name: str) -> None:
         with self._changing_mcp():
+            self._mcp_suspended.add(name)
+            self._revoke_mcp_activation(name)
+            await self._stop_mcp_start(name)
             connection = self._mcp[name]
             self._revoke_mcp_trust(name)
             self._mcp_unverified.discard(connection)
@@ -413,7 +511,7 @@ class Application:
         try:
             discovered = await connection.discover()
             self._ensure_open()
-            if not connection.available:
+            if self._mcp.get(connection.name) is not connection or not connection.available:
                 raise RuntimeError("MCP 连接不可用。")
             connection.tools = discovered
             self._tools = self._mcp_catalog()
@@ -435,23 +533,16 @@ class Application:
         )
 
     async def _mcp_tools_changed(self, connection: MCPConnection) -> None:
-        # Active Turns keep their definitions; revoke automatic trust immediately.
         self._revoke_mcp_trust(connection.name)
         self._mcp_unverified.add(connection)
-        while not self._closed and self._mcp.get(connection.name) is connection and connection.available:
-            if self._mcp_update is not None:
-                await asyncio.wait((self._mcp_update,))
-                continue
-            if active := self._active_tasks():
-                await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-                continue
-            with self._changing_mcp():
-                try:
-                    await self._refresh_mcp_catalog(connection)
-                except RuntimeError as exc:
-                    if not self._closed:
-                        await self._mcp_error(connection.name, str(exc))
-            return
+        if self._mcp_update is not None:
+            await asyncio.wait((self._mcp_update,))
+        if not self._closed and self._mcp.get(connection.name) is connection and connection.available:
+            try:
+                await self._refresh_mcp_catalog(connection)
+            except RuntimeError as exc:
+                if not self._closed and self._mcp.get(connection.name) is connection:
+                    await self._mcp_error(connection.name, str(exc))
 
     async def _request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if not self._interactive:
@@ -577,6 +668,8 @@ class Application:
         )
 
         async def run():
+            if recovery_action is not RecoveryAction.TERMINATE:
+                await self._ensure_always_mcp(session.workspace)
             async with self._history.lease(session) as lease:
                 if prompt_input and any(group.id == prompt_input.id for group in session.prompt_groups):
                     raise ValueError("该 MCP Prompt 已提交。")
@@ -807,6 +900,8 @@ class Application:
                 )
                 if self._mcp_update is not None:
                     await self._mcp_update
+                for key in tuple(self._mcp_starts):
+                    await self._stop_mcp_start(key)
                 for runtime in runtimes:
                     async with runtime.state_lock:
                         pass  # Wait for any in-flight settings or history write.

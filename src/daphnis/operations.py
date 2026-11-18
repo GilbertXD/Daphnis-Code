@@ -292,16 +292,22 @@ class Operations:
             )
         )
 
-    async def reconnect_mcp(self, name: str) -> None:
+    async def reconnect_mcp(self, name: str, *, session_id: str | None = None) -> None:
+        name = self._managed_mcp_key(name, session_id)
+        if name in self._app._mcp_configs:
+            if error := await self.restart_mcp(name, session_id=session_id):
+                raise RuntimeError(error)
+            return
         connection = self._app._mcp.get(name)
         if connection is None:
             raise ValueError(f"未知 MCP Server {name!r}。")
         await self._app._connect_mcp(connection)
 
-    async def refresh_mcp(self, name: str) -> None:
-        await self._app._refresh_mcp(name)
+    async def refresh_mcp(self, name: str, *, session_id: str | None = None) -> None:
+        await self._app._refresh_mcp(self._managed_mcp_key(name, session_id))
 
-    async def disconnect_mcp(self, name: str) -> None:
+    async def disconnect_mcp(self, name: str, *, session_id: str | None = None) -> None:
+        name = self._managed_mcp_key(name, session_id)
         if name not in self._app._mcp:
             raise ValueError(f"MCP Server {name!r} 未连接。")
         await self._app._disconnect_mcp(name)
@@ -312,8 +318,21 @@ class Operations:
     def mcp_status(self) -> tuple[MCPStatus, ...]:
         return tuple(server.status for server in self._app._mcp.values())
 
-    def managed_mcp(self) -> tuple[MCPServerConfig, ...]:
-        return tuple(self._app._mcp_store.read().values())
+    def managed_mcp(self, session_id: str | None = None) -> tuple[MCPServerConfig, ...]:
+        workspace = self._runtime(session_id or self.initial_session_id).session.workspace
+        return tuple(config for config in self._app._mcp_store.read().values() if config.applies_to(workspace))
+
+    async def start_mcp(self, *, session_id: str) -> None:
+        await self._app._ensure_always_mcp(self._runtime(session_id).session.workspace)
+
+    def _managed_mcp_key(self, server: str, session_id: str | None) -> str:
+        workspace = self._runtime(session_id or self.initial_session_id).session.workspace
+        for config in self._app._workspace_mcp(workspace):
+            if server in (config.id, config.key):
+                return config.key
+        if ":" not in server and server not in self._app._mcp_configs:
+            return server  # Global, explicitly connected Servers also support Resources and Prompts.
+        raise ValueError("当前工作区没有此 MCP 服务。")
 
     def import_mcp(self, path: Path) -> None:
         """Seed managed configuration once, including an intentionally empty list."""
@@ -332,75 +351,72 @@ class Operations:
                     config.connection(app._history_redactor)
                     configs[name] = config
                 store.write(configs)
+                app._mcp_configs = configs
 
     async def save_mcp(
-        self, name: str, *, enabled: bool, options: dict[str, Any] | None = None,
-        create: bool = False,
+        self, name: str, *, state: str | None = None, enabled: bool | None = None,
+        options: dict[str, Any] | None = None, scope: str = "global", description: str | None = None,
+        create: bool = False, session_id: str | None = None,
     ) -> str | None:
+        if scope not in ("global", "project"):
+            raise ValueError("MCP 作用域须为 global 或 project。")
+        if enabled is not None:
+            if type(enabled) is not bool or state is not None:
+                raise ValueError("请指定一种 MCP 加载策略。")
+            state = "always" if enabled else "disabled"
         app = self._app
         with app._changing_mcp():
             store = app._mcp_store
             with SessionLease(store.path):
                 configs = store.read()
-                current = configs.get(name)
-                if create and (current or name in app._mcp):
-                    raise ValueError("该 MCP 服务标识已存在。")
-                if not create and current is None:
-                    raise ValueError("MCP 服务不存在。")
+                if create:
+                    workspace = self._runtime(session_id or self.initial_session_id).session.workspace if scope == "project" else None
+                    key = MCPServerConfig(name, "disabled", {}, workspace).key
+                    current = configs.get(key)
+                    if current is not None or key in app._mcp:
+                        raise ValueError("该作用域已有同名 MCP 服务。")
+                else:
+                    key = self._managed_mcp_key(name, session_id)
+                    current = configs.get(key)
+                    if current is None:
+                        raise ValueError("MCP 服务不存在。")
+                    name, workspace = current.name, current.workspace
                 if options is None and current is None:
                     raise ValueError("请提供 MCP 服务配置。")
                 options = deepcopy(options if options is not None else current.options)
                 if current and current.options.get("public_only"):
                     options["public_only"] = True
-                config = MCPServerConfig(name, "always" if enabled else "disabled", options)
-                connection = config.connection(app._history_redactor)
+                config = MCPServerConfig(
+                    name, state if state is not None else current.state if current else "disabled", options,
+                    workspace, description if description is not None else current.description if current else "",
+                )
+                config.connection(app._history_redactor)
                 if config == current:
                     return None
-                configs[name] = config
+                configs[key] = config
                 store.write(configs)
-            return await finish_io(self._apply_mcp(name, connection if enabled else None))
+            return await finish_io(app._apply_mcp_config(key, config, connect=config.state == "always", changed=True))
 
-    async def restart_mcp(self, name: str) -> str | None:
+    async def restart_mcp(self, name: str, *, session_id: str | None = None) -> str | None:
         app = self._app
         with app._changing_mcp():
-            config = app._mcp_store.read().get(name)
+            key = self._managed_mcp_key(name, session_id)
+            config = app._mcp_configs.get(key)
             if config is None or not config.enabled:
                 raise ValueError("请先启用 MCP 服务。")
-            return await finish_io(self._apply_mcp(name, config.connection()))
+            return await finish_io(app._apply_mcp_config(key, config, connect=True, changed=False))
 
-    async def delete_mcp(self, name: str) -> None:
+    async def delete_mcp(self, name: str, *, session_id: str | None = None) -> None:
         app = self._app
         with app._changing_mcp():
+            key = self._managed_mcp_key(name, session_id)
             store = app._mcp_store
             with SessionLease(store.path):
                 configs = store.read()
-                if configs.pop(name, None) is None:
+                if configs.pop(key, None) is None:
                     raise ValueError("MCP 服务不存在。")
                 store.write(configs)
-            await finish_io(self._apply_mcp(name, None, remove=True))
-
-    async def _apply_mcp(
-        self, name: str, connection: MCPConnection | None, *, remove: bool = False,
-    ) -> str | None:
-        app = self._app
-        previous = app._mcp.get(name)
-        if previous is not None:
-            app._revoke_mcp_trust(name)
-            app._mcp_unverified.discard(previous)
-            await previous.aclose()
-            app._tools = app._mcp_catalog()
-        if connection is None:
-            if remove:
-                app._mcp.pop(name, None)
-            return None
-        try:
-            await app._start_mcp(connection)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            if connection.state != "Error":
-                await connection.aclose()
-                connection.state, connection.error = "Error", "无法初始化 MCP 连接。"
-            return connection.error
-        return None
+            await finish_io(app._apply_mcp_config(key, None, connect=False, changed=True))
 
     def list_mcp_tools(self) -> tuple[str, ...]:
         return tuple(
@@ -410,19 +426,30 @@ class Operations:
             for tool in server.tools
         )
 
-    def list_mcp_resource_servers(self) -> tuple[str, ...]:
-        return tuple(server.name for server in self._app._mcp.values() if server.supports_resources)
+    def _workspace_mcp_connections(self, session_id: str | None):
+        app = self._app
+        workspace = self._runtime(session_id or self.initial_session_id).session.workspace
+        return (
+            connection for key, connection in app._mcp.items()
+            if key not in app._mcp_configs or app._mcp_configs[key].applies_to(workspace)
+        )
 
-    async def list_mcp_resources(self, server: str) -> "tuple[Resource, ...]":
-        return await self._app._mcp_resource_connection(server).list_resources()
+    def list_mcp_resource_servers(self, session_id: str | None = None) -> tuple[str, ...]:
+        return tuple(server.name for server in self._workspace_mcp_connections(session_id) if server.supports_resources)
 
-    async def list_mcp_resource_templates(self, server: str) -> "tuple[ResourceTemplate, ...]":
-        return await self._app._mcp_resource_connection(server).list_resource_templates()
+    async def list_mcp_resources(self, server: str, *, session_id: str | None = None) -> "tuple[Resource, ...]":
+        key = self._managed_mcp_key(server, session_id)
+        return await self._app._mcp_resource_connection(key).list_resources()
+
+    async def list_mcp_resource_templates(self, server: str, *, session_id: str | None = None) -> "tuple[ResourceTemplate, ...]":
+        key = self._managed_mcp_key(server, session_id)
+        return await self._app._mcp_resource_connection(key).list_resource_templates()
 
     async def read_mcp_resource(
-        self, server: str, uri: str, arguments: dict[str, str] | None = None,
+        self, server: str, uri: str, arguments: dict[str, str] | None = None, *, session_id: str | None = None,
     ) -> tuple[TextResourceInput, ...]:
-        connection = self._app._mcp_resource_connection(server)
+        key = self._managed_mcp_key(server, session_id)
+        connection = self._app._mcp_resource_connection(key)
         if arguments is None:
             entry = next((item for item in await connection.list_resources() if str(item.uri) == uri), None)
             target = uri
@@ -433,14 +460,18 @@ class Operations:
             raise ValueError("未找到该 MCP 资源，请刷新目录。")
         return await connection.read_resource(target, name=entry.title or entry.name, mime_type=entry.mime_type)
 
-    def list_mcp_prompt_servers(self) -> tuple[str, ...]:
-        return tuple(server.name for server in self._app._mcp.values() if server.supports_prompts)
+    def list_mcp_prompt_servers(self, session_id: str | None = None) -> tuple[str, ...]:
+        return tuple(server.name for server in self._workspace_mcp_connections(session_id) if server.supports_prompts)
 
-    async def list_mcp_prompts(self, server: str) -> "tuple[Prompt, ...]":
-        return await self._app._mcp_prompt_connection(server).list_prompts()
+    async def list_mcp_prompts(self, server: str, *, session_id: str | None = None) -> "tuple[Prompt, ...]":
+        key = self._managed_mcp_key(server, session_id)
+        return await self._app._mcp_prompt_connection(key).list_prompts()
 
-    async def get_mcp_prompt(self, server: str, name: str, arguments: dict[str, str]) -> "GetPromptResult":
-        connection = self._app._mcp_prompt_connection(server)
+    async def get_mcp_prompt(
+        self, server: str, name: str, arguments: dict[str, str], *, session_id: str | None = None,
+    ) -> "GetPromptResult":
+        key = self._managed_mcp_key(server, session_id)
+        connection = self._app._mcp_prompt_connection(key)
         validate_prompt_request(name, arguments)
         arguments = dict(arguments)
         prompt = next((item for item in await connection.list_prompts() if item.name == name), None)
@@ -484,10 +515,10 @@ class Operations:
 
     async def open_project(self, project_id: str | None, *, session_id: str) -> SessionSnapshot:
         current = self._runtime(session_id).session
-        if project_id is None:
-            return self._new_session(current, current.workspace, None)
-        project = self._project_for_workspace(project_id)
-        return self._new_session(current, project.workspace, project.id)
+        project = self._project_for_workspace(project_id) if project_id is not None else None
+        workspace = project.workspace if project is not None else current.workspace
+        await self._app._ensure_always_mcp(workspace)
+        return self._new_session(current, workspace, project_id)
 
     async def new_session(self, *, session_id: str) -> SessionSnapshot:
         current = self._runtime(session_id).session
@@ -557,6 +588,7 @@ class Operations:
             await app._save_and_publish_session(runtime, updated)
             if workspace_changed:
                 app._revoke_session_trust(session_id)
+                runtime.activated_mcp.intersection_update(config.key for config in app._workspace_mcp(workspace))
 
         async with runtime.state_lock:
             await finish_io(move())
