@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from .session_runtime import SessionRuntime
     from .token_budget import TokenBudget
     from .tools import ApprovalRequest
+    from .tools.questions import Answers, QuestionRequest
     from .usage import UsageTotals
 
 
@@ -121,6 +122,22 @@ class Operations:
 
     def pending_approval(self, session_id: str) -> "ApprovalRequest | None":
         return deepcopy(self._runtime(session_id).pending_approval)
+
+    def pending_question(self, session_id: str) -> "QuestionRequest | None":
+        runtime = self._runtime(session_id)
+        if runtime.question_answer is None or runtime.question_answer.done():
+            return None
+        return deepcopy(runtime.pending_question)
+
+    def answer_question(self, request_id: str, turn_id: str, answers: "Answers", *, session_id: str) -> bool:
+        runtime = self._runtime(session_id)
+        pending, future = runtime.pending_question, runtime.question_answer
+        if pending is None or future is None or future.done() or (
+            pending.request_id, pending.turn_id, pending.session_id
+        ) != (request_id, turn_id, session_id):
+            return False
+        future.set_result(pending.validate_answers(answers))
+        return True
 
     def session_usage(self, session_id: str) -> "UsageTotals":
         return self._runtime(session_id).usage.session

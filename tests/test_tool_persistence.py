@@ -75,6 +75,78 @@ class ToolPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
         ops.subscribe("tool.approval_requested", approve)
 
+    def question_call(self, questions=None):
+        self.calls = [{
+            "id": "question", "type": "function", "function": {"name": "ask_user", "arguments": json.dumps({
+                "questions": questions if questions is not None else [
+                    {"id": "scope", "type": "single_select", "question": "Which scope?", "options": ["A", "B"]},
+                    {"id": "tests", "type": "multi_select", "question": "Which tests?", "options": ["C", "D"]},
+                    {"id": "note", "type": "text", "question": "Any note?"},
+                ],
+            })},
+        }]
+
+    async def test_question_waits_after_persistence_and_checks_answer_identity(self):
+        self.question_call()
+        ops = self.application(interactive=True)
+        sid = ops.initial_session_id
+        ops.set_approval_mode("ask", session_id=sid)
+        requests = asyncio.Queue()
+        approvals = []
+        ops.subscribe("tool.question_requested", requests.put_nowait)
+        ops.subscribe("tool.approval_requested", approvals.append)
+        pending = asyncio.create_task(ops.send("Ask me", stream=False, session_id=sid))
+        event = await asyncio.wait_for(requests.get(), 3)
+        question = ops.pending_question(sid)
+        self.assertEqual(question.request_id, event.data["request_id"])
+        self.assertEqual(tool_results(self.saved(ops))[-1][TOOL_STATE], RUNNING)
+        other = await ops.new_session(session_id=sid)
+        answers = {"scope": "Other scope", "tests": ["C", "D", "Other test"], "note": "不回答"}
+        self.assertFalse(ops.answer_question(question.request_id, event.turn_id, answers, session_id=other.id))
+        self.assertFalse(ops.answer_question(question.request_id, "wrong-turn", answers, session_id=sid))
+        for invalid in ({}, {**answers, "scope": ["A"]}, {**answers, "tests": ["X", "Y"]}, {**answers, "note": " "},
+                        {**answers, "note": "x" * 2001}, {**answers, "tests": ["C", "C"]}):
+            with self.assertRaises(ValueError):
+                ops.answer_question(question.request_id, event.turn_id, invalid, session_id=sid)
+            self.assertIsNotNone(ops.pending_question(sid))
+        self.assertTrue(ops.answer_question(question.request_id, event.turn_id, answers, session_id=sid))
+        self.assertFalse(ops.answer_question(question.request_id, event.turn_id, answers, session_id=sid))
+        self.assertEqual((await pending).status, TurnStatus.COMPLETED)
+        saved = self.saved(ops)
+        self.assertEqual([item["role"] for item in saved], ["user", "assistant", "tool", "assistant"])
+        self.assertEqual(json.loads(saved[2]["content"]), {"ok": True, "answers": answers})
+        self.assertEqual(approvals, [])
+
+    async def test_question_cancel_clears_pending_request_and_uses_running_recovery(self):
+        self.question_call()
+        ops = self.application()
+        sid = ops.initial_session_id
+        requests = asyncio.Queue()
+        ops.subscribe("tool.question_requested", requests.put_nowait)
+        pending = asyncio.create_task(ops.send("Ask me", stream=False, session_id=sid))
+        event = await asyncio.wait_for(requests.get(), 3)
+        await ops.cancel(sid)
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertIsNone(ops.pending_question(sid))
+        self.assertFalse(ops.answer_question(event.data["request_id"], event.turn_id, {}, session_id=sid))
+        self.assertEqual(tool_results(self.saved(ops))[-1][TOOL_STATE], RUNNING)
+        self.assertEqual(ops.recovery(sid).kind, "INTERRUPTED_TURN")
+
+    async def test_question_without_recipient_and_invalid_questions_finish_as_tool_errors(self):
+        self.question_call()
+        ops = self.application(interactive=True)
+        sid = ops.initial_session_id
+        self.assertEqual((await ops.send("Ask me", stream=False, session_id=sid)).status, TurnStatus.COMPLETED)
+        self.assertEqual(json.loads(tool_results(self.saved(ops))[-1]["content"])["error"]["code"], "question_unavailable")
+        text = {"id": "same", "type": "text", "question": "Question"}
+        for questions, code in (([], "arguments_schema_mismatch"), ([text, text], "invalid_questions"),
+                                ([{**text, "type": "single_select"}], "invalid_questions")):
+            self.requests.clear()
+            self.question_call(questions)
+            self.assertEqual((await ops.send("Ask again", stream=False, session_id=sid)).status, TurnStatus.COMPLETED)
+            self.assertEqual(json.loads(tool_results(self.saved(ops))[-1]["content"])["error"]["code"], code)
+
     async def test_glob_and_grep_await_approval_and_commit_execution_before_searching(self):
         (self.root / "calc.py").write_text("value = 42\n")
         self.calls = [{

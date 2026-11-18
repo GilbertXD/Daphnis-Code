@@ -60,6 +60,9 @@ class EventBus:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
+    def has_subscribers(self, name: str) -> bool:
+        return bool(self._listeners.get(name))
+
     async def emit(
         self, event_name: str, *, session_id: str, turn_id: str, **data: Any
     ) -> None:

@@ -58,6 +58,8 @@ from .tools import (
     ToolExecutor,
     create_tools,
 )
+from .tools.approval import ToolError
+from .tools.questions import Answers, QuestionRequest
 from .turn_state import RecoveryAction
 
 logger = logging.getLogger(__name__)
@@ -333,6 +335,7 @@ class Application:
     def _mcp_catalog(self, connecting: MCPConnection | None = None) -> ToolExecutor:
         return create_tools(
             approval=self._request_approval,
+            question=self._request_question,
             trusted=self._trusted_tools,
             redactor=self._history_redactor,
             search_excluded_directory=self._history.directory,
@@ -493,6 +496,27 @@ class Application:
             return False
         runtime.approval.set_result(decision)
         return True
+
+    async def _request_question(self, request: QuestionRequest) -> Answers:
+        runtime = self._runtimes.get(request.session_id)
+        if self._closed or runtime is None or not self.events.has_subscribers("tool.question_requested"):
+            raise ToolError("question_unavailable", "No interactive recipient is available for this question.")
+        if runtime.question_answer is not None:
+            raise RuntimeError("已有待回答的问题。")
+        future: asyncio.Future[Answers] = asyncio.get_running_loop().create_future()
+        runtime.question_answer = future
+        runtime.pending_question = request
+        try:
+            await self.events.emit(
+                "tool.question_requested", session_id=request.session_id, turn_id=request.turn_id,
+                request_id=request.request_id,
+            )
+            return await future
+        finally:
+            if not future.done():
+                future.cancel()
+            runtime.pending_question = None
+            runtime.question_answer = None
 
     async def _run_turn(
         self, runtime: SessionRuntime, prompt: str | None = None, *, stream: bool = True,

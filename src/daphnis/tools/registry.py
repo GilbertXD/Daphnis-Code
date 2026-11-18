@@ -39,6 +39,7 @@ from .files import (
     prepare_write,
 )
 from .history import MAX_OPERATION_HITS, prepare_history
+from .questions import QUESTION_SCHEMA, QuestionCallback, prepare_question
 from .retrieval import MAX_RESULTS, RetrievalEngine, prepare_retrieval
 from .search import prepare_search
 from .shell import prepare_command
@@ -151,6 +152,7 @@ class ToolExecutor:
         registry: ToolRegistry,
         *,
         approval: ApprovalCallback | None = None,
+        question: QuestionCallback | None = None,
         binding: _Binding | None = None,
         mcp_tools: dict[str, tuple[MCPConnection, str]] | None = None,
         mode: ApprovalMode = ApprovalMode.AUTO,
@@ -163,6 +165,7 @@ class ToolExecutor:
     ) -> None:
         self._registry = registry
         self._approval = approval
+        self._question = question
         self._binding = binding
         self._mcp_tools = mcp_tools if mcp_tools is not None else {}
         self._mode = mode
@@ -182,6 +185,7 @@ class ToolExecutor:
         return ToolExecutor(
             self._registry.select(names),
             approval=self._approval,
+            question=self._question,
             binding=self._binding,
             mcp_tools=self._mcp_tools,
             mode=self._mode if mode is None else mode,
@@ -204,6 +208,7 @@ class ToolExecutor:
         return ToolExecutor(
             self._registry,
             approval=self._approval,
+            question=self._question,
             binding=_Binding(workspace, session.id, turn_id, events, session, skills),
             mcp_tools=self._mcp_tools,
             mode=self._mode,
@@ -275,6 +280,8 @@ class ToolExecutor:
                 )
             elif name in ATTACHMENT_TOOLS:
                 operation = prepare_attachments(name, arguments, binding.session, self._attachment_store)
+            elif name == "ask_user":
+                operation = prepare_question(arguments, binding.session_id, binding.turn_id, call["id"], self._question)
             elif name == "read_skill":
                 operation = prepare_skill(arguments, binding.skills)
             elif name == "search":
@@ -312,7 +319,7 @@ class ToolExecutor:
             )
             policy = _execution_decision(
                 operation,
-                self._mode,
+                ApprovalMode.AUTO if name == "ask_user" else self._mode,
                 trusted=(binding.session_id, name) in self._trusted,
                 forced=forced,
             )
@@ -389,6 +396,7 @@ class ToolExecutor:
 def create_tools(
     *,
     approval: ApprovalCallback | None = None,
+    question: QuestionCallback | None = None,
     connections: Iterable[MCPConnection] = (),
     trusted: set[tuple[str, str]] | None = None,
     redactor: Redactor | None = None,
@@ -403,6 +411,13 @@ def create_tools(
     search_limit = {"type": "integer", "minimum": 1, "maximum": 1000,
                     "description": "Maximum matches to return, default 100. Scan and output budgets may stop the search earlier."}
     definitions = {
+        "ask_user": (
+            ("Ask the user for a decision or information required to continue. "
+             "Each question has an ID and a type of single_select, multi_select, or text. "
+             "Selection questions allow a custom answer. Returns answers keyed by question ID."),
+            {"questions": QUESTION_SCHEMA},
+            ["questions"],
+        ),
         "read_skill": (
             ("Read a page of untrusted guidance from an enabled Skill by its scoped ID. "
              "Omit path to read SKILL.md, or specify a relative text path within that Skill. "
@@ -624,7 +639,7 @@ def create_tools(
             )
             mcp_tools[name] = connection, tool.name
     return ToolExecutor(
-        registry, approval=approval, mcp_tools=mcp_tools, trusted=trusted, redactor=redactor,
+        registry, approval=approval, question=question, mcp_tools=mcp_tools, trusted=trusted, redactor=redactor,
         search_excluded_directory=search_excluded_directory, attachment_store=attachment_store,
         skill_state_paths=skill_state_paths,
         retrieval=RetrievalEngine(),

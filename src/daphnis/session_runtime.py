@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .compaction import CompactionCheckpoint
     from .session import Session
     from .token_budget import TokenBudget
+    from .tools.questions import Answers, QuestionRequest
 
 
 @dataclass
@@ -20,6 +21,8 @@ class SessionRuntime:
     task: asyncio.Task["TurnResult"] | asyncio.Task["CompactionCheckpoint | None"] | None = None
     approval: asyncio.Future[ApprovalDecision] | None = None
     pending_approval: ApprovalRequest | None = None
+    question_answer: asyncio.Future["Answers"] | None = None
+    pending_question: "QuestionRequest | None" = None
     approval_mode: ApprovalMode = ApprovalMode.AUTO
     usage: UsageTracker = field(init=False)
     last_budget: tuple[str, str, "TokenBudget"] | None = None
