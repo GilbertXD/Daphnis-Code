@@ -310,6 +310,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("ask_user", prompt)
                 self.assertIn("glob", prompt)
                 self.assertIn("grep", prompt)
+                self.assertIn("show_line_numbers=true", prompt)
                 self.assertEqual(prompt.count(json.dumps(str(root.resolve()), ensure_ascii=False)), 1)
             finally:
                 await ops.close()
