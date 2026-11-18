@@ -276,10 +276,14 @@ class ToolExecutor:
                     return (connection.available and connection not in self._mcp_unverified
                             and connection.tools.get(name) == tool)
 
+                if not connection.available:
+                    return result(connection.disconnected_result())
                 if not usable():
                     raise ToolError("mcp_unavailable", "MCP 工具目录已变化或连接不可用。")
 
                 async def run():
+                    if not connection.available:
+                        return connection.disconnected_result()
                     if not usable():
                         return failure("mcp_unavailable", "MCP 工具目录已变化或连接不可用。")
                     if decision is ApprovalDecision.TRUST_SESSION:
@@ -312,7 +316,7 @@ class ToolExecutor:
                     try:
                         return await self._activate_mcp(binding.session_id, arguments["server_id"])
                     except ToolError as exc:
-                        return failure(exc.code, str(exc))
+                        return failure(exc.code, str(exc), **exc.details)
 
                 operation = Operation(decision=Decision.ALLOW, reason="Activate an authorized MCP server.",
                                       targets=(), details={}, run=activate)
@@ -663,7 +667,7 @@ def create_tools(
     }
     if activate_mcp is not None:
         definitions["activate_mcp"] = (
-            "Activate an available on-demand MCP server. Its native tools appear on the next request.",
+            "Activate an on-demand MCP server or reconnect an authorized server. Use its native tools on the next request.",
             {"server_id": {"type": "string", "pattern": "^(global|project):[A-Za-z0-9-]{1,20}$"}},
             ["server_id"],
         )

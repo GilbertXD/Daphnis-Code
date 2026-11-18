@@ -11,13 +11,16 @@ from dataclasses import dataclass
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
+from time import monotonic
 from typing import Any, TextIO
 
 import httpx2
-from mcp import Client, StdioServerParameters, stdio_client
+from mcp import Client, MCPError, StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.subscriptions import ToolsListChanged
 from mcp.types import (
+    CONNECTION_CLOSED,
+    INVALID_REQUEST,
     EmptyResult,
     GetPromptResult,
     PingRequest,
@@ -281,6 +284,7 @@ class MCPConnection:
         ):
             raise ValueError("MCP env 必须将子进程变量名映射到本地变量名。")
         self.name = key if key is not None else name
+        self.server_id = f"{'project' if self.name.startswith('p_') else 'global'}:{name}"
         self.prefix = f"{TOOL_PREFIX}{self.name}__"
         self._command, self._args, self._cwd = command, tuple(args), cwd
         self._env = dict(env or {})
@@ -306,14 +310,16 @@ class MCPConnection:
         self.tools: dict[str, Tool] = {}
         self.state = "Disconnected"
         self.error: str | None = None
+        self.disconnected_at: float | None = None
         self._stop = asyncio.Event()
         self._tools_changed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
     @property
     def status(self) -> MCPStatus:
-        if self.state == "Connected" and not self.credentials_current:
-            return MCPStatus(self.name, "Error", 0, "MCP 环境凭据已变更，请重新连接。")
+        if self.state == "Connected" and not self.available:
+            message = "MCP 环境凭据已变更，请重新连接。" if not self.credentials_current else "MCP 连接已中断。"
+            return MCPStatus(self.name, "Error", 0, message)
         return MCPStatus(
             self.name,
             self.state,
@@ -358,6 +364,7 @@ class MCPConnection:
     ) -> dict[str, Tool]:
         self.state, self.error = "Connecting", None
         self._http_error = None
+        self.disconnected_at = None
         self._credentials = {name: os.getenv(name) for name in self._credential_names}
         self._stop.clear()
         self._tools_changed.clear()
@@ -367,6 +374,7 @@ class MCPConnection:
         )
         self._task = task
         started = False
+        config_error = False
         try:
             async with asyncio.timeout(_CONNECT_TIMEOUT):
                 await asyncio.wait((ready, task), return_when=asyncio.FIRST_COMPLETED)
@@ -381,28 +389,28 @@ class MCPConnection:
         except TimeoutError:
             self.error = "连接或发现工具超时。"
         except Exception as exc:  # noqa: BLE001 - keep SDK and subprocess details out of errors.
-            self.error = (
-                str(exc)
-                if isinstance(exc, _MCPConfigError)
-                else "无法连接或读取工具列表。"
-            )
+            config_error = isinstance(exc, (MCPStartConfigError, FileNotFoundError, PermissionError))
+            self.error = str(exc) if isinstance(exc, MCPStartConfigError) else "无法连接或读取工具列表。"
         finally:
             if not started:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         if self._http_error:
             self.error = self._http_error[1]
+            config_error = True
         self.state = "Error"
+        if config_error:
+            raise MCPStartConfigError(self.error)
         raise RuntimeError(self.error)
 
     def _stdio_parameters(self) -> StdioServerParameters:
         if self._cwd is not None and not Path(self._cwd).is_dir():
-            raise _MCPConfigError("MCP 工作目录不存在。")
+            raise MCPStartConfigError("MCP 工作目录不存在。")
         env = {}
         for target, source in self._env.items():
             value = self._credentials[source]
             if not value:
-                raise _MCPConfigError(f"缺少 MCP 环境变量 {source}。")
+                raise MCPStartConfigError(f"缺少 MCP 环境变量 {source}。")
             env[target] = value
         return StdioServerParameters(
             command=self._command, args=list(self._args), cwd=self._cwd, env=env
@@ -424,9 +432,9 @@ class MCPConnection:
         if self._bearer_env is not None:
             token = self._credentials[self._bearer_env]
             if not token:
-                raise _MCPConfigError(f"缺少 MCP 环境变量 {self._bearer_env}。")
+                raise MCPStartConfigError(f"缺少 MCP 环境变量 {self._bearer_env}。")
             if not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", token):
-                raise _MCPConfigError("MCP Bearer Token 格式无效。")
+                raise MCPStartConfigError("MCP Bearer Token 格式无效。")
 
         origin = (self._url.scheme, self._url.host, self._url.port)
 
@@ -468,7 +476,7 @@ class MCPConnection:
         try:
             transport = await public_transport(self._url) if self._public_only else None
         except ValueError as exc:
-            raise _MCPConfigError(str(exc)) from None
+            raise MCPStartConfigError(str(exc)) from None
 
         async with (
             httpx2.AsyncClient(
@@ -688,6 +696,8 @@ class MCPConnection:
                 try:
                     await self._wait_for_stop(client)
                 finally:
+                    if self.state == "Connected":
+                        self._mark_disconnected()
                     self._stop.set()
                     watcher.cancel()
                     await asyncio.gather(watcher, return_exceptions=True)
@@ -698,6 +708,7 @@ class MCPConnection:
                 raise
             if self.state != "Disconnected":
                 self.state = "Error"
+                self._mark_disconnected()
                 self.error = (
                     self._http_error[1]
                     if self._http_error
@@ -734,22 +745,40 @@ class MCPConnection:
                 self._tools_changed.clear()
                 await on_changed(self)
 
+    def _mark_disconnected(self) -> None:
+        if self.disconnected_at is None:
+            self.disconnected_at = monotonic()
+        self._stop.set()
+
+    def disconnected_result(self) -> dict[str, Any]:
+        # Preserve the status of an explicitly closed connection.
+        if self.state == "Disconnected" and self.disconnected_at is None:
+            return {"ok": False, "error": {"code": "mcp_unavailable", "message": "MCP 连接不可用。"}}
+        return {"ok": False, "server_id": self.server_id,
+                "error": {"code": "mcp_disconnected", "message": "MCP 连接已中断，请先恢复连接。"}}
+
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         client = self._client
         if not self.available or client is None:
-            return {
-                "ok": False,
-                "error": {"code": "mcp_unavailable", "message": "MCP 连接不可用。"},
-            }
+            return self.disconnected_result()
         try:
             async with asyncio.timeout(_CALL_TIMEOUT):
                 result = await client.session.call_tool(name, arguments)
         except TimeoutError:
+            if not self.available:
+                return self.disconnected_result()
             return {
                 "ok": False,
                 "error": {"code": "mcp_timeout", "message": "MCP 工具调用超时。"},
             }
         except Exception as exc:  # noqa: BLE001 - SDK protocol and transport failures are tool results.
+            if isinstance(exc, (ConnectionError, httpx2.TransportError)) or (
+                isinstance(exc, MCPError)
+                and (exc.code == CONNECTION_CLOSED or (exc.code == INVALID_REQUEST and exc.message == "Session terminated"))
+            ):
+                self._mark_disconnected()
+            if not self.available:
+                return self.disconnected_result()
             code, message = self._http_error or (
                 "mcp_call_failed",
                 f"MCP 工具调用失败（{type(exc).__name__}）。",
@@ -788,5 +817,5 @@ class MCPConnection:
                 raise
 
 
-class _MCPConfigError(ValueError):
+class MCPStartConfigError(RuntimeError):
     """Safe configuration diagnostics, with variable names but no values."""
