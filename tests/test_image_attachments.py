@@ -23,9 +23,10 @@ from daphnis.attachments import (
 )
 from daphnis.errors import APIError
 from daphnis.history import History
-from daphnis.models import MODELS
+from daphnis.models import MODELS, get_model, resolve_model
+from daphnis.models.image_budget import mimo_image_tokens
 from daphnis.session import Session
-from daphnis.token_budget import image_token_reserve, mimo_image_tokens, request_budget
+from daphnis.token_budget import request_budget
 from daphnis.web.bridge import Bridge
 from daphnis.web.redaction import Redactor
 
@@ -56,7 +57,10 @@ def reply(text, **extra):
 
 
 class ImageBudgetTests(unittest.TestCase):
-    def test_provider_estimates_and_mimo_grid_boundaries(self):
+    def test_model_estimates_and_mimo_grid_boundaries(self):
+        mimo = get_model("mimo", "mimo-v2.6-flash")
+        deepseek = get_model("deepseek", "deepseek-flash")
+        compatible = resolve_model("compatible", "unregistered")
         for dims, expected in (
             ((1, 1), 9), ((32, 224), 16), ((64, 96), 12), ((64, 128), 8),
             ((512, 512), 256), ((1024, 256), 256), ((4096, 2048), 8192),
@@ -65,9 +69,11 @@ class ImageBudgetTests(unittest.TestCase):
             with self.subTest(dims=dims):
                 self.assertEqual(mimo_image_tokens(*dims), expected)
                 self.assertEqual(mimo_image_tokens(*reversed(dims)), expected)
-                self.assertEqual(image_token_reserve("mimo", *dims), expected + (expected + 9) // 10)
-                self.assertEqual(image_token_reserve("deepseek", *dims), 1024)
-        self.assertEqual(image_token_reserve("compatible", 512, 512), 2048)
+                self.assertEqual(mimo.image_token_estimator(*dims), expected + (expected + 9) // 10)
+                self.assertEqual(deepseek.image_token_estimator(*dims), 1024)
+        self.assertEqual(compatible.image_token_estimator(512, 512), 2048)
+        self.assertEqual(compatible.image_token_estimator(1024, 1024), 2048)
+        self.assertEqual(compatible.image_token_estimator(1025, 1024), 2112)
 
 
 class ImageStoreTests(unittest.IsolatedAsyncioTestCase):

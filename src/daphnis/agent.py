@@ -72,7 +72,7 @@ from .models.requests import require_document_input, require_image_input
 from .prompt_groups import PromptGroup, PromptInput
 from .response import ResponseAccumulator, _response_choice
 from .session import Session
-from .token_budget import TokenBudget, image_token_reserve, request_budget
+from .token_budget import TokenBudget, request_budget
 from .tool_state import (
     PENDING,
     TOOL_STATE,
@@ -589,7 +589,7 @@ class Agent:
         costs = {
             index: (
                 sum(image.size_bytes for image in items),
-                sum(image_token_reserve(model.provider, image.width, image.height) for image in items),
+                sum(model.image_token_estimator(image.width, image.height) for image in items),
             )
             for index, items in images.items()
         }
@@ -617,17 +617,19 @@ class Agent:
         text_messages = []
         for message in messages:
             image_reserve += sum(
-                image_token_reserve(model.provider, image.width, image.height) for image in message.get(IMAGE_REFS, ())
+                model.image_token_estimator(image.width, image.height) for image in message.get(IMAGE_REFS, ())
             )
             unknown_documents += len(message.get(DOCUMENT_REFS, ()))
             if IMAGE_REFS in message or DOCUMENT_REFS in message:
                 text_messages.append({key: value for key, value in message.items() if key not in (IMAGE_REFS, DOCUMENT_REFS)})
             else:
                 text_messages.append(message)
+        default_output_tokens = (
+            None if self._custom_compatibility else model.output_reserve_for(body.get("thinking_mode"))
+        )
         return request_budget(
             text_messages, body, model.context_window, counter=model.token_counter,
-            provider=None if self._custom_compatibility else self._provider,
-            default_output_tokens=None if self._custom_compatibility else model.default_output_tokens,
+            default_output_tokens=default_output_tokens,
             settings=self.compaction_settings,
             image_reserve=image_reserve,
             unknown_documents=unknown_documents,

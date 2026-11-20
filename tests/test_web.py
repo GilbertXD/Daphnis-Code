@@ -653,6 +653,13 @@ class WebTests(unittest.TestCase):
         self.command("tools", first, names=[])
         state = self.snapshot()["state"]
         self.assertEqual(state["model"]["thinking_modes"], ["off", "on"])
+        model_fields = {
+            "id", "provider", "context_window", "supports_tools", "thinking_modes",
+            "max_output_tokens", "default_output_tokens", "supports_image", "supports_document",
+        }
+        self.assertEqual(set(state["model"]), model_fields)
+        for model in state["models"]:
+            self.assertEqual(set(model), model_fields | {"configured"})
         self.assertEqual(state["thinking"], "on")
         self.assertEqual(state["enabled_tools"], [])
         self.command("confirm_full", first)

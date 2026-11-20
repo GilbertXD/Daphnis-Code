@@ -229,7 +229,10 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            model_a = ModelInfo("a", "mimo", context_window=10_000, default_output_tokens=1_500)
+            model_a = ModelInfo(
+                "a", "mimo", context_window=10_000, default_output_tokens=1_500,
+                thinking_modes=("on",), thinking_output_tokens=(("on", 1_750),),
+            )
             model_b = ModelInfo("b", "mimo", context_window=20_000, default_output_tokens=2_000)
             ops = Operations(Application(
                 workspace=root, provider="mimo", model_id="a", catalog=(model_a, model_b),
@@ -249,9 +252,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (7500, 1500, 9500))
             self.assertNotIn("max_completion_tokens", bodies[-1])
 
+            await ops.set_thinking("on", session_id=ops.initial_session_id)
+            self.assertEqual((await ops.send("two", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+            budget = ops.context_budget(ops.initial_session_id)
+            self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (7500, 1750, 9500))
+            self.assertNotIn("max_completion_tokens", bodies[-1])
+
             await ops.set_model("mimo", "b", session_id=ops.initial_session_id)
             self.assertIsNone(ops.context_budget(ops.initial_session_id))
-            self.assertEqual((await ops.send("two", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
+            self.assertEqual((await ops.send("three", stream=False, session_id=ops.initial_session_id)).status, TurnStatus.COMPLETED)
             budget = ops.context_budget(ops.initial_session_id)
             self.assertEqual((budget.trigger_tokens, budget.output_reserve, budget.hard_limit), (12000, 500, 19000))
             self.assertEqual(bodies[-1]["max_completion_tokens"], 500)
@@ -1006,7 +1015,10 @@ asyncio.run(main())
                 await restarted.close()
 
     async def test_generic_thinking_uses_explicit_connection_compatibility(self):
-        model = ModelInfo(id="local", provider="compatible", thinking_modes=("high",))
+        model = ModelInfo(
+            id="local", provider="compatible", context_window=80_000, thinking_modes=("high",),
+            default_output_tokens=20_000, thinking_output_tokens=(("high", 30_000),),
+        )
         override = Compatibility(
             field_mappings={"thinking_mode": "vendor_thinking"},
             value_mappings={"thinking_mode": {"high": {"level": 3}}},
@@ -1039,6 +1051,7 @@ asyncio.run(main())
                 try:
                     await ops.set_thinking("high", session_id=ops.initial_session_id)
                     result = await ops.send("think", stream=False, session_id=ops.initial_session_id)
+                    budget = ops.context_budget(ops.initial_session_id)
                 finally:
                     await ops.close()
                 if compatibility is None:
@@ -1047,6 +1060,7 @@ asyncio.run(main())
                     self.assertEqual(requests, [])
                 else:
                     self.assertEqual(result.status, TurnStatus.COMPLETED, result.error)
+                    self.assertEqual(budget.output_reserve, 10_000)
                     self.assertEqual(requests[0]["vendor_thinking"], {"level": 3})
                     self.assertNotIn("thinking_mode", requests[0])
 

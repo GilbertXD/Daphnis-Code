@@ -34,7 +34,8 @@ _MAX_LIVE_CHARS = 256_000
 def _model_view(model):
     return {
         field.name: getattr(model, field.name)
-        for field in fields(model) if field.name != "token_counter"
+        for field in fields(model)
+        if field.name not in {"token_counter", "image_token_estimator", "thinking_output_tokens"}
     }
 
 

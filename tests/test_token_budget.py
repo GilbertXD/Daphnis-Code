@@ -44,13 +44,15 @@ class TokenBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(unknown.compaction_threshold)
         self.assertFalse(unknown.needs_compaction)
 
-    def test_deepseek_reserves_the_default_completion_space_for_each_mode(self):
-        for mode, reserve in ((None, 65_536), ("off", 8192), ("max", 131_072)):
-            with self.subTest(mode=mode):
-                body = {"thinking_mode": mode} if mode else {}
-                budget = request_budget([], body, 1_048_576, provider="deepseek")
+    def test_generic_output_reserve_fallback_and_explicit_limits(self):
+        for window, reserve in ((None, 16_384), (1_048_576, 16_384), (400, 50), (1, 1)):
+            with self.subTest(window=window):
+                budget = request_budget([], {}, window)
                 self.assertEqual(budget.output_reserve, reserve)
-        budget = request_budget([], {"output_limit": 512}, 1_048_576, provider="deepseek")
+        budget = request_budget(
+            [], {"output_limit": 256, "max_tokens": 512, "max_completion_tokens": True},
+            None, default_output_tokens=8192,
+        )
         self.assertEqual(budget.output_reserve, 512)
 
     def test_fixed_threshold_counts_reserve_even_if_window_is_unknown(self):

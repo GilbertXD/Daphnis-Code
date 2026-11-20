@@ -11,6 +11,7 @@ from daphnis.models import (
     CapabilityError,
     ModelInfo,
     get_model,
+    list_models,
     prepare_request_options,
     provider_compatibility,
     resolve_model,
@@ -56,6 +57,35 @@ class ModelsTests(unittest.IsolatedAsyncioTestCase):
             require_image_input(ModelInfo("text", "compatible", supports_image=False))
         with self.assertRaisesRegex(ValueError, "supports_image"):
             ModelInfo("invalid", "compatible", supports_image=1)
+
+    def test_catalog_output_reserves(self):
+        for model in list_models("deepseek"):
+            for mode, reserve in (
+                (None, 65_536), ("off", 8192), ("on", 65_536),
+                ("low", 65_536), ("high", 65_536), ("max", 131_072),
+            ):
+                with self.subTest(model=model.id, mode=mode):
+                    self.assertEqual(model.output_reserve_for(mode), reserve)
+        for model in list_models("mimo"):
+            for mode in (None, "off", "on"):
+                with self.subTest(model=model.id, mode=mode):
+                    self.assertEqual(model.output_reserve_for(mode), 131_072)
+        self.assertIsNone(resolve_model("compatible", "unregistered").output_reserve_for(None))
+
+    def test_model_budget_field_validation(self):
+        with self.assertRaisesRegex(TypeError, "image_token_estimator"):
+            ModelInfo("invalid", "compatible", image_token_estimator=1024)
+        with self.assertRaisesRegex(TypeError, "thinking_output_tokens"):
+            ModelInfo("invalid", "compatible", thinking_output_tokens={"high": 1})
+        for entries in (
+            (("high",),), (("unknown", 1),), (("high", 1), ("high", 2)),
+            (("high", True),), (("high", 0),), (("high", 101),),
+        ):
+            with self.subTest(entries=entries), self.assertRaisesRegex(ValueError, "thinking_output_tokens"):
+                ModelInfo(
+                    "invalid", "compatible", thinking_modes=("high",), max_output_tokens=100,
+                    thinking_output_tokens=entries,
+                )
 
     async def test_provider_routing_and_parameter_mappings(self):
         cases = (
