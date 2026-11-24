@@ -258,6 +258,16 @@ export type Skill = {
   error: string | null
 }
 
+export type MemoryScope = 'global' | 'project'
+export type MemoryItem = {
+  id: string
+  scope: MemoryScope
+  title: string
+  content: string
+  tags: string[]
+  updated_at: number
+}
+
 type State = {
   session: Session
   sessions: Session[]
@@ -268,6 +278,8 @@ type State = {
   mcp_prompt_servers: string[]
   mcp_resource_servers: string[]
   skills: Skill[]
+  memories: MemoryItem[]
+  memories_error: string | null
   history_issues: HistoryIssue[]
   history_error: string | null
   messages: Message[]
@@ -287,6 +299,7 @@ type State = {
 type SharedState = Pick<State,
   'session' | 'sessions' | 'projects' | 'projects_error' | 'mcp_servers' | 'mcp_error' | 'mcp_prompt_servers'
   | 'mcp_resource_servers' | 'history_issues' | 'history_error' | 'all_tools' | 'effective_tools' | 'skills'
+  | 'memories' | 'memories_error'
 >
 
 type Frame = {

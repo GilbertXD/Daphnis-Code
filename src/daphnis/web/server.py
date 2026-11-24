@@ -61,6 +61,8 @@ _FIELDS = {
     "skill_import": {"source": str, "scope": str},
     "skill_set_state": {"skill_id": str, "state": str},
     "skill_remove": {"skill_id": str},
+    "memory_save": {"scope": str, "title": str, "content": str, "tags": list, "id": (str, type(None))},
+    "memory_remove": {"id": str, "scope": str},
     "mcp_save": {"name": str, "state": str, "scope": str, "description": str, "options": dict, "create": bool},
     "mcp_set_state": {"name": str, "state": str},
     "mcp_restart": {"name": str},
@@ -93,7 +95,7 @@ _SESSION_EDITS = {"rename", "move", "delete"}
 _SESSION_SETTINGS = {"model", "thinking", "system", "tools", "set_approval_mode", "confirm_full"}
 _SHARED_EDITS = {
     "project_create", "project_remove", "mcp_save", "mcp_set_state", "mcp_restart", "mcp_delete", "mcp_add_registry",
-    "skill_import", "skill_set_state", "skill_remove",
+    "skill_import", "skill_set_state", "skill_remove", "memory_save", "memory_remove",
 }
 
 
@@ -147,6 +149,10 @@ async def _command(request: Request):
         or any(not isinstance(name, str) or not 0 < len(name) <= 255 for name in value["names"])
     ):
         raise RequestError("工具列表无效。")
+    if action == "memory_save" and (
+        len(value["tags"]) > 10 or any(not isinstance(tag, str) for tag in value["tags"])
+    ):
+        raise RequestError("记忆标签无效。")
     if action == "send" and not value["prompt"].strip():
         raise RequestError("请输入消息。")
     if action == "send_attachments" and (
@@ -411,6 +417,17 @@ async def _execute(bridge, action, session, args, discovery):
             await ops.set_skill_state(args["skill_id"], args["state"], session_id=session)
         case "skill_remove":
             await ops.remove_skill(args["skill_id"], session_id=session)
+        case "memory_save":
+            await ops.save_memory(
+                scope=args["scope"],
+                title=args["title"],
+                content=args["content"],
+                tags=args["tags"],
+                entry_id=args["id"],
+                session_id=session,
+            )
+        case "memory_remove":
+            await ops.remove_memory(args["id"], args["scope"], session_id=session)
         case "mcp_save" | "mcp_set_state":
             return await ops.save_mcp(**args, session_id=session), None
         case "mcp_restart":

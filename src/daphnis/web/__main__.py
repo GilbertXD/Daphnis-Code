@@ -41,7 +41,7 @@ def main() -> None:
             raise RuntimeError(f"Daphnis 无法启动（{type(exc).__name__}），请检查服务端配置。") from None
         redactor = Redactor([
             token,
-            *(os.getenv(f"{name}_API_KEY", "") for name in ("LLM", "MIMO", "DEEPSEEK", "COMPATIBLE")),
+            *(os.getenv(f"{name}_API_KEY", "") for name in ("LLM", "MIMO", "DEEPSEEK", "COMPATIBLE", "EMBEDDING")),
         ])
         print(f"Daphnis Web  http://127.0.0.1:{args.port}\n访问令牌  {token}", flush=True)
         return Bridge(ops, redactor)

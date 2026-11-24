@@ -25,6 +25,7 @@ from .history import SessionLease, finish_io
 from .mcp import TOOL_PREFIX, MCPConnection, MCPStatus, validate_prompt_request
 from .mcp.resources import expand_resource_template
 from .mcp_store import MCPServerConfig
+from .memory import MemoryEntry, MemoryNotFoundError
 from .models import ModelInfo, list_models
 from .project import Project
 from .prompt_groups import PromptGroup, PromptInput
@@ -269,6 +270,47 @@ class Operations:
         """Remove the managed copy and its state record in the selected scope."""
         workspace = Path(self._runtime(session_id).session.workspace)
         await finish_io(asyncio.to_thread(self._app._skills.remove, skill_id, workspace))
+
+    def list_memories(self, session_id: str) -> tuple[MemoryEntry, ...]:
+        """List global and current-workspace long-term memories."""
+        workspace = Path(self._runtime(session_id).session.workspace)
+        return self._app._memory.list_all(workspace, redactor=self._app._history_redactor)
+
+    async def save_memory(
+        self,
+        *,
+        scope: str,
+        title: str,
+        content: str,
+        tags: Sequence[str] = (),
+        entry_id: str | None = None,
+        session_id: str,
+    ) -> MemoryEntry:
+        if scope not in ("global", "project"):
+            raise ValueError("记忆作用域须为 global 或 project。")
+        workspace = Path(self._runtime(session_id).session.workspace)
+        try:
+            saved, _ = await self._app._memory.write_entry(
+                workspace,
+                scope=scope,
+                title=title,
+                content=content,
+                tags=tags,
+                entry_id=entry_id,
+                redactor=self._app._history_redactor,
+            )
+        except MemoryNotFoundError as exc:
+            raise ValueError(str(exc)) from None
+        return saved
+
+    async def remove_memory(self, entry_id: str, scope: str, *, session_id: str) -> None:
+        if scope not in ("global", "project"):
+            raise ValueError("记忆作用域须为 global 或 project。")
+        workspace = Path(self._runtime(session_id).session.workspace)
+        try:
+            await self._app._memory.delete_entry(workspace, scope=scope, entry_id=entry_id)
+        except MemoryNotFoundError as exc:
+            raise ValueError(str(exc)) from None
 
     async def connect_mcp(
         self,

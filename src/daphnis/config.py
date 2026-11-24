@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .compaction_settings import CompactionSettings
+from .memory import EmbeddingConfig
 from .models import MODELS, ModelInfo
 from .models.models import validate_catalog
 from .models.tokenizer import verified_tokenizer
@@ -129,6 +130,18 @@ def environment_connections() -> tuple[str, str, dict[str, dict[str, Any]]]:
     if not provider or not model_id or provider not in connections:
         raise ValueError("请在 .env 配置 LLM_PROVIDER、LLM_MODEL 和对应的 Base URL。")
     return provider, model_id, connections
+
+
+def environment_embedding() -> EmbeddingConfig | None:
+    """Read optional OpenAI-compatible / Ollama embedding configuration."""
+    base_url = (os.getenv("EMBEDDING_BASE_URL") or "").strip()
+    model = (os.getenv("EMBEDDING_MODEL") or "").strip()
+    if not base_url and not model:
+        return None
+    if not base_url or not model:
+        raise ValueError("配置 Embedding 时须同时设置 EMBEDDING_BASE_URL 和 EMBEDDING_MODEL。")
+    api_key = (os.getenv("EMBEDDING_API_KEY") or "").strip() or None
+    return EmbeddingConfig(base_url=base_url, model=model, api_key=api_key)
 
 
 def _unique_keys(pairs):

@@ -200,9 +200,14 @@ class Bridge:
             event.name == "model.started" and data["request_number"] == 1
             and data.get("purpose") != "title"
         )
+        memory_changed = (
+            event.name == "tool.finished"
+            and data.get("name") in {"memory_write", "memory_delete"}
+            and data.get("status") == "COMPLETED"
+        )
         self.notify(
             session, state=committed_input or (event.name == "model.started" and bool(data.get("loaded_skills"))),
-            shared=committed_input,
+            shared=committed_input or memory_changed,
         )
 
     def _shared_state(self, session):
@@ -225,6 +230,12 @@ class Bridge:
         except (OSError, TypeError, ValueError):
             servers = ()
             mcp_error = "无法读取已保存的 MCP 配置，请检查 mcp.json。"
+        memories_error = None
+        try:
+            memories = ops.list_memories(session)
+        except (OSError, TypeError, ValueError):
+            memories = ()
+            memories_error = "无法读取已保存的长期记忆，请检查本地 memory 目录。"
         statuses = {status.name: status for status in ops.mcp_status(session)}
         retry_blocks = ops.mcp_retry_blocks(session)
         sessions = [asdict(item) for item in history.sessions]
@@ -240,6 +251,18 @@ class Bridge:
             "all_tools": ops.available_tools(session),
             "effective_tools": ops.effective_tools(session),
             "skills": [asdict(skill) for skill in ops.list_skills(session)],
+            "memories": [
+                {
+                    "id": item.id,
+                    "scope": item.scope,
+                    "title": item.title,
+                    "content": item.content,
+                    "tags": list(item.tags),
+                    "updated_at": item.updated_at,
+                }
+                for item in memories
+            ],
+            "memories_error": memories_error,
         })
         state["mcp_error"] = mcp_error
         state["mcp_prompt_servers"] = ops.list_mcp_prompt_servers(session)

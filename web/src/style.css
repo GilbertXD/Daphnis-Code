@@ -247,6 +247,7 @@ dialog::backdrop { background: rgb(0 0 0 / 18%); }
 .skill-controls { display: flex; align-items: center; gap: 6px; margin-left: auto; }
 .mcp-row-actions { margin-top: 6px; font-size: .87rem; }
 .mcp-operations summary { width: fit-content; color: var(--muted); }
+.memory-body { margin-top: 6px; white-space: pre-wrap; font-size: .9rem; line-height: 1.55; }
 .mcp-tabs { display: flex; gap: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
 .mcp-tabs button { border: 0; border-bottom: 2px solid transparent; padding: 6px 2px; }
 .mcp-tabs button[aria-pressed="true"] { border-bottom-color: var(--ink); font-weight: 600; }

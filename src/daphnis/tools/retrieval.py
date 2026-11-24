@@ -6,12 +6,17 @@ import math
 import re
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..messages import Messages
 from ..redaction import Redactor
 from ..token_budget import DEFAULT_COUNTER
 from .approval import Decision, Operation, ToolError
 from .history import HISTORY_NOTICE, visible_history_text
+
+if TYPE_CHECKING:
+    from ..memory import MemoryStore
 
 MAX_RESULTS = 10
 MAX_RESULT_TOKENS = 1300
@@ -111,13 +116,36 @@ class RetrievalEngine:
         return sorted(scores, key=lambda i: (-scores[i], -index.chunks[i].message_id, index.chunks[i].start))
 
 
-def prepare_retrieval(engine: RetrievalEngine, session_id: str, arguments: dict, messages: Messages,
-                      redactor: Redactor) -> Operation:
+def prepare_retrieval(
+    engine: RetrievalEngine,
+    session_id: str,
+    arguments: dict,
+    messages: Messages,
+    redactor: Redactor,
+    *,
+    workspace: Path | None = None,
+    memory: "MemoryStore | None" = None,
+) -> Operation:
     async def run():
-        if arguments.get("source", "history") != "history":
-            raise ToolError("invalid_source", "Only the history source is available.")
-        index = engine.index(session_id, messages, redactor)
-        return engine.search(index, session_id, redactor.text(arguments["query"]), arguments.get("limit", 5))
+        source = arguments.get("source", "history")
+        if source == "history":
+            index = engine.index(session_id, messages, redactor)
+            return engine.search(index, session_id, redactor.text(arguments["query"]), arguments.get("limit", 5))
+        if source == "memory":
+            if memory is None or workspace is None:
+                raise ToolError("memory_unavailable", "Long-term memory storage is unavailable.")
+            try:
+                return await memory.search(
+                    workspace,
+                    arguments["query"],
+                    scope=arguments.get("scope", "all"),
+                    limit=arguments.get("limit", 5),
+                    redactor=redactor,
+                )
+            except ValueError as exc:
+                code = "invalid_query" if "query" in str(exc).lower() else "invalid_limit"
+                raise ToolError(code, str(exc)) from None
+        raise ToolError("invalid_source", "Available retrieval sources are 'history' and 'memory'.")
 
-    return Operation(decision=Decision.ALLOW, reason="Retrieve exposed text from the current Session.",
+    return Operation(decision=Decision.ALLOW, reason="Retrieve exposed text from history or saved memory.",
                      targets=(), details=arguments, run=run)

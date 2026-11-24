@@ -10,6 +10,7 @@ from .app import Application
 from .config import (
     environment_connections,
     environment_context_options,
+    environment_embedding,
 )
 from .operations import Operations
 
@@ -30,6 +31,7 @@ async def open_operations(
         provider=provider,
         model_id=model_id,
         connections=connections,
+        embedding=environment_embedding(),
         **environment_context_options(),
         interactive=True,
         observe_model_io=observe_model_io,

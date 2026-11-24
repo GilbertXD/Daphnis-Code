@@ -43,6 +43,7 @@ from .mcp import (
     MCPStartConfigError,
 )
 from .mcp_store import MCPServerConfig, MCPStore
+from .memory import EmbeddingClient, EmbeddingConfig, MemoryStore
 from .models import (
     MODELS,
     CapabilityError,
@@ -137,6 +138,8 @@ class Application:
         compaction_settings: CompactionSettings | None = None,
         model_compaction_settings: Mapping[tuple[str, str], CompactionSettings] | None = None,
         output_limits: Mapping[tuple[str, str], int] | None = None,
+        embedding: EmbeddingConfig | None = None,
+        memory: MemoryStore | None = None,
     ) -> None:
         self._catalog = tuple(catalog)
         validate_catalog(self._catalog)
@@ -149,12 +152,22 @@ class Application:
                 secrets.append(key)
             if isinstance(headers := options.get("auth_headers"), Mapping):
                 secrets.extend(value for value in headers.values() if isinstance(value, str))
+        if embedding is not None and embedding.api_key:
+            secrets.append(embedding.api_key)
         self._history_redactor = Redactor(secrets)
         self._clients: dict[str, ChatClient] = {}
         self._document_adapters: dict[str, DocumentAdapter | None] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._history = history if history is not None else History()
+        self._memory = (
+            memory
+            if memory is not None
+            else MemoryStore(
+                self._history.directory.parent / "memory",
+                embedding=EmbeddingClient(embedding) if embedding is not None else None,
+            )
+        )
         self._skills = SkillStore(self._history.directory.parent)
         self._mcp_store = MCPStore(self._history.directory.parent / "mcp.json")
         self._interactive = interactive
@@ -619,6 +632,7 @@ class Application:
             redactor=self._history_redactor,
             search_excluded_directory=self._history.directory,
             attachment_store=self._history.attachments,
+            memory_store=self._memory,
             skill_state_paths=(self._skills.state_path, self._skills.lock_path),
             connections=(
                 server
@@ -1121,6 +1135,7 @@ class Application:
             finally:
                 for client in self._clients.values():
                     stack.push_async_callback(client.aclose)
+                stack.push_async_callback(self._memory.aclose)
                 for adapter in self._document_adapters.values():
                     if adapter is not None:
                         stack.push_async_callback(adapter.aclose)

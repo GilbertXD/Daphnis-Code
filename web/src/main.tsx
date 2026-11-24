@@ -6,6 +6,7 @@ import type { DraftAttachment } from './attachments'
 import { Debug } from './debug'
 import type { Tab } from './debug'
 import { MCPManager } from './mcp'
+import { MemoryManager } from './memory'
 import { PromptPicker } from './prompts'
 import { sessionTitle, useConnection } from './protocol'
 import type { Approval, Command, LoadAttachment, Model, Project, ResourceDraft, Session, View } from './protocol'
@@ -321,7 +322,7 @@ function SystemPromptPanel({ initial, close, apply, disabled, notice }: {
 }
 
 const optionsTabs = [
-  ['tools', '工具'], ['skills', 'Skills'], ['mcp', 'MCP'], ['system', '系统提示词'],
+  ['tools', '工具'], ['skills', 'Skills'], ['memory', '记忆'], ['mcp', 'MCP'], ['system', '系统提示词'],
 ] as const
 
 function OptionsDialog({ panels, close, clearNotice }: {
@@ -770,6 +771,9 @@ function Workspace({ view, connected, command, loadImage, loadDocument }: {
           disabled={disabled || state.model.supports_tools !== true} notice={notice}
           apply={(names) => perform('tools', { names })} />,
         skills: <SkillsManager skills={state.skills} notice={notice} perform={perform} clearNotice={() => setNotice('')}
+          disabled={!connected || busy || navigationDisabled || view.revision < (acknowledged[id] ?? 0)} />,
+        memory: <MemoryManager memories={state.memories} error={state.memories_error} notice={notice} perform={perform}
+          clearNotice={() => setNotice('')}
           disabled={!connected || busy || navigationDisabled || view.revision < (acknowledged[id] ?? 0)} />,
         mcp: <MCPManager servers={state.mcp_servers} disabled={disabled} connected={connected} error={state.mcp_error}
           notice={notice} perform={perform} command={command}
