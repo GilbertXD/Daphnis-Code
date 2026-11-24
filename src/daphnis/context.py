@@ -127,8 +127,12 @@ def materialize_images(
 def history_range_hint(through: int) -> str:
     return (
         f"Earlier session messages have been compacted. Compacted message range: [0, {through}). "
-        "If the task needs original evidence, use retrieval to find visible records in this Session. "
-        "Use history_read with a cited message_id or a range returned by retrieval."
+        "For missing exact values, use retrieval before answering. Search each unresolved identifier alone, "
+        "batching independent calls. Use matching excerpts directly, including units. For final values, "
+        "look for an explicit later correction in those hits. If ambiguous, narrow to the identifier plus "
+        "a correction term, or use history_read on a cited message_id or range. "
+        "Stop when supported; if the identifier has no matching evidence, report it as unknown. "
+        "Avoid broader searches or repeated reads for the same field."
     )
 
 

@@ -20,6 +20,7 @@ from daphnis import Agent, Context, History, Operations, Session, TurnStatus
 from daphnis.agent import TITLE_PROMPT
 from daphnis.app import Application
 from daphnis.compaction import (
+    _SUMMARY_DELIVERY,
     CompactionCheckpoint,
     CompactionError,
     Compactor,
@@ -41,6 +42,11 @@ SUMMARY = json.dumps({
     "goals": "Update a file", "progress": "Inspected the workspace",
     "files": "app.py", "next_steps": "Run checks",
 })
+
+
+def summary_records(messages):
+    source = messages[1]["content"].removesuffix(_SUMMARY_DELIVERY).split("History records:\n", 1)[1]
+    return [json.loads(line) for line in source.splitlines()]
 
 
 class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
@@ -233,6 +239,27 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed validation", prompts[1][0])
         self.assertIn("Missing history summary fields: progress, files, next_steps.", prompts[1][0])
 
+    async def test_schema_repair_uses_grounded_records_and_keeps_prior_summary(self):
+        previous = CompactionCheckpoint(1, SUMMARY)
+        raw = [{"role": "user", "content": "First task."},
+               {"role": "user", "content": "Item01 = NX-802, 35 ms\n" + "routine line\n" * 60 + "Hold release."},
+               {"role": "user", "content": "Item02 = NX-915, 48 ms\n" + "routine line\n" * 60 + "Review QA-44."},
+               {"role": "user", "content": "NX-802 again\nroutine line\nWait for approval.\nroutine line\nEnd."},
+               {"role": "assistant", "content": "Further checks pending."}]
+        prompts = []
+
+        async def summarize(messages, limit):
+            prompts.append(messages[1]["content"])
+            return SUMMARY if len(prompts) == 2 else '{"facts":["NX-802","NX-915"],"file":"invented.py"}'
+
+        await Compactor(None).summarize(raw, previous, 5, summarize)
+        self.assertEqual(len(prompts), 2)
+        self.assertLess(len(prompts[1]), len(prompts[0]))
+        for text in (previous.summary, "Item01 = NX-802, 35 ms", "Item02 = NX-915, 48 ms",
+                     '"message_index":2', "Further checks pending.", "Hold release.", "Review QA-44.", "Wait for approval."):
+            self.assertIn(text, prompts[1])
+        self.assertNotIn("invented.py", prompts[1])
+
     async def test_summary_preserves_structured_notes_and_extra_facts(self):
         raw = [
             {"role": "user", "content": "Verify the files."},
@@ -300,9 +327,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
 
         async def summarize(messages, limit):
             self.assertFalse(request_budget(messages, {"output_limit": limit}, 1200).needs_compaction)
-            fragments.extend(json.loads(line) for line in messages[1]["content"].split(
-                "History records:\n", 1,
-            )[1].splitlines())
+            fragments.extend(summary_records(messages))
             return SUMMARY
 
         checkpoint = await Compactor(1200).summarize(raw, None, 3, summarize)
@@ -352,10 +377,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         records = []
 
         async def summarize(messages, limit):
-            records.extend(
-                json.loads(line)
-                for line in messages[1]["content"].split("History records:\n", 1)[1].splitlines()
-            )
+            records.extend(summary_records(messages))
             return SUMMARY
 
         await Compactor(None).summarize(original, None, 5, summarize)
@@ -406,8 +428,7 @@ class ManualCompactionTests(unittest.IsolatedAsyncioTestCase):
         records = []
 
         async def summarize(messages, limit):
-            for line in messages[1]["content"].split("History records:\n", 1)[1].splitlines():
-                record = json.loads(line)
+            for record in summary_records(messages):
                 if record["field"] == "recovery":
                     records.append({"message_index": record["message_index"], **json.loads(record["content"])})
             return SUMMARY
